@@ -92,6 +92,7 @@ interface ProviderSummaryEntry {
 
 interface StartupSettings {
   favorites?: string[];
+  landingHiddenCharacterIds?: string[];
   filterTab?: "characters" | "favorites" | "groups";
   sortField?: "name" | "recent" | "created" | "shuffle";
   sortDirection?: "asc" | "desc";
@@ -102,6 +103,7 @@ interface StartupSettings {
   landingPageLayoutMode?: "cards" | "compact";
   wallpaper?: unknown;
   drawerSettings?: unknown;
+  spindleSettings?: unknown;
   connectionsOrder?: Partial<Record<"llm" | "imageGen" | "stt" | "tts", string[]>>;
 }
 
@@ -112,6 +114,7 @@ const LANDING_CHATS_DEFAULT_LIMIT = 12;
 const LANDING_CHATS_MAX_LIMIT = 100;
 const STARTUP_SETTINGS_KEYS = [
   "favorites",
+  "landingHiddenCharacterIds",
   "filterTab",
   "sortField",
   "sortDirection",
@@ -122,6 +125,7 @@ const STARTUP_SETTINGS_KEYS = [
   "landingPageLayoutMode",
   "wallpaper",
   "drawerSettings",
+  "spindleSettings",
   "connectionsOrder",
 ] as const;
 
@@ -190,6 +194,13 @@ function getStartupSettings(userId: string): StartupSettings {
   const favorites = rows.get("favorites");
   if (Array.isArray(favorites)) startupSettings.favorites = favorites;
 
+  const landingHiddenCharacterIds = rows.get("landingHiddenCharacterIds");
+  if (Array.isArray(landingHiddenCharacterIds)) {
+    startupSettings.landingHiddenCharacterIds = landingHiddenCharacterIds.filter(
+      (id): id is string => typeof id === "string" && id.length > 0,
+    );
+  }
+
   const filterTab = rows.get("filterTab");
   if (filterTab === "characters" || filterTab === "favorites" || filterTab === "groups") {
     startupSettings.filterTab = filterTab;
@@ -239,6 +250,15 @@ function getStartupSettings(userId: string): StartupSettings {
     startupSettings.drawerSettings = rows.get("drawerSettings");
   }
 
+  const spindleSettings = rows.get("spindleSettings");
+  if (
+    spindleSettings
+    && typeof spindleSettings === "object"
+    && !Array.isArray(spindleSettings)
+  ) {
+    startupSettings.spindleSettings = spindleSettings;
+  }
+
   const connectionsOrder = sanitizeConnectionsOrder(rows.get("connectionsOrder"));
   if (Object.keys(connectionsOrder).length > 0) {
     startupSettings.connectionsOrder = connectionsOrder;
@@ -249,14 +269,26 @@ function getStartupSettings(userId: string): StartupSettings {
 
 /** First recent-chats page for the landing view, sized by the user's setting. */
 function getLandingRecentChats(userId: string): PaginatedResult<GroupedRecentChat> {
-  const stored = settingsSvc
-    .getSettingsByKeys(userId, ["landingPageChatsDisplayed"])
-    .get("landingPageChatsDisplayed");
+  const settings = settingsSvc.getSettingsByKeys(userId, [
+    "landingPageChatsDisplayed",
+    "favorites",
+    "landingHiddenCharacterIds",
+  ]);
+  const stored = settings.get("landingPageChatsDisplayed");
   const limit =
     typeof stored === "number" && Number.isFinite(stored)
       ? Math.min(Math.max(Math.floor(stored), 1), LANDING_CHATS_MAX_LIMIT)
       : LANDING_CHATS_DEFAULT_LIMIT;
-  return chatsSvc.listRecentChatsGrouped(userId, { limit, offset: 0 });
+  const favorites = settings.get("favorites");
+  const hidden = settings.get("landingHiddenCharacterIds");
+  return chatsSvc.listRecentChatsGrouped(userId, { limit, offset: 0 }, {
+    favoriteCharacterIds: Array.isArray(favorites)
+      ? favorites.filter((id): id is string => typeof id === "string" && id.length > 0)
+      : [],
+    hiddenCharacterIds: Array.isArray(hidden)
+      ? hidden.filter((id): id is string => typeof id === "string" && id.length > 0)
+      : [],
+  });
 }
 
 export function buildLandingBootstrapPayload(

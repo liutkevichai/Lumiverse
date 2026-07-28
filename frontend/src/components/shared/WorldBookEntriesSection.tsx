@@ -63,6 +63,7 @@ import type {
   WorldBookEntryDeletedPayload,
 } from '@/types/ws-events'
 import WorldBookEntryEditor from '@/components/shared/WorldBookEntryEditor'
+import WorldBookTokenReportModal from '@/components/panels/world-book/WorldBookTokenReportModal'
 import ConfirmationModal from '@/components/shared/ConfirmationModal'
 import ContextMenu, { type ContextMenuEntry, type ContextMenuPos } from '@/components/shared/ContextMenu'
 import { ModalPresentation } from '@/components/shared/ModalPresentation'
@@ -397,6 +398,10 @@ interface KeywordState {
   entryIds: string[]
 }
 
+interface ActivationState {
+  entryIds: string[]
+}
+
 interface WorldBookEntriesSectionProps {
   books: WorldBook[]
   selectedBookId: string
@@ -440,15 +445,19 @@ export default function WorldBookEntriesSection({
   const [moveCopyState, setMoveCopyState] = useState<MoveCopyModalState | null>(null)
   const [renumberState, setRenumberState] = useState<RenumberState | null>(null)
   const [keywordState, setKeywordState] = useState<KeywordState | null>(null)
+  const [activationState, setActivationState] = useState<ActivationState | null>(null)
+  const [bulkActionsMenu, setBulkActionsMenu] = useState<ContextMenuPos | null>(null)
   const [moveTargetBookId, setMoveTargetBookId] = useState('')
   const [renumberStart, setRenumberStart] = useState('')
   const [renumberStep, setRenumberStep] = useState('1')
   const [renumberDirection, setRenumberDirection] = useState<'asc' | 'desc'>('asc')
   const [keywordValue, setKeywordValue] = useState('')
   const [keywordTarget, setKeywordTarget] = useState<'primary' | 'secondary'>('primary')
+  const [bulkActivation, setBulkActivation] = useState<'trigger' | 'constant' | 'vector'>('trigger')
   const [positionState, setPositionState] = useState<{ entryIds: string[] } | null>(null)
   const [bulkPosition, setBulkPosition] = useState(0)
   const [bulkDepth, setBulkDepth] = useState('4')
+  const [showTokenReport, setShowTokenReport] = useState(false)
   const [pendingAction, setPendingAction] = useState(false)
   const entryTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
   const sectionRef = useRef<HTMLDivElement>(null)
@@ -679,11 +688,14 @@ export default function WorldBookEntriesSection({
     setEntrySearchFilter('')
     setMobileListOptionsOpen(false)
     setSelectedEntryId(null)
+    setShowTokenReport(false)
     setSelectMode(false)
     setSelectedIds([])
     setContextMenu(null)
     setTypeMenu(null)
     setPositionMenu(null)
+    setBulkActionsMenu(null)
+    setActivationState(null)
   }, [selectedBookId, worldBookEntryViewPrefs])
 
   useEffect(() => {
@@ -908,6 +920,24 @@ export default function WorldBookEntriesSection({
       setPendingAction(false)
     }
   }, [positionState, bulkPosition, bulkDepth, selectedBookId, refetchCurrentPage])
+
+  const handleBulkSetActivation = useCallback(async () => {
+    if (!activationState) return
+    setPendingAction(true)
+    try {
+      await worldBooksApi.bulkEntryAction(selectedBookId, {
+        action: 'set_activation',
+        entry_ids: activationState.entryIds,
+        activation: bulkActivation,
+      })
+      setActivationState(null)
+      setBulkActivation('trigger')
+      await refetchCurrentPage()
+      await refreshVectorSummary()
+    } finally {
+      setPendingAction(false)
+    }
+  }, [activationState, bulkActivation, selectedBookId, refetchCurrentPage, refreshVectorSummary])
 
   const handleToggleSelect = useCallback((entryId: string) => {
     setSelectedIds((current) => (
@@ -1144,6 +1174,15 @@ export default function WorldBookEntriesSection({
             {selectMode ? <CheckSquare size={13} /> : <Square size={13} />}
             <span>{te('select')}</span>
           </button>
+          <button
+            type="button"
+            className={styles.toolbarBtn}
+            onClick={() => setShowTokenReport(true)}
+            title={t('tokenReportOpen')}
+          >
+            <Hash size={13} />
+            <span>{t('tokenReportOpen')}</span>
+          </button>
           <button type="button" className={styles.newEntryBtn} onClick={() => void handleCreateEntry()}>
             <Plus size={12} />
             <span>{te('newEntry')}</span>
@@ -1277,41 +1316,13 @@ export default function WorldBookEntriesSection({
               type="button"
               className={styles.bulkActionBtn}
               disabled={selectedCount === 0}
-              onClick={() => {
-                setRenumberStart('')
-                setRenumberStep('1')
-                setRenumberDirection('asc')
-                setRenumberState({ entryIds: selectedIds })
+              onClick={(event) => {
+                const rect = event.currentTarget.getBoundingClientRect()
+                setBulkActionsMenu({ x: rect.left, y: rect.bottom })
               }}
             >
-              <Hash size={13} />
-              <span>{te('renumber')}</span>
-            </button>
-            <button
-              type="button"
-              className={styles.bulkActionBtn}
-              disabled={selectedCount === 0}
-              onClick={() => {
-                setKeywordValue('')
-                setKeywordTarget('primary')
-                setKeywordState({ entryIds: selectedIds })
-              }}
-            >
-              <Tag size={13} />
-              <span>{te('addKeyword')}</span>
-            </button>
-            <button
-              type="button"
-              className={styles.bulkActionBtn}
-              disabled={selectedCount === 0}
-              onClick={() => {
-                setBulkPosition(0)
-                setBulkDepth('4')
-                setPositionState({ entryIds: selectedIds })
-              }}
-            >
-              <MapPin size={13} />
-              <span>Set Position</span>
+              <MoreVertical size={13} />
+              <span>{te('moreActions')}</span>
             </button>
             <button
               type="button"
@@ -1428,6 +1439,66 @@ export default function WorldBookEntriesSection({
         items={positionMenuItems}
         onClose={() => setPositionMenu(null)}
       />
+
+      <ContextMenu
+        position={bulkActionsMenu}
+        items={[
+          {
+            key: 'renumber',
+            label: te('renumber'),
+            icon: <Hash size={14} />,
+            onClick: () => {
+              setBulkActionsMenu(null)
+              setRenumberStart('')
+              setRenumberStep('1')
+              setRenumberDirection('asc')
+              setRenumberState({ entryIds: selectedIds })
+            },
+          },
+          {
+            key: 'keyword',
+            label: te('addKeyword'),
+            icon: <Tag size={14} />,
+            onClick: () => {
+              setBulkActionsMenu(null)
+              setKeywordValue('')
+              setKeywordTarget('primary')
+              setKeywordState({ entryIds: selectedIds })
+            },
+          },
+          {
+            key: 'position',
+            label: te('setPosition'),
+            icon: <MapPin size={14} />,
+            onClick: () => {
+              setBulkActionsMenu(null)
+              setBulkPosition(0)
+              setBulkDepth('4')
+              setPositionState({ entryIds: selectedIds })
+            },
+          },
+          {
+            key: 'activation',
+            label: te('setActivation'),
+            icon: <Zap size={14} />,
+            onClick: () => {
+              setBulkActionsMenu(null)
+              setBulkActivation('trigger')
+              setActivationState({ entryIds: selectedIds })
+            },
+          },
+        ]}
+        onClose={() => setBulkActionsMenu(null)}
+      />
+
+      {selectedBook && (
+        <WorldBookTokenReportModal
+          isOpen={showTokenReport}
+          onClose={() => setShowTokenReport(false)}
+          bookId={selectedBook.id}
+          bookName={selectedBook.name}
+        />
+      )}
 
       {deleteState && (
         <ConfirmationModal
@@ -1593,6 +1664,32 @@ export default function WorldBookEntriesSection({
               </FormField>
             )}
           </div>
+        </ModalPresentation>
+      )}
+
+      {activationState && (
+        <ModalPresentation
+          isOpen={true}
+          onClose={() => !pendingAction && setActivationState(null)}
+          maxWidth="clamp(320px, 90vw, min(520px, var(--lumiverse-content-max-width, 520px)))"
+          closeOnBackdrop={!pendingAction}
+          closeOnEscape={!pendingAction}
+          title={te('setActivationTitle')}
+          subtitle={te('setActivationHint', { count: activationState.entryIds.length })}
+          footer={(
+            <>
+              <Button variant="ghost" onClick={() => setActivationState(null)} disabled={pendingAction}>{tc('actions.cancel')}</Button>
+              <Button variant="primary" onClick={() => void handleBulkSetActivation()} disabled={pendingAction}>{tc('actions.apply')}</Button>
+            </>
+          )}
+        >
+          <FormField label={te('activationMethod')} className={styles.dialogFormField}>
+            <Select
+              value={bulkActivation}
+              onChange={(value) => setBulkActivation(value as 'trigger' | 'constant' | 'vector')}
+              options={labels.typeOptions}
+            />
+          </FormField>
         </ModalPresentation>
       )}
     </div>

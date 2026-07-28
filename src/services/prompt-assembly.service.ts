@@ -1411,7 +1411,11 @@ export async function assemblePrompt(
             requestedPresetId,
             chat.id,
             characterId,
-            { isGroup: chat.metadata?.group === true, connectionId: connection?.id ?? null },
+            {
+              isGroup: chat.metadata?.group === true,
+              connectionId: connection?.id ?? null,
+              personaId: persona?.id ?? null,
+            },
           );
   const resolvedPresetId = resolvedProfile.preset_id;
 
@@ -1476,6 +1480,10 @@ export async function assemblePrompt(
   // immediately so cortex never blocks generation or dry-run rendering.
   const cortexConfig =
     pf?.cortexConfig ?? memoryCortex.getCortexConfig(ctx.userId);
+  const cortexEnabledForChat = memoryCortex.isCortexEnabledForChat(
+    cortexConfig,
+    chat.metadata,
+  );
   let cortexChatMemSettings:
     | import("./embeddings.service").ChatMemorySettings
     | null = null;
@@ -1488,7 +1496,7 @@ export async function assemblePrompt(
   // would otherwise spawn a nested cortex worker from in here. Cortex warming
   // runs only on the in-process assembly path (where it reaches the real cache),
   // matching prior behavior — the per-call worker killed this task anyway.
-  if (cortexConfig.enabled && !runningInAssemblyWorker()) {
+  if (cortexEnabledForChat && !runningInAssemblyWorker()) {
     const cmRaw =
       pf?.allSettings.get("chatMemorySettings") ??
       settingsSvc.getSetting(ctx.userId, "chatMemorySettings")?.value ??
@@ -2101,7 +2109,7 @@ export async function assemblePrompt(
 
   let memoryResult: Awaited<ReturnType<typeof collectChatVectorMemory>>;
 
-  if (cortexConfig.enabled) {
+  if (cortexEnabledForChat) {
     // Fast path: warm cache from a previous generation (synchronous, no I/O).
     // Require the cached entry to have excluded the current live-context tail
     // (and regen target, if any), otherwise it may re-inject recent messages as
@@ -2162,9 +2170,9 @@ export async function assemblePrompt(
   }
 
   // Merge linked cortex data (vaults + interlinks) if available
-  const linkedCortexResult = memoryCortex.getCachedLinkedCortexResult(
-    ctx.chatId,
-  );
+  const linkedCortexResult = cortexEnabledForChat
+    ? memoryCortex.getCachedLinkedCortexResult(ctx.chatId)
+    : null;
   let linkedMemoryText = "";
   if (
     linkedCortexResult &&
@@ -3485,8 +3493,9 @@ export async function assemblePrompt(
   }
 
   // ---- Context budget clipping ----
-  // Drop oldest chat history messages until the assembly fits under the
-  // configured `max_context_length` (minus response headroom + safety margin).
+  // A context anchor excludes all earlier chat history; otherwise drop the
+  // oldest history until the assembly fits under the configured
+  // `max_context_length` (minus response headroom + safety margin).
   // Runs AFTER all WI / AN / depth / prefill insertions so fixed overhead is
   // accurately measured. The breakdown recompute below picks up the new
   // chat-history bounds from the mutated `result` array.
@@ -3587,6 +3596,7 @@ export async function assemblePrompt(
     messages: result,
     breakdown,
     parameters,
+    trimIncompleteWords: prompts.advancedSettings?.trimIncompleteWords === true,
     assistantPrefill,
     activatedWorldInfo:
       activatedWorldInfo.length > 0 ? activatedWorldInfo : undefined,
@@ -5853,8 +5863,10 @@ const FALLBACK_MAX_RESPONSE_TOKENS = 4096;
 const CLIP_YIELD_CHAR_BUDGET = 262_144;
 
 /**
- * Clip oldest chat-history messages from the assembled prompt so the total
- * fits within the preset's `contextSize` (minus response headroom + margin).
+ * Clip chat-history messages from the assembled prompt so the total fits
+ * within the preset's `contextSize` (minus response headroom + margin). A
+ * manually set context anchor is a hard history start: history before it is
+ * always excluded, then the anchored tail must fit as a whole.
  *
  * Lazy newest→oldest tokenization: fixed (always-included) overhead is counted
  * up front, then chat-history messages are tokenized newest→oldest only until
@@ -5886,6 +5898,40 @@ export async function clipToContextBudget(
       : FALLBACK_MAX_RESPONSE_TOKENS;
 
   if (resolvedContext <= 0) {
+    // A context anchor is meaningful even when automatic context clipping is
+    // disabled. It explicitly defines the first chat message the model may
+    // read, so apply that manual cut without requiring a tokenizer or budget.
+    const historyIndices = result.flatMap((message, index) =>
+      isChatHistoryMessage(message) ? [index] : [],
+    );
+    const protectedHistoryStart = historyIndices.findIndex((index) =>
+      isContextAnchorProtected(result[index]),
+    );
+    const anchorActive = protectedHistoryStart >= 0;
+    const messagesDropped = anchorActive ? protectedHistoryStart : 0;
+    let chatHistoryTokensBefore = 0;
+    let tokensDropped = 0;
+    for (let i = 0; i < historyIndices.length; i++) {
+      const message = result[historyIndices[i]];
+      const estimatedTokens = Math.ceil(
+        (message.role.length + 1 + getTextContent(message).length) / 4,
+      );
+      chatHistoryTokensBefore += estimatedTokens;
+      if (i < messagesDropped) tokensDropped += estimatedTokens;
+    }
+
+    if (messagesDropped > 0) {
+      const firstKeptRawIdx = historyIndices[protectedHistoryStart];
+      let write = 0;
+      for (let read = 0; read < result.length; read++) {
+        const message = result[read];
+        if (isChatHistoryMessage(message) && read < firstKeptRawIdx) continue;
+        if (write !== read) result[write] = message;
+        write++;
+      }
+      result.length = write;
+    }
+
     return {
       enabled: false,
       maxContext: 0,
@@ -5894,11 +5940,12 @@ export async function clipToContextBudget(
       inputBudget: 0,
       fixedTokens: 0,
       remainingHistoryBudget: 0,
-      chatHistoryTokensBefore: 0,
-      chatHistoryTokensAfter: 0,
-      messagesDropped: 0,
-      tokensDropped: 0,
+      chatHistoryTokensBefore,
+      chatHistoryTokensAfter: chatHistoryTokensBefore - tokensDropped,
+      messagesDropped,
+      tokensDropped,
       tokenizerUsed: APPROXIMATE_TOKENIZER_NAME,
+      anchorActive,
     };
   }
 
@@ -5990,15 +6037,37 @@ export async function clipToContextBudget(
     return tokens;
   };
 
+  const anchorPrefixCount = anchorActive ? protectedHistoryStart : 0;
+  const anchorPrefixTokens = anchorActive
+    ? approxHistoryTokens(0, protectedHistoryStart)
+    : 0;
+  const dropHistoryBefore = (historyStart: number): void => {
+    if (historyStart <= 0) return;
+    const firstKeptRawIdx = historyIndices[historyStart];
+    let write = 0;
+    for (let read = 0; read < n; read++) {
+      const msg = result[read];
+      if (isChatHistoryMessage(msg) && read < firstKeptRawIdx) continue;
+      if (write !== read) result[write] = msg;
+      write++;
+    }
+    result.length = write;
+  };
+
   // Misconfigured budget (e.g. maxContext smaller than max_tokens + margin).
   // Don't clip silently — surface the misconfiguration via `budgetInvalid`.
   if (inputBudget <= 0) {
-    const allHistory = approxHistoryTokens(0, historyIndices.length);
     const protectedHistoryTokens = await countProtectedHistory();
+    if (anchorActive) dropHistoryBefore(anchorPrefixCount);
+    const allHistory = anchorActive
+      ? anchorPrefixTokens + protectedHistoryTokens
+      : approxHistoryTokens(0, historyIndices.length);
     return makeStats({
       budgetInvalid: true,
       chatHistoryTokensBefore: allHistory,
-      chatHistoryTokensAfter: allHistory,
+      chatHistoryTokensAfter: anchorActive ? protectedHistoryTokens : allHistory,
+      messagesDropped: anchorPrefixCount,
+      tokensDropped: anchorPrefixTokens,
       protectedHistoryTokens,
       remainingBeforeAnchor: remainingHistoryBudget - protectedHistoryTokens,
       anchorOverflow: anchorActive && protectedHistoryTokens > 0,
@@ -6008,10 +6077,13 @@ export async function clipToContextBudget(
   if (remainingHistoryBudget <= 0) {
     const protectedHistoryTokens = await countProtectedHistory();
     if (anchorActive && protectedHistoryTokens > 0) {
-      const allHistory = approxHistoryTokens(0, historyIndices.length);
+      dropHistoryBefore(anchorPrefixCount);
+      const allHistory = anchorPrefixTokens + protectedHistoryTokens;
       return makeStats({
         chatHistoryTokensBefore: allHistory,
-        chatHistoryTokensAfter: allHistory,
+        chatHistoryTokensAfter: protectedHistoryTokens,
+        messagesDropped: anchorPrefixCount,
+        tokensDropped: anchorPrefixTokens,
         protectedHistoryTokens,
         remainingBeforeAnchor: remainingHistoryBudget - protectedHistoryTokens,
         anchorOverflow: true,
@@ -6046,11 +6118,13 @@ export async function clipToContextBudget(
   const protectedHistoryTokens = await countProtectedHistory();
   const remainingBeforeAnchor = remainingHistoryBudget - protectedHistoryTokens;
   if (anchorActive && remainingBeforeAnchor < 0) {
-    const allHistory =
-      approxHistoryTokens(0, protectedHistoryStart) + protectedHistoryTokens;
+    dropHistoryBefore(anchorPrefixCount);
+    const allHistory = anchorPrefixTokens + protectedHistoryTokens;
     return makeStats({
       chatHistoryTokensBefore: allHistory,
-      chatHistoryTokensAfter: allHistory,
+      chatHistoryTokensAfter: protectedHistoryTokens,
+      messagesDropped: anchorPrefixCount,
+      tokensDropped: anchorPrefixTokens,
       protectedHistoryTokens,
       remainingBeforeAnchor,
       anchorOverflow: true,
@@ -6058,18 +6132,18 @@ export async function clipToContextBudget(
   }
 
   let accHistoryTokens = protectedHistoryTokens;
-  let oldestKeptHistoryIdx = anchorActive
-    ? protectedHistoryStart
-    : -1;
-  for (let i = (anchorActive ? protectedHistoryStart : historyIndices.length) - 1; i >= 0; i--) {
-    const msg = result[historyIndices[i]];
-    const text = `${msg.role}\n${getTextContent(msg)}`;
-    charsSinceYield += text.length;
-    await yieldWhenDue();
-    const t = counter.count(text);
-    if (accHistoryTokens + t > remainingHistoryBudget) break;
-    accHistoryTokens += t;
-    oldestKeptHistoryIdx = i;
+  let oldestKeptHistoryIdx = anchorActive ? protectedHistoryStart : -1;
+  if (!anchorActive) {
+    for (let i = historyIndices.length - 1; i >= 0; i--) {
+      const msg = result[historyIndices[i]];
+      const text = `${msg.role}\n${getTextContent(msg)}`;
+      charsSinceYield += text.length;
+      await yieldWhenDue();
+      const t = counter.count(text);
+      if (accHistoryTokens + t > remainingHistoryBudget) break;
+      accHistoryTokens += t;
+      oldestKeptHistoryIdx = i;
+    }
   }
 
   if (oldestKeptHistoryIdx === 0 || historyIndices.length === 0) {
@@ -6697,6 +6771,7 @@ async function onelinerImpersonation(
     messages: result,
     breakdown,
     parameters,
+    trimIncompleteWords: preset?.prompts?.advancedSettings?.trimIncompleteWords === true,
     assistantPrefill,
     macroEnv,
   };

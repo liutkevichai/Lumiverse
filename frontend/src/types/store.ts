@@ -109,6 +109,7 @@ export type CharacterViewMode = 'grid' | 'single' | 'list'
 
 export interface StartupSettings {
   favorites?: string[]
+  landingHiddenCharacterIds?: string[]
   filterTab?: CharacterFilterTab
   sortField?: CharacterSortField
   sortDirection?: CharacterSortDirection
@@ -120,6 +121,7 @@ export interface StartupSettings {
   landingPageLayoutMode?: 'cards' | 'compact'
   wallpaper?: WallpaperSettings
   drawerSettings?: DrawerSettings
+  spindleSettings?: Partial<SpindleSettings>
   connectionsOrder?: Partial<Record<'llm' | 'imageGen' | 'stt' | 'tts', string[]>>
 }
 
@@ -234,6 +236,7 @@ export interface Toast {
   message: string
   duration?: number
   dismissible?: boolean
+  action?: { label: string; onClick: () => void }
 }
 
 // ---- UI Slice ----
@@ -460,6 +463,7 @@ export interface SettingsSlice {
   fullSettingsLoaded: boolean
   landingPageChatsDisplayed: number
   landingPageLayoutMode: 'cards' | 'compact'
+  landingHiddenCharacterIds: string[]
   charactersPerPage: number
   personasPerPage: number
   messagesPerPage: number
@@ -545,7 +549,8 @@ export interface SettingsSlice {
   renameSavedTheme: (id: string, name: string) => void
   deleteSavedTheme: (id: string) => Promise<void>
   applySavedTheme: (id: string) => void
-  updateSavedTheme: (id: string) => void
+  /** Replace a saved theme with the complete current theme snapshot and persist it. */
+  updateSavedTheme: (id: string) => Promise<void>
   loadSettings: () => Promise<void>
 }
 
@@ -569,6 +574,10 @@ export interface DrawerSettings {
 export interface SpindleSettings {
   interceptorTimeoutMs: number
   dockPanelDesktopSide: 'left' | 'right'
+  /** Show routine Spindle lifecycle and WebSocket events in the browser console. */
+  infoLoggingEnabled: boolean
+  /** Sparse identifier map. Missing/false means toast + badge; true means badge only. */
+  extensionUpdateToastDisabled: Record<string, boolean>
 }
 
 // ---- Loom Registry Entry ----
@@ -915,6 +924,8 @@ export interface BulkUpdateStatus {
 
 export interface SpindleSlice {
   extensions: ExtensionInfo[]
+  /** Manageable extensions whose tracked remote branch has a different HEAD. */
+  extensionUpdates: import('./spindle-updates').ExtensionUpdateInfo[]
   /** Active theme overrides from Spindle extensions, keyed by extensionId */
   extensionThemeOverrides: Record<string, ExtensionThemeOverride>
   /** Extension IDs whose theme overrides are suppressed by the user */
@@ -934,6 +945,7 @@ export interface SpindleSlice {
   pendingInputPrompt: PendingInputPromptRequest | null
   pendingContextMenu: PendingContextMenuRequest | null
   loadExtensions: () => Promise<void>
+  setExtensionUpdates: (updates: import('./spindle-updates').ExtensionUpdateInfo[]) => void
   installExtension: (githubUrl: string, branch?: string | null) => Promise<void>
   updateExtension: (id: string) => Promise<void>
   switchBranch: (id: string, branch: string) => Promise<void>
@@ -1193,7 +1205,7 @@ export interface SpindlePlacementSlice {
 
   registerFloatWidget: (widget: FloatWidgetState) => void
   unregisterFloatWidget: (widgetId: string) => void
-  updateFloatWidget: (widgetId: string, updates: Partial<Pick<FloatWidgetState, 'x' | 'y' | 'width' | 'height' | 'visible' | 'fullscreen' | 'preFullscreen'>>) => void
+  updateFloatWidget: (widgetId: string, updates: Partial<Pick<FloatWidgetState, 'x' | 'y' | 'width' | 'height' | 'visible' | 'desktopPoppedOut' | 'fullscreen' | 'preFullscreen'>>) => void
 
   registerDockPanel: (panel: DockPanelState) => void
   unregisterDockPanel: (panelId: string) => void

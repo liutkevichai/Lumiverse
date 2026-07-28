@@ -145,6 +145,10 @@
   flex-shrink: 0;
 }
 
+.mobileActionMenu {
+  display: none;
+}
+
 
 .exportWrapper {
   position: relative;
@@ -851,6 +855,12 @@
   overflow: hidden;
   border: 1px solid var(--lumiverse-border);
   background: var(--lumiverse-bg-dark);
+  cursor: zoom-in;
+}
+
+.galleryItem:focus-visible {
+  outline: 2px solid var(--lumiverse-primary);
+  outline-offset: 2px;
 }
 
 .galleryThumb {
@@ -1158,6 +1168,14 @@
 
   .headerActions {
     gap: 2px;
+  }
+
+  .desktopHeaderAction {
+    display: none;
+  }
+
+  .mobileActionMenu {
+    display: inline-flex;
   }
 
   .tabBar {

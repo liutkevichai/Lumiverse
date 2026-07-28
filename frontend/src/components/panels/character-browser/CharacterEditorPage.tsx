@@ -4,7 +4,7 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 
 import { createPortal } from 'react-dom'
 import { motion, AnimatePresence } from 'motion/react'
-import { X, Upload, Trash2, Copy, MessageSquare, User, UserPlus, Plus, ImagePlus, Download, Code2, GripVertical, ExternalLink } from 'lucide-react'
+import { X, Upload, Trash2, Copy, MessageSquare, User, UserPlus, Plus, ImagePlus, Download, Code2, GripVertical, ExternalLink, Hash, MoreHorizontal } from 'lucide-react'
 import {
   DndContext,
   closestCenter,
@@ -39,6 +39,7 @@ import { uuidv7 } from '@/lib/uuid'
 import useImageCropFlow from '@/hooks/useImageCropFlow'
 import { getCharacterAvatarThumbUrl } from '@/lib/avatarUrls'
 import ImageCropModal from '@/components/shared/ImageCropModal'
+import ImageLightbox from '@/components/shared/ImageLightbox'
 import LazyImage from '@/components/shared/LazyImage'
 import ContextMenu, { type ContextMenuEntry, type ContextMenuPos } from '@/components/shared/ContextMenu'
 import ConfirmationModal from '@/components/shared/ConfirmationModal'
@@ -52,11 +53,13 @@ import { Button } from '@/components/shared/FormComponents'
 import { RangeSlider } from '@/components/shared/RangeSlider'
 import SearchableSelect from '@/components/shared/SearchableSelect'
 import VoicePicker from '@/components/shared/VoicePicker'
+import FolderDropdown from '@/components/shared/FolderDropdown'
 import SpindleCharacterEditorTabContent from '@/components/spindle/SpindleCharacterEditorTabContent'
 import { ttsConnectionsApi } from '@/api/tts-connections'
 import type { VoiceRef } from '@/types/api'
 import { filterWorldBooksForChatContextAttachment } from '@/lib/worldBookIndexPrompt'
 import { useScaledSortableStyle } from '@/lib/dndUiScale'
+import { useFolders } from '@/hooks/useFolders'
 import { setCharacterEditorController, syncCharacterEditorState } from '@/lib/spindle/character-editor-helper'
 import styles from './CharacterEditorPage.module.css'
 import clsx from 'clsx'
@@ -70,6 +73,7 @@ import CharacterLoraTab from './CharacterLoraTab'
 import AlternateFieldEditor from './AlternateFieldEditor'
 import AlternateAvatarManager from './AlternateAvatarManager'
 import type { AlternateAvatarEntry } from './AlternateAvatarManager'
+import CharacterTokenReportModal, { type CharacterTokenReportItem } from './CharacterTokenReportModal'
 
 const DEBOUNCE_MS = 2000
 const MAX_PERSPECTIVE_LAYERS = 5
@@ -97,16 +101,31 @@ interface GalleryGridItemProps {
   item: CharacterGalleryItem
   onRemove: (itemId: string) => void
   onOpenMenu: (item: CharacterGalleryItem, pos: ContextMenuPos) => void
+  onPreview: (item: CharacterGalleryItem) => void
 }
 
-function GalleryGridItem({ item, onRemove, onOpenMenu }: GalleryGridItemProps) {
+function GalleryGridItem({ item, onRemove, onOpenMenu, onPreview }: GalleryGridItemProps) {
   const { t } = useTranslation('panels')
   const longPress = useLongPress({
     onLongPress: (pos) => onOpenMenu(item, pos),
   })
 
   return (
-    <div className={styles.galleryItem} {...longPress}>
+    <div
+      className={styles.galleryItem}
+      role="button"
+      tabIndex={0}
+      aria-label={item.caption || t('characterEditor.galleryImage')}
+      onClick={() => onPreview(item)}
+      onKeyDown={(e) => {
+        if (e.target !== e.currentTarget) return
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          onPreview(item)
+        }
+      }}
+      {...longPress}
+    >
       <LazyImage
         src={characterGalleryApi.smallUrl(item.image_id)}
         alt={item.caption || t('characterEditor.galleryImage')}
@@ -116,7 +135,10 @@ function GalleryGridItem({ item, onRemove, onOpenMenu }: GalleryGridItemProps) {
       <button
         type="button"
         className={styles.galleryRemoveBtn}
-        onClick={() => onRemove(item.id)}
+        onClick={(e) => {
+          e.stopPropagation()
+          onRemove(item.id)
+        }}
         title={t('characterEditor.removeFromGallery')}
       >
         <X size={12} />
@@ -360,6 +382,7 @@ export default function CharacterEditorPage() {
   const loadRegexScripts = useStore((s) => s.loadRegexScripts)
   const updateRegexScript = useStore((s) => s.updateRegexScript)
   const browser = useCharacterBrowser()
+  const { folders: characterFolders, createFolder: createCharacterFolder } = useFolders('characterFolders', allCharacters)
 
   const character = allCharacters.find((c) => c.id === editingCharacterId) ?? null
   const isOpen = !!editingCharacterId
@@ -372,6 +395,7 @@ export default function CharacterEditorPage() {
 
   const [activeTab, setActiveTab] = useState<TabId>('core')
   const [name, setName] = useState('')
+  const [folder, setFolder] = useState('')
   const [fields, setFields] = useState<Record<string, string>>({})
   const [tags, setTags] = useState<string[]>([])
   const [newTag, setNewTag] = useState('')
@@ -380,11 +404,13 @@ export default function CharacterEditorPage() {
   const [extensionsJson, setExtensionsJson] = useState('')
   const [jsonError, setJsonError] = useState<string | null>(null)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
+  const [showTokenReport, setShowTokenReport] = useState(false)
   const [avatarKey, setAvatarKey] = useState(0)
   const [lorebookImporting, setLorebookImporting] = useState(false)
   const [lorebookResult, setLorebookResult] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const [galleryItems, setGalleryItems] = useState<CharacterGalleryItem[]>([])
+  const [galleryLightboxSrc, setGalleryLightboxSrc] = useState<string | null>(null)
   const [worldBooks, setWorldBooks] = useState<Array<Pick<WorldBook, 'id' | 'name' | 'folder' | 'metadata'>>>([])
   const [galleryUploading, setGalleryUploading] = useState(false)
   const [extracting, setExtracting] = useState(false)
@@ -435,6 +461,7 @@ export default function CharacterEditorPage() {
     if (editingCharacterId) {
       setActiveTab('core')
     }
+    setShowTokenReport(false)
   }, [editingCharacterId])
 
   useEffect(() => {
@@ -450,6 +477,7 @@ export default function CharacterEditorPage() {
     if (lastSyncedId.current === character.id) return
     lastSyncedId.current = character.id
     setName(character.name)
+    setFolder(character.folder || '')
     setFields({
       description: character.description || '',
       personality: character.personality || '',
@@ -477,6 +505,19 @@ export default function CharacterEditorPage() {
     clearTimeout(savingTimer.current)
     savingTimer.current = setTimeout(() => setSaving(false), 1000)
   }, [])
+
+  const handleFolderChange = useCallback(async (value: string) => {
+    if (!character) return
+    const previous = folder
+    setFolder(value)
+    showSaving()
+    try {
+      await browser.updateCharacter(character.id, { folder: value })
+    } catch (err: any) {
+      setFolder(previous)
+      toast.error(err?.body?.error || err?.message || t('characterEditor.folderSaveFailed'))
+    }
+  }, [browser, character, folder, showSaving, t])
 
   // Gallery
   const fetchGallery = useCallback(() => {
@@ -728,6 +769,59 @@ export default function CharacterEditorPage() {
 
     return pendingExtensionsRef.current ?? character?.extensions ?? {}
   }, [extensionsJson, character?.extensions])
+
+  // This report intentionally uses the editor's local draft state rather than
+  // the saved card, so it remains useful while the user is still typing.
+  const tokenReportItems = useMemo<CharacterTokenReportItem[]>(() => {
+    const baseFields = [
+      ['description', t('characterEditor.description')],
+      ['personality', t('characterEditor.personality')],
+      ['scenario', t('characterEditor.scenario')],
+      ['system_prompt', t('characterEditor.systemPrompt')],
+      ['post_history_instructions', t('characterEditor.postHistory')],
+      ['mes_example', t('characterEditor.messageExamples')],
+    ] as const
+    const items: CharacterTokenReportItem[] = baseFields.map(([field, label]) => ({
+      id: `base:${field}`,
+      label,
+      text: fields[field] || '',
+      group: 'base',
+    }))
+
+    const alternateFields = isRecord(workingExtensions.alternate_fields) ? workingExtensions.alternate_fields : {}
+    for (const [field, baseLabel] of baseFields.slice(0, 3)) {
+      const variants = Array.isArray(alternateFields[field]) ? alternateFields[field] : []
+      variants.forEach((variant: unknown, index: number) => {
+        if (!isRecord(variant)) return
+        const label = typeof variant.label === 'string' && variant.label.trim()
+          ? variant.label
+          : `${t('characterEditor.alternateField.default')} ${index + 1}`
+        items.push({
+          id: `variant:${field}:${typeof variant.id === 'string' ? variant.id : index}`,
+          label: `${baseLabel} — ${label}`,
+          text: typeof variant.content === 'string' ? variant.content : '',
+          group: 'variant',
+        })
+      })
+    }
+
+    items.push({
+      id: 'greeting:first',
+      label: t('characterEditor.firstMessage'),
+      text: fields.first_mes || '',
+      group: 'greeting',
+    })
+    alternateGreetings.forEach((greeting, index) => {
+      items.push({
+        id: `greeting:${index}`,
+        label: t('characterEditor.greetingNumber', { n: index + 1 }),
+        text: greeting,
+        group: 'greeting',
+      })
+    })
+
+    return items
+  }, [alternateGreetings, fields, t, workingExtensions])
 
 
   const flushExtensionsSave = useCallback(async () => {
@@ -1354,6 +1448,7 @@ export default function CharacterEditorPage() {
 
   const [showExportMenu, setShowExportMenu] = useState(false)
   const [exporting, setExporting] = useState(false)
+  const [headerActionMenuPosition, setHeaderActionMenuPosition] = useState<ContextMenuPos | null>(null)
   const exportMenuRef = useRef<HTMLDivElement>(null)
   const activeCharxExportRef = useRef<{
     exportId: string
@@ -1438,6 +1533,89 @@ export default function CharacterEditorPage() {
       setExporting(false)
     }
   }, [editingCharacterId, character, t])
+
+  const headerActionMenuItems: ContextMenuEntry[] = [
+    {
+      key: 'token-report',
+      label: t('characterEditor.tokenReportTitle'),
+      icon: <Hash size={14} />,
+      onClick: () => {
+        setHeaderActionMenuPosition(null)
+        setShowTokenReport(true)
+      },
+    },
+    {
+      key: 'create-persona',
+      label: t('characterEditor.createPersona'),
+      icon: creatingPersona ? <Spinner size={14} fast /> : <UserPlus size={14} />,
+      disabled: creatingPersona,
+      onClick: () => {
+        setHeaderActionMenuPosition(null)
+        void handleCreatePersonaFromCharacter()
+      },
+    },
+    {
+      key: 'replace-card',
+      label: t('characterEditor.replaceCard'),
+      icon: replacingCard ? <Spinner size={14} fast /> : <Upload size={14} />,
+      disabled: replacingCard,
+      onClick: () => {
+        setHeaderActionMenuPosition(null)
+        cardReplaceFileRef.current?.click()
+      },
+    },
+    { key: 'export-divider', type: 'divider' },
+    {
+      key: 'export-json',
+      label: t('characterEditor.exportJson'),
+      icon: <Download size={14} />,
+      disabled: exporting,
+      onClick: () => {
+        setHeaderActionMenuPosition(null)
+        void handleExport('json')
+      },
+    },
+    {
+      key: 'export-png',
+      label: t('characterEditor.exportPng'),
+      icon: <Download size={14} />,
+      disabled: exporting,
+      onClick: () => {
+        setHeaderActionMenuPosition(null)
+        void handleExport('png')
+      },
+    },
+    {
+      key: 'export-charx',
+      label: t('characterEditor.exportCharx'),
+      icon: <Download size={14} />,
+      disabled: exporting,
+      onClick: () => {
+        setHeaderActionMenuPosition(null)
+        void handleExport('charx')
+      },
+    },
+    { key: 'duplicate-divider', type: 'divider' },
+    {
+      key: 'duplicate',
+      label: t('characterEditor.duplicate'),
+      icon: <Copy size={14} />,
+      onClick: () => {
+        setHeaderActionMenuPosition(null)
+        void handleDuplicate()
+      },
+    },
+    {
+      key: 'delete',
+      label: tc('actions.delete'),
+      icon: <Trash2 size={14} />,
+      danger: true,
+      onClick: () => {
+        setHeaderActionMenuPosition(null)
+        setShowDeleteConfirm(true)
+      },
+    },
+  ]
 
   // Close export menu on outside click
   useEffect(() => {
@@ -1551,10 +1729,20 @@ export default function CharacterEditorPage() {
                   {saving && <span className={styles.savingIndicator}>{t('characterEditor.saving')}</span>}
 
                   <div className={styles.headerActions}>
+                    <Button
+                      className={styles.desktopHeaderAction}
+                      size="icon"
+                      variant="ghost"
+                      onClick={() => setShowTokenReport(true)}
+                      title={t('characterEditor.tokenReportTitle')}
+                    >
+                      <Hash size={14} />
+                    </Button>
                     <Button size="icon" variant="ghost" onClick={handleOpenChat} title={t('characterEditor.openChat')}>
                       <MessageSquare size={14} />
                     </Button>
                     <Button
+                      className={styles.desktopHeaderAction}
                       size="icon"
                       variant="ghost"
                       onClick={handleCreatePersonaFromCharacter}
@@ -1566,6 +1754,7 @@ export default function CharacterEditorPage() {
                         : <UserPlus size={14} />}
                     </Button>
                     <Button
+                      className={styles.desktopHeaderAction}
                       size="icon"
                       variant="ghost"
                       onClick={() => cardReplaceFileRef.current?.click()}
@@ -1574,7 +1763,7 @@ export default function CharacterEditorPage() {
                     >
                       {replacingCard ? <Spinner size={14} fast /> : <Upload size={14} />}
                     </Button>
-                    <div className={styles.exportWrapper} ref={exportMenuRef}>
+                    <div className={clsx(styles.exportWrapper, styles.desktopHeaderAction)} ref={exportMenuRef}>
                       <Button
                         size="icon"
                         variant="ghost"
@@ -1594,16 +1783,31 @@ export default function CharacterEditorPage() {
                         </div>
                       )}
                     </div>
-                    <Button size="icon" variant="ghost" onClick={handleDuplicate} title={t('characterEditor.duplicate')}>
+                    <Button className={styles.desktopHeaderAction} size="icon" variant="ghost" onClick={handleDuplicate} title={t('characterEditor.duplicate')}>
                       <Copy size={14} />
                     </Button>
                     <Button
+                      className={styles.desktopHeaderAction}
                       size="icon"
                       variant="danger-ghost"
                       onClick={() => setShowDeleteConfirm(true)}
                       title={tc('actions.delete')}
                     >
                       <Trash2 size={14} />
+                    </Button>
+                    <Button
+                      className={styles.mobileActionMenu}
+                      size="icon"
+                      variant="ghost"
+                      onClick={(e) => {
+                        const rect = e.currentTarget.getBoundingClientRect()
+                        setHeaderActionMenuPosition((position) => position ? null : { x: rect.right, y: rect.bottom + 4 })
+                      }}
+                      title={t('characterEditor.moreActions')}
+                      aria-label={t('characterEditor.moreActions')}
+                      aria-expanded={headerActionMenuPosition !== null}
+                    >
+                      <MoreHorizontal size={16} />
                     </Button>
                   </div>
 
@@ -1737,6 +1941,16 @@ export default function CharacterEditorPage() {
 
                   {activeTab === 'identity' && (
                     <>
+                      <div className={styles.fieldGroup}>
+                        <span className={styles.fieldLabel}>{t('characterEditor.folder')}</span>
+                        <span className={styles.fieldHelper}>{t('characterEditor.folderHelper')}</span>
+                        <FolderDropdown
+                          folders={characterFolders}
+                          selectedFolder={folder}
+                          onSelect={(value) => void handleFolderChange(value)}
+                          onCreateFolder={createCharacterFolder}
+                        />
+                      </div>
                       <Field
                         label={t('characterEditor.alternateName')}
                         helper={t('characterEditor.alternateNameHelper')}
@@ -1940,6 +2154,7 @@ export default function CharacterEditorPage() {
                                       item={cell.item}
                                       onRemove={handleGalleryRemove}
                                       onOpenMenu={(menuItem, pos) => setGalleryContextMenu({ item: menuItem, pos })}
+                                      onPreview={(previewItem) => setGalleryLightboxSrc(characterGalleryApi.imageUrl(previewItem.image_id))}
                                     />
                                   )
                                 })}
@@ -2207,6 +2422,16 @@ export default function CharacterEditorPage() {
       items={galleryContextMenuItems}
       onClose={() => setGalleryContextMenu(null)}
     />
+    <ImageLightbox src={galleryLightboxSrc} onClose={() => setGalleryLightboxSrc(null)} />
+
+    {character && (
+      <CharacterTokenReportModal
+        isOpen={showTokenReport}
+        onClose={() => setShowTokenReport(false)}
+        characterName={name || character.name}
+        items={tokenReportItems}
+      />
+    )}
 
     {showDeleteConfirm && (
       <ConfirmationModal
@@ -2219,6 +2444,11 @@ export default function CharacterEditorPage() {
         onCancel={() => setShowDeleteConfirm(false)}
       />
     )}
+    <ContextMenu
+      position={headerActionMenuPosition}
+      items={headerActionMenuItems}
+      onClose={() => setHeaderActionMenuPosition(null)}
+    />
     </>,
     document.body
   )

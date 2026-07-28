@@ -274,6 +274,7 @@ function DisplaySettings() {
   const modalMaxWidth = useStore((s) => s.modalMaxWidth)
   const landingPageChatsDisplayed = useStore((s) => s.landingPageChatsDisplayed)
   const landingPageLayoutMode = useStore((s) => s.landingPageLayoutMode)
+  const landingHiddenCharacterIds = useStore((s) => s.landingHiddenCharacterIds)
   const toastPosition = useStore((s) => s.toastPosition)
   const chatHeadsEnabled = useStore((s) => s.chatHeadsEnabled)
   const chatHeadsSize = useStore((s) => s.chatHeadsSize)
@@ -283,6 +284,7 @@ function DisplaySettings() {
   const chatHeadsCustomCompletionSound = useStore((s) => s.chatHeadsCustomCompletionSound)
   const setSetting = useStore((s) => s.setSetting)
   const addToast = useStore((s) => s.addToast)
+  const openModal = useStore((s) => s.openModal)
 
   const updateDrawer = (patch: Partial<DrawerSettings>) => {
     setSetting('drawerSettings', { ...drawerSettings, ...patch })
@@ -570,6 +572,16 @@ function DisplaySettings() {
           integer
           onChange={(value) => setSetting('landingPageChatsDisplayed', value ?? 12)}
         />
+      </div>
+
+      <div className={styles.field}>
+        <label className={styles.fieldLabel}>
+          {t('display.landing.hiddenCharacters', { count: landingHiddenCharacterIds.length })}
+        </label>
+        <Button variant="ghost" size="sm" onClick={() => openModal('hiddenFromHome')}>
+          {t('display.landing.manageHiddenCharacters')}
+        </Button>
+        <p className={styles.helperText}>{t('display.landing.hiddenCharactersHelper')}</p>
       </div>
 
     </div>
@@ -2918,6 +2930,8 @@ function ImageOptimizationSettings() {
 
 function AdvancedSettings() {
   const { t } = useTranslation('settings')
+  const spindleSettings = useStore((s) => s.spindleSettings)
+  const setSetting = useStore((s) => s.setSetting)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -2990,6 +3004,18 @@ function AdvancedSettings() {
       {/* Image Optimization accordion */}
       <CollapsibleSection title={t('advanced.imageOptimization')} defaultExpanded={false}>
         <ImageOptimizationSettings />
+      </CollapsibleSection>
+
+      <CollapsibleSection title={t('advanced.spindleLogging')} defaultExpanded={false}>
+        <Toggle.Checkbox
+          checked={spindleSettings.infoLoggingEnabled}
+          onChange={(infoLoggingEnabled) => setSetting('spindleSettings', {
+            ...spindleSettings,
+            infoLoggingEnabled,
+          })}
+          label={t('advanced.spindleInfoLogging')}
+          hint={t('advanced.spindleInfoLoggingHint')}
+        />
       </CollapsibleSection>
 
       {/* Long-Term Memory accordion */}

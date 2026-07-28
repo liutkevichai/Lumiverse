@@ -77,6 +77,19 @@ import type {
   VaultDTO,
   VaultReindexResultDTO,
   VaultWithContentsDTO,
+  BoundAssembleRequestDTO,
+  BoundAssemblyOutcomeDTO,
+  ConnectionDispatchDescriptorDTO,
+  ImageGenStreamEventDTO,
+  ImageGenStreamRequestDTO,
+  InterceptorContextDTO,
+  InterceptorDisposer,
+  InterceptorHandler,
+  InterceptorRegistrationMatchOptions,
+  InterceptorRegistrationOptions,
+  QuietTrackedRequestDTO,
+  QuietTrackedResultDTO,
+  SpindleHostDescriptorV1,
 } from "lumiverse-spindle-types";
 import type {
   MediaConvertAudioRequestDTO,
@@ -488,7 +501,9 @@ type RuntimeWorkerToHost =
       tabId?: string;
       viewId?: string;
       userId?: string;
-    };
+    }
+  | { type: "image_gen_generate_stream"; requestId: string; input: Record<string, unknown> }
+  | { type: "image_gen_cancel_stream"; requestId: string };
 
 type RuntimeHostToWorker =
   | HostToWorker
@@ -525,13 +540,18 @@ type RuntimeHostToWorker =
   | { type: "frontend_process_lifecycle"; event: FrontendProcessLifecycleEvent }
   | { type: "frontend_process_message"; processId: string; payload: unknown; userId: string }
   | { type: "backend_process_lifecycle"; event: BackendProcessLifecycleEvent }
-  | { type: "backend_process_message"; processId: string; payload: unknown; userId: string };
+  | { type: "backend_process_message"; processId: string; payload: unknown; userId: string }
+  | { type: "image_gen_stream_chunk"; requestId: string; event: ImageGenStreamEvent }
+  | { type: "image_gen_stream_error"; requestId: string; error: string };
+
+type ImageGenStreamEvent = ImageGenStreamEventDTO;
+type ImageGenStreamInput = ImageGenStreamRequestDTO;
 
 // `presets` is replaced wholesale (not intersected) because the local
 // PromptBlock type also carries host-only sealed-block provenance. Keeping the
 // runtime CRUD surface on the native type avoids narrowing data returned by
 // newer hosts when the installed public type package lags a release.
-type RuntimeSpindleAPI = Omit<SpindleAPI, "presets"> & {
+type RuntimeSpindleAPI = Omit<SpindleAPI, "presets" | "imageGen"> & {
   /** Read-only Lumia DLC catalog. Public extension types expose this as `spindle.dlc`. */
   dlc: {
     getCatalog(options?: { userId?: string }): Promise<LumiaDlcCatalog>;
@@ -546,6 +566,14 @@ type RuntimeSpindleAPI = Omit<SpindleAPI, "presets"> & {
     }): Promise<any>;
   };
   assemble(input: AssembleRequest, userId?: string): Promise<AssembleResult>;
+  imageGen: SpindleAPI["imageGen"] & {
+    /**
+     * Generate through a provider that explicitly supports WebSocket preview
+     * images and status updates. The terminal `done` event contains the saved
+     * image result. Breaking out of the iterator aborts the upstream job.
+     */
+    generateStream(input: ImageGenStreamInput): AsyncGenerator<ImageGenStreamEvent, void, void>;
+  };
   contracts: Readonly<Record<string, number>>;
   registerContextHandler(
     handler: (context: unknown) => Promise<unknown>,
@@ -785,6 +813,7 @@ type RuntimeSpindleAPI = Omit<SpindleAPI, "presets"> & {
 
 let manifest: SpindleManifest;
 let storagePath: string;
+let hostDescriptor: SpindleHostDescriptorV1 | null = null;
 
 const eventHandlers = new Map<string, Set<(payload: unknown, userId?: string) => void>>();
 const pendingResponses = new Map<
@@ -795,12 +824,15 @@ const streamingGenerations = new Map<
   string,
   { push: (chunk: StreamChunkDTO) => void; fail: (reason: unknown) => void }
 >();
+const streamingImageGenerations = new Map<
+  string,
+  { push: (event: ImageGenStreamEvent) => void; fail: (reason: unknown) => void }
+>();
+const interceptorAbortControllers = new Map<string, AbortController>();
 let interceptHandler:
-  | ((
-      messages: LlmMessageDTO[],
-      context: unknown
-    ) => Promise<LlmMessageDTO[] | InterceptorResultDTO>)
+  | InterceptorHandler
   | null = null;
+let interceptRegistrationId: string | null = null;
 let contextHandlerFn: ((context: unknown) => Promise<unknown>) | null = null;
 let messageContentProcessorFn:
   | ((ctx: unknown) => Promise<unknown>)
@@ -1027,6 +1059,37 @@ function requestAssembly(input: AssembleRequest, userId?: string): Promise<Assem
   });
 }
 
+/** Issue an RPC whose authority is bound to the currently active interceptor. */
+function requestBoundGeneration<T>(
+  type: "generate_assemble" | "generate_quiet_tracked",
+  input: BoundAssembleRequestDTO | QuietTrackedRequestDTO,
+): Promise<T> {
+  const signal = input.signal;
+  const { signal: _omit, ...payload } = input;
+  void _omit;
+
+  if (signal?.aborted) {
+    return Promise.reject(makeAbortError((signal.reason as Error | undefined)?.message));
+  }
+
+  const requestId = crypto.randomUUID();
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => post({ type: "cancel_generation", requestId });
+    pendingResponses.set(requestId, {
+      resolve: (value) => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve(value as T);
+      },
+      reject: (reason) => {
+        signal?.removeEventListener("abort", onAbort);
+        reject(reason);
+      },
+    });
+    signal?.addEventListener("abort", onAbort, { once: true });
+    post({ type, requestId, input: payload } as RuntimeWorkerToHost);
+  });
+}
+
 /**
  * Issue a `request_generation_stream` RPC and return an `AsyncGenerator`
  * that yields `StreamChunkDTO` values as the host forwards them. The
@@ -1118,9 +1181,86 @@ function requestGenerationStream(input: any): AsyncGenerator<StreamChunkDTO, voi
   })();
 }
 
+/**
+ * Start an image generation that exposes its provider WebSocket status and
+ * preview frames. The host rejects providers that did not opt into this
+ * capability, so extensions never receive a misleading partial stream.
+ */
+function requestImageGenStream(input: ImageGenStreamInput): AsyncGenerator<ImageGenStreamEvent, void, void> {
+  const signal = input?.signal;
+  const { signal: _omit, ...payload } = input ?? {};
+  void _omit;
+
+  if (signal?.aborted) {
+    const err = makeAbortError((signal.reason as any)?.message);
+    return (async function* (): AsyncGenerator<ImageGenStreamEvent, void, void> {
+      throw err;
+    })();
+  }
+
+  const requestId = crypto.randomUUID();
+  type QueueItem =
+    | { kind: "event"; event: ImageGenStreamEvent }
+    | { kind: "error"; error: unknown };
+
+  const queue: QueueItem[] = [];
+  let waiter: ((item: QueueItem) => void) | null = null;
+  let terminated = false;
+
+  const push = (event: ImageGenStreamEvent) => {
+    if (terminated) return;
+    if (event.type === "done") terminated = true;
+    if (waiter) {
+      const resolve = waiter;
+      waiter = null;
+      resolve({ kind: "event", event });
+    } else {
+      queue.push({ kind: "event", event });
+    }
+  };
+  const fail = (error: unknown) => {
+    if (terminated) return;
+    terminated = true;
+    if (waiter) {
+      const resolve = waiter;
+      waiter = null;
+      resolve({ kind: "error", error });
+    } else {
+      queue.push({ kind: "error", error });
+    }
+  };
+
+  streamingImageGenerations.set(requestId, { push, fail });
+  const onAbort = () => post({ type: "image_gen_cancel_stream", requestId });
+  signal?.addEventListener("abort", onAbort, { once: true });
+  post({ type: "image_gen_generate_stream", requestId, input: payload });
+
+  return (async function* (): AsyncGenerator<ImageGenStreamEvent, void, void> {
+    try {
+      while (true) {
+        const item = queue.length > 0
+          ? queue.shift()!
+          : await new Promise<QueueItem>((resolve) => { waiter = resolve; });
+        if (item.kind === "error") throw item.error;
+        yield item.event;
+        if (item.event.type === "done") return;
+      }
+    } finally {
+      streamingImageGenerations.delete(requestId);
+      signal?.removeEventListener("abort", onAbort);
+      if (!terminated) post({ type: "image_gen_cancel_stream", requestId });
+    }
+  })();
+}
+
 // ─── Spindle API (exposed to extensions as globalThis.spindle) ───────────
 
 const spindleApi: RuntimeSpindleAPI = {
+  get host(): SpindleHostDescriptorV1 {
+    if (!hostDescriptor) throw new Error("Spindle host descriptor is not initialized");
+    return hostDescriptor;
+  },
+
   on(event: string, handler: (payload: any) => void): () => void {
     if (!eventHandlers.has(event)) {
       eventHandlers.set(event, new Set());
@@ -1187,10 +1327,28 @@ const spindleApi: RuntimeSpindleAPI = {
     post({ type: "update_macro_value", name, value: String(value ?? "") });
   },
 
-  registerInterceptor(handler, priority?): void {
+  registerInterceptor(
+    handler: InterceptorHandler,
+    priorityOrOptions?: number | InterceptorRegistrationOptions,
+    options?: InterceptorRegistrationMatchOptions,
+  ): InterceptorDisposer {
     assertMutationAllowed("spindle.registerInterceptor()");
+    const registrationId = crypto.randomUUID();
+    const priority = typeof priorityOrOptions === "number"
+      ? priorityOrOptions
+      : priorityOrOptions?.priority;
+    const match = typeof priorityOrOptions === "number"
+      ? options?.match
+      : priorityOrOptions?.match;
     interceptHandler = handler;
-    post({ type: "register_interceptor", priority });
+    interceptRegistrationId = registrationId;
+    post({ type: "register_interceptor", registrationId, priority, ...(match ? { match } : {}) });
+    return () => {
+      if (interceptRegistrationId !== registrationId) return;
+      interceptHandler = null;
+      interceptRegistrationId = null;
+      post({ type: "unregister_interceptor", registrationId });
+    };
   },
 
   assemble(input, userId?: string) {
@@ -1208,6 +1366,12 @@ const spindleApi: RuntimeSpindleAPI = {
   },
 
   generate: {
+    assemble(input: BoundAssembleRequestDTO): Promise<BoundAssemblyOutcomeDTO> {
+      return requestBoundGeneration<BoundAssemblyOutcomeDTO>("generate_assemble", input);
+    },
+    quietTracked(input: QuietTrackedRequestDTO): Promise<QuietTrackedResultDTO> {
+      return requestBoundGeneration<QuietTrackedResultDTO>("generate_quiet_tracked", input);
+    },
     async raw(input) {
       return requestGeneration({ ...input, type: "raw" });
     },
@@ -1823,6 +1987,11 @@ const spindleApi: RuntimeSpindleAPI = {
       const result = await request({ type: "connections_get", requestId, connectionId, userId });
       return result as ConnectionProfileDTO | null;
     },
+    async resolveDispatch(connectionId: string): Promise<ConnectionDispatchDescriptorDTO | null> {
+      const requestId = crypto.randomUUID();
+      const result = await request({ type: "connections_resolve_dispatch", requestId, connectionId });
+      return result as ConnectionDispatchDescriptorDTO | null;
+    },
   },
 
   uploads: {
@@ -1884,6 +2053,9 @@ const spindleApi: RuntimeSpindleAPI = {
     async generate(input: any): Promise<any> {
       const requestId = crypto.randomUUID();
       return request({ type: "image_gen_generate", requestId, input });
+    },
+    generateStream(input: ImageGenStreamInput): AsyncGenerator<ImageGenStreamEvent, void, void> {
+      return requestImageGenStream(input);
     },
     async getProviders(userId?: string): Promise<any[]> {
       const requestId = crypto.randomUUID();
@@ -3745,6 +3917,7 @@ async function handleHostMessage(msg: RuntimeHostToWorker): Promise<void> {
     case "init": {
       manifest = msg.manifest;
       storagePath = msg.storagePath;
+      hostDescriptor = msg.host;
 
       // Expose the API globally
       (globalThis as any).spindle = spindleApi;
@@ -3845,9 +4018,14 @@ async function handleHostMessage(msg: RuntimeHostToWorker): Promise<void> {
     }
 
     case "intercept_request": {
-      if (interceptHandler) {
+      if (interceptHandler && interceptRegistrationId === msg.registrationId) {
+        const abortController = new AbortController();
+        interceptorAbortControllers.set(msg.requestId, abortController);
         try {
-          const result = await interceptHandler(msg.messages, msg.context);
+          const result = await interceptHandler(msg.messages, {
+            ...msg.context,
+            signal: abortController.signal,
+          });
           // Normalize: handler may return LlmMessageDTO[] or { messages, parameters? }
           const normalized: InterceptorResultDTO = Array.isArray(result)
             ? { messages: result }
@@ -3855,9 +4033,12 @@ async function handleHostMessage(msg: RuntimeHostToWorker): Promise<void> {
           post({
             type: "intercept_result",
             requestId: msg.requestId,
+            registrationId: msg.registrationId,
             messages: normalized.messages,
             ...(normalized.parameters ? { parameters: normalized.parameters } : {}),
             ...(normalized.breakdown ? { breakdown: normalized.breakdown } : {}),
+            ...(normalized.deferredGuidance ? { deferredGuidance: normalized.deferredGuidance } : {}),
+            ...(normalized.finalResponse ? { finalResponse: normalized.finalResponse } : {}),
           });
         } catch (err: any) {
           post({
@@ -3869,9 +4050,19 @@ async function handleHostMessage(msg: RuntimeHostToWorker): Promise<void> {
           post({
             type: "intercept_result",
             requestId: msg.requestId,
+            registrationId: msg.registrationId,
             messages: msg.messages,
           });
+        } finally {
+          interceptorAbortControllers.delete(msg.requestId);
         }
+      }
+      break;
+    }
+
+    case "intercept_abort": {
+      if (interceptRegistrationId === msg.registrationId) {
+        interceptorAbortControllers.get(msg.requestId)?.abort(msg.reason);
       }
       break;
     }
@@ -4037,6 +4228,23 @@ async function handleHostMessage(msg: RuntimeHostToWorker): Promise<void> {
         } else {
           stream.fail(new Error(msg.error));
         }
+      }
+      break;
+    }
+
+    case "image_gen_stream_chunk": {
+      streamingImageGenerations.get(msg.requestId)?.push(msg.event);
+      break;
+    }
+
+    case "image_gen_stream_error": {
+      const stream = streamingImageGenerations.get(msg.requestId);
+      if (stream) {
+        stream.fail(
+          msg.error.startsWith("AbortError:")
+            ? makeAbortError(msg.error.slice("AbortError:".length).trim())
+            : new Error(msg.error),
+        );
       }
       break;
     }

@@ -61,6 +61,11 @@ import type { RoomStateView } from '@/types/multiplayer'
 import type { CouncilToolResult } from 'lumiverse-spindle-types'
 import type { ActivatedWorldInfoEntry, WorldInfoStats } from '@/types/api'
 import { playNotificationPing } from '@/lib/notificationAudio'
+import {
+  extensionUpdateFingerprint,
+  pruneAnnouncedExtensionUpdates,
+  selectToastableExtensionUpdates,
+} from '@/lib/spindle/update-notifications'
 
 const LOCAL_STREAM_PLACEHOLDER_PREFIX = '__stream_placeholder_'
 const LOCAL_REGEN_PLACEHOLDER_PREFIX = '__regen_placeholder_'
@@ -74,6 +79,8 @@ function isLocalStreamPlaceholderId(id: string | null | undefined) {
 
 const MAX_TOAST_ERROR_LENGTH = 800
 const MULTIPLAYER_CHAT_HEAD_PREFIX = 'mp-room:'
+const EXTENSION_UPDATE_STARTUP_RETRY_MS = 1_000
+const EXTENSION_UPDATE_STARTUP_RETRY_MAX_MS = 5_000
 
 const LIVE_GENERATION_HEAD_STATUSES = new Set<ChatHeadStatus>([
   'assembling',
@@ -259,6 +266,35 @@ function fetchLatestMessages(chatId: string) {
   return messagesApi.list(chatId, { limit: pageSize, tail: true })
 }
 
+/**
+ * GENERATION_STARTED is a durable confirmation that the backend has already
+ * staged the target swipe. Reflect it locally as well as listening for
+ * MESSAGE_SWIPED: a list response or a short websocket gap must not leave the
+ * streaming marker pointing past the visible swipe count.
+ */
+function ensureStreamingTargetSwipe(
+  state: ReturnType<typeof useStore.getState>,
+  payload: GenerationStartedPayload,
+): void {
+  if (
+    payload.generationType !== 'swipe' ||
+    !payload.targetMessageId ||
+    payload.targetSwipeId == null
+  ) return
+
+  const message = state.messages.find((item) => item.id === payload.targetMessageId)
+  if (!message || message.swipes.length > payload.targetSwipeId) return
+
+  const missing = payload.targetSwipeId - message.swipes.length + 1
+  const now = Math.floor(Date.now() / 1000)
+  state.updateMessage(message.id, {
+    swipes: [...message.swipes, ...Array<string | null>(missing).fill('')],
+    swipe_dates: [...message.swipe_dates, ...Array<number>(missing).fill(now)],
+    swipe_id: payload.targetSwipeId,
+    content: '',
+  })
+}
+
 // Deferred generation metrics (tokenCount / TTFT / TPS / model / provider) are
 // persisted *after* GENERATION_ENDED and pushed via GENERATION_METRICS_READY,
 // which races that event's reconciliation re-fetch (the fetch can read the row
@@ -368,16 +404,20 @@ export function useWebSocket() {
   const store = useStore
   const isAuthenticated = useStore((s) => s.isAuthenticated)
   const userRole = useStore((s) => s.user?.role)
+  const settingsLoaded = useStore((s) => s.settingsLoaded)
   const activeChatId = useStore((s) => s.activeChatId)
+  const spindleInfoLoggingEnabled = useStore((s) => s.spindleSettings.infoLoggingEnabled)
   const lastExtensionSyncAtRef = useRef(0)
   const lastOperatorUpdateToastKeyRef = useRef<string | null>(null)
-  /**
-   * Set to true when the socket closes after we'd already had a fully healthy
-   * connection — i.e. an actual drop, not the initial connect. The next pong
-   * that completes the recovery will trigger one bundle-update check and clear
-   * the flag, so checks only fire on reconnect-after-drop.
-   */
-  const pendingReconnectCheckRef = useRef(false)
+  const announcedExtensionUpdatesRef = useRef<Set<string>>(new Set())
+  // Set only after a confirmed healthy session drops. The following verified
+  // reconnect then gets one prompt service-worker update check, which catches
+  // bundles rebuilt while the server was unavailable.
+  const pendingReconnectBundleCheckRef = useRef(false)
+
+  useEffect(() => {
+    wsClient.setSpindleInfoLogging(spindleInfoLoggingEnabled)
+  }, [spindleInfoLoggingEnabled])
 
   useEffect(() => {
     if (!isAuthenticated) {
@@ -430,6 +470,98 @@ export function useWebSocket() {
   }, [isAuthenticated, store, userRole])
 
   useEffect(() => {
+    if (!isAuthenticated) {
+      announcedExtensionUpdatesRef.current = new Set()
+      return
+    }
+
+    let cancelled = false
+    let startupRetryTimer: number | null = null
+    let startupRetryDelay = EXTENSION_UPDATE_STARTUP_RETRY_MS
+    let initialSnapshotComplete = false
+
+    function scheduleStartupRetry() {
+      if (cancelled || startupRetryTimer !== null) return
+      const delay = startupRetryDelay
+      startupRetryTimer = window.setTimeout(() => {
+        startupRetryTimer = null
+        startupRetryDelay = Math.min(
+          startupRetryDelay * 2,
+          EXTENSION_UPDATE_STARTUP_RETRY_MAX_MS,
+        )
+        void syncExtensionUpdates()
+      }, delay)
+    }
+
+    async function syncExtensionUpdates() {
+      try {
+        const snapshot = await spindleApi.getUpdates()
+        if (cancelled) return
+
+        store.getState().setExtensionUpdates(snapshot.updates)
+        if (snapshot.checkedAt === null || snapshot.checking) {
+          scheduleStartupRetry()
+          return
+        }
+        initialSnapshotComplete = true
+        startupRetryDelay = EXTENSION_UPDATE_STARTUP_RETRY_MS
+        if (!settingsLoaded) return
+
+        const announced = pruneAnnouncedExtensionUpdates(
+          announcedExtensionUpdatesRef.current,
+          snapshot.updates,
+        )
+        const newToastable = selectToastableExtensionUpdates(
+          snapshot.updates,
+          store.getState().spindleSettings.extensionUpdateToastDisabled,
+          announced,
+        )
+        announcedExtensionUpdatesRef.current = announced
+        if (newToastable.length === 0) return
+
+        for (const update of newToastable) {
+          announcedExtensionUpdatesRef.current.add(extensionUpdateFingerprint(update))
+        }
+
+        const shownNames = newToastable.slice(0, 3).map((update) => update.name)
+        const remaining = newToastable.length - shownNames.length
+        const suffix = shownNames.length > 0
+          ? `: ${shownNames.join(', ')}${remaining > 0 ? ` +${remaining}` : ''}`
+          : ''
+        toast.info(
+          i18n.t('common.toast.extensionUpdatesAvailable', {
+            count: newToastable.length,
+            suffix,
+          }),
+          {
+            title: i18n.t('common.toast.extensionUpdateTitle'),
+            duration: 8000,
+            action: {
+              label: i18n.t('common.toast.viewExtensions'),
+              onClick: () => {
+                const state = store.getState()
+                state.closeSettings()
+                state.openDrawer('spindle')
+              },
+            },
+          },
+        )
+      } catch {
+        if (!initialSnapshotComplete) scheduleStartupRetry()
+      }
+    }
+
+    void syncExtensionUpdates()
+    const interval = window.setInterval(syncExtensionUpdates, 30_000)
+
+    return () => {
+      cancelled = true
+      window.clearInterval(interval)
+      if (startupRetryTimer !== null) window.clearTimeout(startupRetryTimer)
+    }
+  }, [isAuthenticated, settingsLoaded, store])
+
+  useEffect(() => {
     if (!isAuthenticated) return
 
     const syncExtensions = (force = false) => {
@@ -455,18 +587,15 @@ export function useWebSocket() {
       }),
       wsClient.on(WS_CLOSE, () => {
         store.getState().setWsConnected(false)
-        // If the user had a working connection before this close, remember to
-        // ask the SW for a fresh bundle once we recover. Initial-load failures
-        // (wsHasEverConnected still false) shouldn't trigger an update check.
         if (store.getState().wsHasEverConnected) {
-          pendingReconnectCheckRef.current = true
+          pendingReconnectBundleCheckRef.current = true
         }
       }),
       wsClient.on(WS_PONG, () => {
         store.getState().setWsRoundTripVerified(true)
-        if (pendingReconnectCheckRef.current) {
-          pendingReconnectCheckRef.current = false
-          checkForBundleUpdate()
+        if (pendingReconnectBundleCheckRef.current) {
+          pendingReconnectBundleCheckRef.current = false
+          void checkForBundleUpdate()
         }
       }),
       wsClient.on(WS_AUTH_ERROR, () => {
@@ -609,6 +738,7 @@ export function useWebSocket() {
           // Anchor the streaming buffer to its swipe so the user can navigate to
           // other swipes mid-generation without smearing live tokens onto them.
           state.setStreamingSwipeId(payload.targetSwipeId ?? null)
+          ensureStreamingTargetSwipe(state, payload)
           // A new generation supersedes any stale "new swipe ready" badge on this
           // message — the upcoming completion will re-flag the fresh swipe if needed.
           if (payload.targetMessageId) state.clearUnseenSwipe(payload.targetMessageId)
@@ -638,6 +768,7 @@ export function useWebSocket() {
           // Refine (never clobber) the swipe anchor — GENERATION_STARTED is the
           // authoritative source; only overwrite if this event actually carries it.
           if (payload.targetSwipeId != null) state.setStreamingSwipeId(payload.targetSwipeId)
+          ensureStreamingTargetSwipe(state, payload)
 
           // Surface context clipping once the final assembly metadata is ready.
           const clip = payload.contextClipStats
@@ -1336,7 +1467,17 @@ export function useWebSocket() {
           payload.operation,
           payload.name ?? null
         )
+        if (payload.operation === 'disabled' && payload.extensionId) {
+          const state = useStore.getState()
+          state.setExtensionUpdates(
+            state.extensionUpdates.filter((update) => update.extensionId !== payload.extensionId),
+          )
+        }
         if (payload.operation === 'updated' && payload.extensionId) {
+          const state = useStore.getState()
+          state.setExtensionUpdates(
+            state.extensionUpdates.filter((update) => update.extensionId !== payload.extensionId),
+          )
           // Force a list refresh so the status dot reflects the post-restart state
           syncExtensions(true)
           const ext = useStore.getState().extensions.find((e) => e.id === payload.extensionId)
@@ -1369,11 +1510,18 @@ export function useWebSocket() {
         rssKb: number | null
         startupMs?: number
       }) => {
-        console.info('[Spindle] Runtime stats:', payload)
+        if (store.getState().spindleSettings.infoLoggingEnabled) {
+          console.info('[Spindle] Runtime stats:', payload)
+        }
       }),
 
       wsClient.on(EventType.SPINDLE_BULK_UPDATE_COMPLETE, (payload: { total: number; updated: number; failed: number; errors: Array<{ id: string; name: string; error: string }> }) => {
         const { total, updated, failed, errors } = payload
+        const failedIds = new Set(errors.map((error) => error.id))
+        const currentState = useStore.getState()
+        currentState.setExtensionUpdates(
+          currentState.extensionUpdates.filter((update) => failedIds.has(update.extensionId)),
+        )
         useStore.getState().setBulkUpdateStatus({
           total,
           completed: updated,
