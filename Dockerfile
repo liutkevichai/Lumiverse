@@ -90,6 +90,14 @@ COPY --from=frontend-build /app/frontend/package.json ./frontend/package.json
 COPY package.json ./
 COPY src/ ./src/
 
+# Maintenance scripts (password reset, backfills, etc.). Needed at runtime so
+# operators can run `bun run reset-password` and friends inside a deployed
+# container (Docker, Railway, …); without this the script resolves to a path
+# that isn't in the image and fails with "Module not found". `.dockerignore`
+# still excludes the heavy dev-only scripts (setup wizard, runner, SillyTavern
+# migration).
+COPY scripts/ ./scripts/
+
 # Create data directory with correct ownership
 RUN mkdir -p /app/data && chown -R bun:bun /app/data
 
@@ -105,8 +113,15 @@ ENV TRUST_ANY_ORIGIN=true
 
 EXPOSE 7860
 
-# Persist database, encryption identity, avatars, images, extensions
-VOLUME /app/data
+# Persist database, encryption identity, avatars, images, extensions.
+#
+# No `VOLUME /app/data` declaration: Railway rejects the instruction outright
+# ("docker VOLUME ... is not supported, use Railway Volumes") and fails the
+# build. The declaration was only ever a convenience for bare `docker run` —
+# docker-compose.yml already mounts the named `lumiverse-data` volume at
+# /app/data explicitly, so compose deployments are unaffected. Bare `docker run`
+# users should pass `-v lumiverse-data:/app/data`; PaaS users attach the
+# platform's own volume at /app/data (or point DATA_DIR at its mount path).
 
 # Health check — hit the root (serves frontend) to verify the server is alive
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
