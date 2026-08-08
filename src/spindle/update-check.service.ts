@@ -28,7 +28,6 @@ const activeExtensionChecks = new Map<
 >();
 let lastCheckedAt: number | null = null;
 let activeCheck: Promise<ExtensionUpdateSnapshot> | null = null;
-let intervalTimer: ReturnType<typeof setInterval> | null = null;
 
 async function inspectExtension(
   ext: managerSvc.ExtensionUpdateCandidate,
@@ -191,29 +190,24 @@ export function clearCachedExtensionUpdate(extensionId: string): void {
 }
 
 /**
- * Lazy-start: run the first check and arm the periodic timer. Called on the
- * first user-facing request that needs update data (e.g. GET /spindle/updates)
- * instead of unconditionally at boot, so idle containers don't generate
- * outbound git traffic that prevents Railway Serverless sleep.
+ * On-demand freshness gate: trigger a background update check if the cache is
+ * stale (older than UPDATE_CHECK_INTERVAL_MS) or has never been populated.
+ * Called from the GET /spindle/updates handler so checks only happen while the
+ * user is actively viewing the updates page — no persistent setInterval that
+ * would generate outbound git traffic and prevent Railway Serverless sleep.
  */
 export function ensureExtensionUpdateMonitor(): void {
-  if (intervalTimer || lastCheckedAt !== null || activeCheck) return;
-
-  void refreshExtensionUpdates();
-
-  intervalTimer = setInterval(() => {
-    void refreshExtensionUpdates();
-  }, UPDATE_CHECK_INTERVAL_MS);
-
-  if (typeof intervalTimer.unref === "function") intervalTimer.unref();
+  if (activeCheck) return;
+  const stale =
+    lastCheckedAt === null ||
+    Date.now() - lastCheckedAt >= UPDATE_CHECK_INTERVAL_MS;
+  if (stale) void refreshExtensionUpdates();
 }
 
 export function startExtensionUpdateMonitor(): void {
-  // Kept for backward compatibility (runner, desktop wrapper) but now a
-  // no-op — the monitor starts lazily via ensureExtensionUpdateMonitor().
+  // No-op — kept for backward compatibility (runner, desktop wrapper).
 }
 
 export function stopExtensionUpdateMonitor(): void {
-  if (intervalTimer) clearInterval(intervalTimer);
-  intervalTimer = null;
+  // No-op — no persistent timer to stop.
 }
