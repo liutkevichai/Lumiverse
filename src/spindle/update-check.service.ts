@@ -190,15 +190,27 @@ export function clearCachedExtensionUpdate(extensionId: string): void {
   );
 }
 
-export function startExtensionUpdateMonitor(): void {
-  if (intervalTimer) return;
+/**
+ * Lazy-start: run the first check and arm the periodic timer. Called on the
+ * first user-facing request that needs update data (e.g. GET /spindle/updates)
+ * instead of unconditionally at boot, so idle containers don't generate
+ * outbound git traffic that prevents Railway Serverless sleep.
+ */
+export function ensureExtensionUpdateMonitor(): void {
+  if (intervalTimer || lastCheckedAt !== null || activeCheck) return;
+
+  void refreshExtensionUpdates();
 
   intervalTimer = setInterval(() => {
     void refreshExtensionUpdates();
   }, UPDATE_CHECK_INTERVAL_MS);
 
   if (typeof intervalTimer.unref === "function") intervalTimer.unref();
-  void refreshExtensionUpdates();
+}
+
+export function startExtensionUpdateMonitor(): void {
+  // Kept for backward compatibility (runner, desktop wrapper) but now a
+  // no-op — the monitor starts lazily via ensureExtensionUpdateMonitor().
 }
 
 export function stopExtensionUpdateMonitor(): void {

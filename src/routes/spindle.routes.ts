@@ -58,6 +58,7 @@ app.get("/", async (c) => {
 // GET /api/v1/spindle/updates — Return the cached update set filtered to
 // extensions the current viewer is allowed to manage.
 app.get("/updates", async (c) => {
+  updateCheckSvc.ensureExtensionUpdateMonitor();
   const viewer = getViewer(c);
   const manageableIds = new Set(
     managerSvc.getManageableExtensionIdsForUser(viewer.userId, viewer.role)
