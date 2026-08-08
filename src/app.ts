@@ -542,8 +542,15 @@ if (env.frontendDir) {
 
   app.use("*", serveStatic({ root: env.frontendDir }));
 
-  // SPA fallback: serve index.html for any non-API route not matched above
-  app.use("*", serveStatic({ root: env.frontendDir, path: "index.html" }));
+  // SPA fallback: serve index.html for any non-API route not matched above.
+  // API paths must NOT fall through here — unmatched /api/* requests should
+  // 404 (via app.notFound below), not serve the SPA shell with a 200. Bots
+  // and security scanners that probe paths like /api/swagger otherwise see a
+  // live 200, which counts as activity and prevents Railway Serverless sleep.
+  app.use("*", async (c, next) => {
+    if (c.req.path.startsWith("/api/")) return next();
+    return serveStatic({ root: env.frontendDir, path: "index.html" })(c, next);
+  });
 }
 
 app.notFound((c) => c.json({ error: "Not found" }, 404));
