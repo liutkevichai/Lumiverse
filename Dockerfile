@@ -123,9 +123,11 @@ EXPOSE 7860
 # users should pass `-v lumiverse-data:/app/data`; PaaS users attach the
 # platform's own volume at /app/data (or point DATA_DIR at its mount path).
 
-# Health check — hit the root (serves frontend) to verify the server is alive
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD bun -e "fetch('http://localhost:' + (Bun.env.PORT || '7860')).then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+# Health check disabled — Railway Serverless treats the periodic localhost fetch
+# as incoming activity, which resets the idle timer and prevents the container
+# from ever sleeping. Railway has its own proxy-level health detection.
+# HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+#   CMD bun -e "fetch('http://localhost:' + (Bun.env.PORT || '7860')).then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 
 # Run as non-root
 USER bun
