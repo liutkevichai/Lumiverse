@@ -89,6 +89,10 @@ export async function spawnAsync(
   cmd: string[],
   opts: SpawnAsyncOptions = {}
 ): Promise<SpawnAsyncResult> {
+  if (cmd[0] === "git" && (cmd.includes("ls-remote") || cmd.includes("fetch") || cmd.includes("pull"))) {
+    const stack = new Error().stack?.split("\n").slice(1, 6).join("\n") ?? "(no stack)";
+    console.log(`[git:debug] spawnAsync: ${cmd.join(" ")} cwd=${opts.cwd ?? "?"}\n${stack}`);
+  }
   const hasTimeout = typeof opts.timeoutMs === "number" && opts.timeoutMs > 0;
 
   // Bun enforces this deadline in its subprocess implementation. This is
