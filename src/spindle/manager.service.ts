@@ -1919,7 +1919,6 @@ export async function importLocalExtensions(): Promise<{
 
 /** List remote branches from a GitHub URL (pre-install discovery). */
 export function listRemoteBranches(githubUrl: string): string[] {
-  console.log(`[git:debug] listRemoteBranches(${githubUrl})\n${new Error().stack?.split("\n").slice(1, 6).join("\n") ?? ""}`);
   const proc = Bun.spawnSync({
     cmd: ["git", "ls-remote", "--heads", githubUrl],
     timeout: 15_000,
@@ -1937,7 +1936,6 @@ export function listRemoteBranches(githubUrl: string): string[] {
 
 /** List branches for an already-installed extension by querying its remote. */
 export function getBranches(identifier: string): { current: string | null; branches: string[] } {
-  console.log(`[git:debug] getBranches(${identifier})\n${new Error().stack?.split("\n").slice(1, 6).join("\n") ?? ""}`);
   const repo = repoDir(identifier);
   if (!existsSync(repo)) {
     throw new Error(`Extension repo not found: ${identifier}`);

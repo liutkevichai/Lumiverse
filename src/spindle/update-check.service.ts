@@ -4,8 +4,6 @@ import { probeGitRepositoryForUpdate } from "./update-check-git";
 const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1_000;
 const UPDATE_CHECK_CONCURRENCY = 3;
 
-console.log(`[Spindle:debug] UPDATE_CHECK_INTERVAL_MS = ${UPDATE_CHECK_INTERVAL_MS} (${UPDATE_CHECK_INTERVAL_MS / 60_000} min)`);
-
 export interface ExtensionUpdateInfo {
   extensionId: string;
   identifier: string;
@@ -111,8 +109,6 @@ async function checkAllExtensions(): Promise<ExtensionUpdateSnapshot> {
 }
 
 export function refreshExtensionUpdates(): Promise<ExtensionUpdateSnapshot> {
-  const stack = new Error().stack?.split("\n").slice(1, 5).join("\n") ?? "(no stack)";
-  console.log(`[Spindle:debug] refreshExtensionUpdates() called. activeCheck=${!!activeCheck}\n${stack}`);
   if (activeCheck) return activeCheck;
 
   activeCheck = checkAllExtensions()
@@ -133,8 +129,6 @@ export function refreshExtensionUpdates(): Promise<ExtensionUpdateSnapshot> {
 export function refreshExtensionUpdate(
   extensionId: string,
 ): Promise<ExtensionUpdateSnapshot> {
-  const stack = new Error().stack?.split("\n").slice(1, 5).join("\n") ?? "(no stack)";
-  console.log(`[Spindle:debug] refreshExtensionUpdate(${extensionId}) called\n${stack}`);
   const existing = activeExtensionChecks.get(extensionId);
   if (existing) return existing;
 
@@ -203,13 +197,10 @@ export function clearCachedExtensionUpdate(extensionId: string): void {
  * would generate outbound git traffic and prevent Railway Serverless sleep.
  */
 export function ensureExtensionUpdateMonitor(): void {
-  const age = lastCheckedAt === null ? "never" : `${((Date.now() - lastCheckedAt) / 1000).toFixed(0)}s ago`;
   const stale =
     lastCheckedAt === null ||
     Date.now() - lastCheckedAt >= UPDATE_CHECK_INTERVAL_MS;
   if (stale) {
-    const stack = new Error().stack?.split("\n").slice(1, 5).join("\n") ?? "(no stack)";
-    console.log(`[Spindle:debug] ensureExtensionUpdateMonitor() → STALE (lastChecked: ${age}), triggering check\n${stack}`);
     void refreshExtensionUpdates();
   }
 }
