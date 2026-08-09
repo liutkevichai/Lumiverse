@@ -3,6 +3,9 @@ import type { TokenizerConfig, TokenizerModelPattern, TokenCountResult, TokenCou
 import { getTextContent, type AssemblyBreakdownEntry, type LlmMessage } from "../llm/types";
 import { validateHost, SSRFError } from "../utils/safe-fetch";
 import { hfAuthHeaders } from "./huggingface.service";
+import { env } from "../env";
+import { join } from "node:path";
+import { existsSync, mkdirSync, statSync } from "node:fs";
 
 export interface TokenCountMessageLike {
   role: "system" | "user" | "assistant";
@@ -20,6 +23,8 @@ export interface TokenCountMessageLike {
  * would never engage). On timeout the fetch throws and the fallback kicks in.
  */
 const TOKENIZER_FETCH_TIMEOUT_MS = 30_000;
+const TOKENIZER_DISK_CACHE_TTL_MS = 24 * 60 * 60 * 1_000;
+const TOKENIZER_DISK_CACHE_DIR = join(env.dataDir, "tokenizer-cache");
 
 async function validateTokenizerUrl(url: string, label: string): Promise<void> {
   let parsed: URL;
@@ -218,6 +223,46 @@ async function loadOpenAI(config: TokenizerConfig): Promise<TokenizerInstance> {
   return { count: (text: string) => encode(text).length };
 }
 
+function ensureDiskCacheDir(): void {
+  if (!existsSync(TOKENIZER_DISK_CACHE_DIR)) {
+    mkdirSync(TOKENIZER_DISK_CACHE_DIR, { recursive: true });
+  }
+}
+
+function isDiskCacheFresh(path: string): boolean {
+  try {
+    return Date.now() - statSync(path).mtimeMs < TOKENIZER_DISK_CACHE_TTL_MS;
+  } catch {
+    return false;
+  }
+}
+
+async function fetchJsonCached(url: string, headers?: Record<string, string>): Promise<any> {
+  ensureDiskCacheDir();
+  const cachePath = join(TOKENIZER_DISK_CACHE_DIR, `${Bun.hash(url).toString(16)}.json`);
+  if (isDiskCacheFresh(cachePath)) {
+    return JSON.parse(await Bun.file(cachePath).text());
+  }
+  const resp = await fetch(url, { signal: AbortSignal.timeout(TOKENIZER_FETCH_TIMEOUT_MS), headers });
+  if (!resp.ok) throw new Error(`Failed to fetch ${url}: ${resp.status}`);
+  const json = await resp.json();
+  await Bun.write(cachePath, JSON.stringify(json));
+  return json;
+}
+
+async function fetchTextCached(url: string, headers?: Record<string, string>): Promise<string> {
+  ensureDiskCacheDir();
+  const cachePath = join(TOKENIZER_DISK_CACHE_DIR, `${Bun.hash(url).toString(16)}.txt`);
+  if (isDiskCacheFresh(cachePath)) {
+    return Bun.file(cachePath).text();
+  }
+  const resp = await fetch(url, { signal: AbortSignal.timeout(TOKENIZER_FETCH_TIMEOUT_MS), headers });
+  if (!resp.ok) throw new Error(`Failed to fetch ${url}: ${resp.status}`);
+  const text = await resp.text();
+  await Bun.write(cachePath, text);
+  return text;
+}
+
 async function loadHuggingFace(config: TokenizerConfig): Promise<TokenizerInstance> {
   const cfg = config.config;
 
@@ -257,9 +302,7 @@ async function loadHuggingFace(config: TokenizerConfig): Promise<TokenizerInstan
     // try fetching the JSON data manually and use fromPreTrained() instead of fromPreTrainedUrls()
     if (configUrl === cfg.url) {
       await validateTokenizerUrl(cfg.url, "tokenizer url");
-      const resp = await fetch(cfg.url, { signal: AbortSignal.timeout(TOKENIZER_FETCH_TIMEOUT_MS), headers: await hfAuthHeaders(cfg.url) });
-      if (!resp.ok) throw new Error(`Failed to fetch tokenizer.json from ${cfg.url}: ${resp.status}`);
-      const tokenizerJSON = await resp.json();
+      const tokenizerJSON = await fetchJsonCached(cfg.url, await hfAuthHeaders(cfg.url));
       const tokenizer = withoutBenignTokenizerWarning(() => TokenizerLoader.fromPreTrained({
         tokenizerJSON,
         tokenizerConfig: { tokenizer_class: "PreTrainedTokenizer" },
@@ -267,16 +310,10 @@ async function loadHuggingFace(config: TokenizerConfig): Promise<TokenizerInstan
       return { count: (text: string) => tokenizer.encode(text).length };
     }
 
-    // Fetch both files ourselves so warning suppression is scoped only to construction,
-    // not the whole network request inside fromPreTrainedUrls().
     await validateTokenizerUrl(cfg.url, "tokenizer url");
     await validateTokenizerUrl(configUrl, "tokenizer config url");
-    const tokenizerResp = await fetch(cfg.url, { signal: AbortSignal.timeout(TOKENIZER_FETCH_TIMEOUT_MS), headers: await hfAuthHeaders(cfg.url) });
-    if (!tokenizerResp.ok) throw new Error(`Failed to fetch tokenizer.json from ${cfg.url}: ${tokenizerResp.status}`);
-    const configResp = await fetch(configUrl, { signal: AbortSignal.timeout(TOKENIZER_FETCH_TIMEOUT_MS), headers: await hfAuthHeaders(configUrl) });
-    if (!configResp.ok) throw new Error(`Failed to fetch tokenizer_config.json from ${configUrl}: ${configResp.status}`);
-    const tokenizerJSON = await tokenizerResp.json();
-    const tokenizerConfig = await configResp.json();
+    const tokenizerJSON = await fetchJsonCached(cfg.url, await hfAuthHeaders(cfg.url));
+    const tokenizerConfig = await fetchJsonCached(configUrl, await hfAuthHeaders(configUrl));
     const tokenizer = withoutBenignTokenizerWarning(() =>
       TokenizerLoader.fromPreTrained({ tokenizerJSON, tokenizerConfig })
     );
@@ -330,9 +367,7 @@ async function loadTiktoken(config: TokenizerConfig): Promise<TokenizerInstance>
   if (!cfg.url) throw new Error("Tiktoken requires 'url' in config pointing to .model file");
 
   await validateTokenizerUrl(cfg.url, "tiktoken model url");
-  const resp = await fetch(cfg.url, { signal: AbortSignal.timeout(TOKENIZER_FETCH_TIMEOUT_MS), headers: await hfAuthHeaders(cfg.url) });
-  if (!resp.ok) throw new Error(`Failed to fetch tiktoken model from ${cfg.url}`);
-  const rawBpe = await resp.text();
+  const rawBpe = await fetchTextCached(cfg.url, await hfAuthHeaders(cfg.url));
 
   // js-tiktoken's constructor expects its own compressed rank format
   // (`<sentinel> <offset> <tok0> <tok1> ...` on a single line — see
@@ -348,14 +383,11 @@ async function loadTiktoken(config: TokenizerConfig): Promise<TokenizerInstance>
   if (cfg.configUrl) {
     try {
       await validateTokenizerUrl(cfg.configUrl, "tiktoken config url");
-      const configResp = await fetch(cfg.configUrl, { headers: await hfAuthHeaders(cfg.configUrl) });
-      if (configResp.ok) {
-        const configData = await configResp.json();
-        if (configData.added_tokens_decoder) {
-          for (const [id, tok] of Object.entries(configData.added_tokens_decoder)) {
-            if ((tok as any).special) {
-              specialTokens[(tok as any).content] = parseInt(id, 10);
-            }
+      const configData = await fetchJsonCached(cfg.configUrl, await hfAuthHeaders(cfg.configUrl));
+      if (configData.added_tokens_decoder) {
+        for (const [id, tok] of Object.entries(configData.added_tokens_decoder)) {
+          if ((tok as any).special) {
+            specialTokens[(tok as any).content] = parseInt(id, 10);
           }
         }
       }
