@@ -24,6 +24,7 @@ import type {
   AdvancedSettings,
   PromptVariableDef,
   PromptVariableValue,
+  PromptVariableValues,
 } from "../types/preset";
 import type { WorldInfoCache, WorldBookEntry } from "../types/world-book";
 import type { Character } from "../types/character";
@@ -1169,8 +1170,8 @@ const ZERO_EXCLUDES_SAMPLER = new Set([
 
 /**
  * Default sampler values — mirrors the frontend's `defaultHint` from SAMPLER_PARAMS.
- * When samplerOverrides is enabled but a value is null, these are sent to ensure
- * generation behavior matches what the user sees in the UI sliders.
+ * When samplerOverrides is enabled but a value is null, these are sent for
+ * controls without an include toggle so generation behavior matches the UI.
  *
  * Only includes params that should ALWAYS be sent when enabled. Opt-in params
  * (frequencyPenalty, presencePenalty, repetitionPenalty) are excluded — a null
@@ -1179,7 +1180,6 @@ const ZERO_EXCLUDES_SAMPLER = new Set([
 const SAMPLER_DEFAULTS: Record<string, number> = {
   maxTokens: 16384,
   temperature: 1.0,
-  topP: 0.95,
 };
 
 interface GuidedGeneration {
@@ -1252,6 +1252,17 @@ function appendBaseRole(role: string): "user" | "assistant" {
 }
 
 /**
+ * A resolved profile owns its variable scope. Missing values use the variable
+ * definition's default rather than leaking selections from the shared preset.
+ */
+function resolveStoredPromptVariableValues(
+  presetValues: Record<string, Record<string, PromptVariableValue>>,
+  profileValues?: PromptVariableValues,
+): Record<string, Record<string, PromptVariableValue>> {
+  return profileValues === undefined ? presetValues : profileValues;
+}
+
+/**
  * Resolve one preset block within its own placement context. This deliberately
  * wraps the existing single macro evaluation rather than scheduling a second
  * pass, so the placement macros are strictly observational.
@@ -1281,11 +1292,13 @@ export function resolvePromptVariables(
   env: MacroEnv,
   blocks: PromptBlock[],
   preset: Preset | null,
+  profileValues?: PromptVariableValues,
 ): void {
-  const stored = (preset?.metadata?.promptVariables ?? {}) as Record<
+  const presetValues = (preset?.metadata?.promptVariables ?? {}) as Record<
     string,
     Record<string, PromptVariableValue>
   >;
+  const stored = resolveStoredPromptVariableValues(presetValues, profileValues);
 
   const values: Record<string, string | number> = {};
   const defaults: Record<string, string | number> = {};
@@ -1451,11 +1464,13 @@ function isPromptBlockPlacement(value: unknown): value is Pick<PromptBlock, "rol
 export function resolvePromptBlockPlacements(
   blocks: PromptBlock[],
   preset: Pick<Preset, "metadata"> | null,
+  profileValues?: PromptVariableValues,
 ): PromptBlock[] {
-  const stored = (preset?.metadata?.promptVariables ?? {}) as Record<
+  const presetValues = (preset?.metadata?.promptVariables ?? {}) as Record<
     string,
     Record<string, PromptVariableValue>
   >;
+  const stored = resolveStoredPromptVariableValues(presetValues, profileValues);
 
   return blocks.map((block) => {
     const binding = block.placementBinding;
@@ -2410,12 +2425,15 @@ export async function assemblePrompt(
   // Prompt variables — resolve creator-defined schemas + end-user overrides and
   // surface them on env.extra so {{var::name}} / {{hasVar::name}} / {{varDefault::name}}
   // can read consistent values across every block in this assembly.
-  resolvePromptVariables(macroEnv, blocks, preset);
+  const profilePromptVariables = resolvedProfile.binding
+    ? resolvedProfile.binding.prompt_variables ?? {}
+    : undefined;
+  resolvePromptVariables(macroEnv, blocks, preset, profilePromptVariables);
 
   // A select variable may choose an in-memory insertion profile for its own
   // block. Project that configuration before ordering/rendering, rather than
   // asking macro output to mutate placement during the render pass.
-  const effectiveBlocks = resolvePromptBlockPlacements(blocks, preset);
+  const effectiveBlocks = resolvePromptBlockPlacements(blocks, preset, profilePromptVariables);
   reorderBlocksByPosition(effectiveBlocks);
 
   // Use prefetched settings or batch-load all needed settings in a single query
@@ -7122,7 +7140,8 @@ export function buildParameters(
     params._streaming = false;
   }
 
-  // Sampler overrides — when enabled, apply user values (or defaults for core params).
+  // Sampler overrides — when enabled, apply user values (or defaults for
+  // controls without an include toggle).
   // A value of 0 on selected sampling params means "exclude from request", allowing
   // users to avoid provider conflicts (e.g. Claude rejects requests with both
   // temperature and top_p). top_k is handled separately via an explicit UI toggle.
@@ -7211,7 +7230,7 @@ export function buildParameters(
  * - DeepSeek:    thinking + reasoning_effort (OpenAI-format API). Effort is
  *                normalized to high/max per the official docs.
  * - OpenRouter:  reasoning: { effort } with values: none/minimal/low/medium/high/xhigh
- * - NanoGPT:     reasoning: { effort } with values: none/minimal/low/medium/high.
+ * - NanoGPT:     reasoning: { effort } with values: none/minimal/low/medium/high/xhigh.
  *                Object form is used so `reasoning.exclude = true` can suppress
  *                thinking on `:thinking`-suffixed models when the user disables
  *                API reasoning (the `:thinking` suffix activates reasoning
@@ -7339,8 +7358,8 @@ export function injectReasoningParams(
     // `reasoning_effort` and nested `reasoning.effort` are equivalent, but the
     // object form is the only one that also exposes `exclude` (strip reasoning
     // from the response) and `delta_field` (legacy `reasoning_content` streams).
-    // Valid efforts: none, minimal, low, medium, high.
-    const validEfforts = new Set(["none", "minimal", "low", "medium", "high"]);
+    // Valid efforts: none, minimal, low, medium, high, xhigh.
+    const validEfforts = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
     const mappedEffort = validEfforts.has(effort) ? effort : "high";
     const existing =
       params.reasoning && typeof params.reasoning === "object"

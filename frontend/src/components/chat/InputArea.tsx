@@ -7,6 +7,7 @@ import { useStore } from '@/store'
 import { sendRoomAction } from '@/ws/relayClient'
 import { messagesApi, chatsApi } from '@/api/chats'
 import { presetsApi } from '@/api/presets'
+import { presetProfilesApi, type PresetProfileBinding } from '@/api/preset-profiles'
 import { charactersApi } from '@/api/characters'
 import { generateApi } from '@/api/generate'
 import { memoryCortexApi } from '@/api/memory-cortex'
@@ -40,7 +41,7 @@ import type { AutocompleteResult } from '@/api/databank'
 import styles from './InputArea.module.css'
 import clsx from 'clsx'
 import InputBarExtensionActions from './InputBarExtensionActions'
-import { didMobileQueueHoldReachThreshold, getMobileQueueHoldPreviewState } from './mobileQueueHold'
+import { getMobileQueueHoldPreviewState, shouldQueueMobileHold } from './mobileQueueHold'
 import { getMobileQueueHintKey, type MobileQueueHoldState } from './mobileQueueHint'
 import { unlockNotificationAudio } from '@/lib/notificationAudio'
 import { unlockTTSAudio } from '@/lib/ttsAudio'
@@ -63,7 +64,14 @@ import {
   type RegexActionActivation,
 } from '@/lib/regex/actionBus'
 import { createSTTEngine, getSupportedSTTAudioFormat, isWebSpeechAvailable, type STTAudioFrame, type STTEngine } from '@/lib/sttEngine'
+import { composeChatSafeZones } from '@/lib/chatSurfaceLayout'
+import { renderedPxToLayoutPx } from '@/lib/uiScale'
 import { applyChatAppearance } from '@/lib/chatAppearance'
+import {
+  getEffectivePromptVariableValues,
+  subscribePresetProfilePromptVariableChanges,
+  updatePresetProfilePromptVariables,
+} from '@/hooks/preset-profile-prompt-variables'
 
 interface InputAreaProps {
   chatId: string
@@ -77,11 +85,19 @@ const STT_VISUALIZER_BARS = 18
 const MOBILE_QUEUE_HOLD_PROMPT_MS = 180
 const MOBILE_QUEUE_HOLD_MS = 900
 const LIVE_GENERATION_HEAD_STATUSES = new Set(['assembling', 'council', 'waiting', 'reasoning', 'streaming'])
+const ALT_FIELD_NAMES = ['description', 'personality', 'scenario'] as const
 
 function stackVisibleRegexSelections(base: string, selections: PendingRegexSelection[]): string {
   return [base.trim(), ...selections.filter((item) => item.type === 'send').map((item) => item.content.trim())]
     .filter(Boolean)
     .join('\n\n')
+}
+
+type PromptVariableProfileTarget = {
+  chatId: string
+  source: 'chat' | 'persona' | 'character' | 'connection' | 'defaults'
+  id: string
+  binding: PresetProfileBinding
 }
 
 function serializeHiddenRegexSelections(selections: PendingRegexSelection[]) {
@@ -263,6 +279,9 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
   const [impersonationPresetId, setImpersonationPresetId] = useState<string | null>(null)
   const [promptVariablesModalOpen, setPromptVariablesModalOpen] = useState(false)
   const [promptVariablesPreset, setPromptVariablesPreset] = useState<LoomPreset | null>(null)
+  const [promptVariablesBinding, setPromptVariablesBinding] = useState<PromptVariableProfileTarget | null>(null)
+  const promptVariablesBindingRef = useRef<PromptVariableProfileTarget | null>(null)
+  promptVariablesBindingRef.current = promptVariablesBinding
   const [promptVariablesLoading, setPromptVariablesLoading] = useState(false)
   const [pendingAttachments, setPendingAttachments] = useState<(MessageAttachment & { previewUrl?: string })[]>([])
   const [uploading, setUploading] = useState(false)
@@ -296,6 +315,7 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
   const touchHoldPromptTimerRef = useRef<number>(0)
   const touchQueueArmTimerRef = useRef<number>(0)
   const touchHoldStartedAtRef = useRef(0)
+  const touchHoldPointerIdRef = useRef<number | null>(null)
   const ignoreFollowupClickUntilRef = useRef(0)
   const ignoreFollowupClickCountRef = useRef(0)
   const mobileQueueHoldStateRef = useRef<MobileQueueHoldState>('idle')
@@ -401,7 +421,6 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
 
   // Track alternate fields for the active character or group members.
   type AltFieldVariant = { id: string; label: string; content: string }
-  const ALT_FIELD_NAMES = ['description', 'personality', 'scenario'] as const
   const [altFieldsData, setAltFieldsData] = useState<Record<string, AltFieldVariant[]>>({})
   const [groupAltFieldsData, setGroupAltFieldsData] = useState<Record<string, Record<string, AltFieldVariant[]>>>({})
   const [altFieldsLoaded, setAltFieldsLoaded] = useState(false)
@@ -1058,30 +1077,75 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
     setOpenPopover(null)
     setPromptVariablesLoading(true)
     const presetId = activeLoomPresetId
-    const hydration = presetSaveCoordinator.beginHydration(presetId, 'prompt-variables')
     try {
+      const resolvedProfile = await presetProfilesApi.resolve(chatId, presetId, activeProfileId, activePersonaId)
       const preset = await presetsApi.get(presetId)
       if (useStore.getState().activeLoomPresetId !== presetId) {
-        presetSaveCoordinator.cancelHydration(hydration)
         return
       }
-      setPromptVariablesPreset(presetSaveCoordinator.hydrate(unmarshalPreset(preset), hydration))
+      const binding = resolvedProfile.binding?.preset_id === presetId ? resolvedProfile.binding : null
+      const targetId = binding
+        ? resolvedProfile.source_id
+          ?? (resolvedProfile.source === 'chat' ? chatId
+            : resolvedProfile.source === 'persona' ? activePersonaId
+              : resolvedProfile.source === 'character' ? activeCharacterId
+                : resolvedProfile.source === 'connection' ? activeProfileId
+                  : resolvedProfile.source === 'defaults' ? presetId
+                    : null)
+        : null
+      if (resolvedProfile.source !== 'none' && (!binding || !targetId)) {
+        throw new Error('The bound preset profile changed while prompt variables were loading')
+      }
+      const target = binding && targetId && resolvedProfile.source !== 'none'
+        ? { chatId, source: resolvedProfile.source, id: targetId, binding } as PromptVariableProfileTarget
+        : null
+      // Profile values are an overlay, not part of the shared preset draft.
+      // Keep the bound modal copy local so it cannot publish profile state to
+      // the global preset save coordinator.
+      const hydrated = binding
+        ? unmarshalPreset(preset)
+        : presetSaveCoordinator.hydrate(
+            unmarshalPreset(preset),
+            presetSaveCoordinator.beginHydration(presetId, 'prompt-variables'),
+          )
+      setPromptVariablesPreset(binding
+        ? {
+            ...hydrated,
+            promptVariables: getEffectivePromptVariableValues(hydrated.id, hydrated.promptVariables, binding),
+          }
+        : hydrated)
+      setPromptVariablesBinding(target)
       setPromptVariablesModalOpen(true)
     } catch (err) {
-      presetSaveCoordinator.cancelHydration(hydration)
       if (err instanceof StalePresetHydrationError) return
       console.error('[InputArea] Failed to load prompt variables preset:', err)
       toast.error(t('toast.failedLoadPromptVariables'))
     } finally {
       setPromptVariablesLoading(false)
     }
-  }, [activeLoomPresetId, promptVariablesLoading, t])
+  }, [activeLoomPresetId, activeCharacterId, activePersonaId, activeProfileId, chatId, promptVariablesLoading, t])
 
   const savePromptVariableValues = useCallback(async (values: PromptVariableValues) => {
     if (!promptVariablesPreset || useStore.getState().activeLoomPresetId !== promptVariablesPreset.id) {
       setPromptVariablesModalOpen(false)
       setPromptVariablesPreset(null)
+      setPromptVariablesBinding(null)
       return
+    }
+    const bound = promptVariablesBinding
+    if (bound && bound.chatId === chatId && useStore.getState().activeChatId === chatId) {
+      try {
+        const binding = await updatePresetProfilePromptVariables(presetProfilesApi, bound, values)
+        setPromptVariablesBinding({ ...bound, binding })
+        setPromptVariablesPreset((current) => current
+          ? { ...current, promptVariables: values }
+          : current)
+        return
+      } catch (err) {
+        console.warn('[InputArea] Failed to save profile prompt variable values:', err)
+        toast.error(t('toast.failedSavePromptVariables'))
+        throw err
+      }
     }
     const updated = presetSaveCoordinator.mutate(
       promptVariablesPreset.id,
@@ -1097,7 +1161,24 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
       toast.error(t('toast.failedSavePromptVariables'))
       throw err
     }
-  }, [promptVariablesPreset, t])
+  }, [promptVariablesPreset, promptVariablesBinding, chatId, t])
+
+  useEffect(() => subscribePresetProfilePromptVariableChanges(({ target, binding }) => {
+    const currentTarget = promptVariablesBindingRef.current
+    if (
+      !currentTarget
+      || currentTarget.source !== target.source
+      || currentTarget.id !== target.id
+    ) return
+
+    setPromptVariablesBinding({ ...currentTarget, binding })
+    setPromptVariablesPreset((current) => current && current.id === binding.preset_id
+      ? {
+          ...current,
+          promptVariables: getEffectivePromptVariableValues(current.id, current.promptVariables, binding),
+        }
+      : current)
+  }), [])
 
   const consumeOneshotGuides = useCallback(() => {
     const next = guidedGenerations.map((g) =>
@@ -1125,10 +1206,11 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
 
   useEffect(() => {
     if (!promptVariablesPreset) return
-    if (promptVariablesPreset.id === activeLoomPresetId) return
+    if (promptVariablesPreset.id === activeLoomPresetId && (!promptVariablesBinding || promptVariablesBinding.chatId === chatId)) return
     setPromptVariablesModalOpen(false)
     setPromptVariablesPreset(null)
-  }, [activeLoomPresetId, promptVariablesPreset])
+    setPromptVariablesBinding(null)
+  }, [activeLoomPresetId, chatId, promptVariablesPreset, promptVariablesBinding])
 
   // Databank # autocomplete — search when hash query changes
   useEffect(() => {
@@ -1217,7 +1299,9 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
     const syncHiddenEditSafeZone = () => {
       const rootStyle = getComputedStyle(root)
       const keyboardInset = parseFloat(rootStyle.getPropertyValue('--app-keyboard-inset-bottom')) || 0
-      parent.style.setProperty('--lcs-input-safe-zone', `${Math.max(16, Math.round(16 + keyboardInset))}px`)
+      const zones = composeChatSafeZones(16, 0, keyboardInset)
+      parent.style.setProperty('--lcs-composer-safe-zone', `${Math.round(zones.composerSafeZone)}px`)
+      parent.style.setProperty('--lcs-input-safe-zone', `${Math.round(zones.inputSafeZone)}px`)
     }
 
     const scheduleHiddenEditSafeZoneSync = () => {
@@ -1242,6 +1326,8 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
       window.removeEventListener('resize', scheduleHiddenEditSafeZoneSync)
       window.visualViewport?.removeEventListener('resize', scheduleHiddenEditSafeZoneSync)
       window.visualViewport?.removeEventListener('scroll', scheduleHiddenEditSafeZoneSync)
+      parent.style.removeProperty('--lcs-composer-safe-zone')
+      parent.style.removeProperty('--lcs-input-safe-zone')
     }
   }, [hideForMobileEdit])
 
@@ -1254,9 +1340,22 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
     if (!parent) return
     const root = document.documentElement
     const isIOSPwa = document.documentElement.hasAttribute('data-ios-pwa')
+    const loreMount = el.querySelector<HTMLElement>('[data-spindle-mount="chat_composer_above"]')
+
+    const measureLoreHeight = () => {
+      if (!loreMount) return 0
+      const children = Array.from(loreMount.children) as HTMLElement[]
+      if (children.length === 0) return Math.max(0, loreMount.offsetHeight)
+      return children.reduce((height, child) => {
+        const renderedHeight = renderedPxToLayoutPx(child.getBoundingClientRect().height)
+        return height + Math.max(0, renderedHeight, child.offsetHeight)
+      }, 0)
+    }
 
     const update = () => {
+      const loreHeight = measureLoreHeight()
       const h = el.offsetHeight
+      const composerHeight = Math.max(0, h - loreHeight) + 8
       // On iOS PWA, read --app-keyboard-inset-bottom directly instead of
       // getComputedStyle(el).bottom. The CSS `bottom` property transitions,
       // so the computed value may be mid-animation when the ResizeObserver
@@ -1269,11 +1368,14 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
       } else {
         bottomOffset = parseFloat(getComputedStyle(el).bottom) || 12
       }
-      parent.style.setProperty('--lcs-input-safe-zone', `${h + bottomOffset + 8}px`)
+      const zones = composeChatSafeZones(composerHeight, loreHeight, bottomOffset)
+      parent.style.setProperty('--lcs-composer-safe-zone', `${zones.composerSafeZone}px`)
+      parent.style.setProperty('--lcs-input-safe-zone', `${zones.inputSafeZone}px`)
     }
 
     const ro = new ResizeObserver(update)
     ro.observe(el)
+    if (loreMount) ro.observe(loreMount)
     update()
 
     // On iOS PWA, the virtual keyboard changes `bottom` via CSS variable but
@@ -1287,22 +1389,20 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
       vpFrame = requestAnimationFrame(update)
     }
     const rootObserver = new MutationObserver(onViewportResize)
-    if (isIOSPwa) {
-      rootObserver.observe(root, { attributes: true, attributeFilter: ['style'] })
-      window.addEventListener('resize', onViewportResize)
-      window.visualViewport?.addEventListener('resize', onViewportResize)
-      window.visualViewport?.addEventListener('scroll', onViewportResize)
-    }
+    rootObserver.observe(root, { attributes: true, attributeFilter: ['style'] })
+    window.addEventListener('resize', onViewportResize)
+    window.visualViewport?.addEventListener('resize', onViewportResize)
+    window.visualViewport?.addEventListener('scroll', onViewportResize)
 
     return () => {
       ro.disconnect()
       cancelAnimationFrame(vpFrame)
-      if (isIOSPwa) {
-        rootObserver.disconnect()
-        window.removeEventListener('resize', onViewportResize)
-        window.visualViewport?.removeEventListener('resize', onViewportResize)
-        window.visualViewport?.removeEventListener('scroll', onViewportResize)
-      }
+      rootObserver.disconnect()
+      window.removeEventListener('resize', onViewportResize)
+      window.visualViewport?.removeEventListener('resize', onViewportResize)
+      window.visualViewport?.removeEventListener('scroll', onViewportResize)
+      parent.style.removeProperty('--lcs-composer-safe-zone')
+      parent.style.removeProperty('--lcs-input-safe-zone')
     }
   }, [hideForMobileEdit])
 
@@ -2484,10 +2584,14 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
     }
   }, [hasDraftContent, handleQueueMessage, handleSend])
 
-  // Touch interactions with draft content are handled on touchend directly so
-  // the synthetic follow-up click cannot trigger a second action.
-  const handleSendTouchStart = useCallback((e: React.TouchEvent<HTMLButtonElement>) => {
+  // Use a captured pointer rather than touch events. Android can cancel a touch
+  // sequence when a tiny finger drift is interpreted as a pan; pointer capture
+  // keeps the release associated with this button instead.
+  const handleSendPointerDown = useCallback((e: React.PointerEvent<HTMLButtonElement>) => {
+    if (e.pointerType !== 'touch') return
     if (!hasDraftContent || isGeneratingInChat) return
+    touchHoldPointerIdRef.current = e.pointerId
+    e.currentTarget.setPointerCapture(e.pointerId)
     const holdStartedAt = e.timeStamp
     touchHoldStartedAtRef.current = holdStartedAt
     clearTouchQueueTimers()
@@ -2508,16 +2612,22 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
     }, MOBILE_QUEUE_HOLD_MS)
   }, [hasDraftContent, isGeneratingInChat, clearTouchQueueTimers, setMobileQueueHoldVisualState, syncMobileQueueHoldVisualState])
 
-  const handleSendTouchEnd = useCallback((e: React.TouchEvent<HTMLButtonElement>) => {
+  const handleSendPointerUp = useCallback((e: React.PointerEvent<HTMLButtonElement>) => {
+    if (e.pointerType !== 'touch' || touchHoldPointerIdRef.current !== e.pointerId) return
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId)
+    }
     // Use the native event timestamps instead of Date.now(). On Android the
     // button tap can trigger keyboard/viewport reflow before JS handles
     // touchend, which inflates wall-clock duration and turns a tap into a
     // false long-press.
-    const heldLongEnough = didMobileQueueHoldReachThreshold({
+    const heldLongEnough = shouldQueueMobileHold({
+      isArmed: mobileQueueHoldStateRef.current === 'armed',
       holdStartedAt: touchHoldStartedAtRef.current,
       releasedAt: e.timeStamp,
       thresholdMs: MOBILE_QUEUE_HOLD_MS,
     })
+    touchHoldPointerIdRef.current = null
     touchHoldStartedAtRef.current = 0
     clearTouchQueueTimers()
     if (heldLongEnough && hasDraftContent) {
@@ -2556,7 +2666,9 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
     }
   }, [handleQueueMessage, handleSend, hasDraftContent, suppressFollowupClick, clearTouchQueueTimers, setMobileQueueHoldVisualState])
 
-  const handleSendTouchCancel = useCallback(() => {
+  const handleSendPointerCancel = useCallback((e: React.PointerEvent<HTMLButtonElement>) => {
+    if (e.pointerType !== 'touch' || touchHoldPointerIdRef.current !== e.pointerId) return
+    touchHoldPointerIdRef.current = null
     touchHoldStartedAtRef.current = 0
     clearTouchQueueTimers()
     if (mobileQueueHoldStateRef.current !== 'queueing') {
@@ -2892,6 +3004,7 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
 
       {promptVariablesPreset && (
         <PromptVariablesModal
+          key={`${promptVariablesBinding?.source ?? 'global'}:${promptVariablesBinding?.id ?? promptVariablesPreset.id}:${chatId}`}
           isOpen={promptVariablesModalOpen}
           blocks={promptVariablesPreset.blocks}
           values={promptVariablesPreset.promptVariables ?? {}}
@@ -2899,6 +3012,8 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
           onClose={() => setPromptVariablesModalOpen(false)}
         />
       )}
+
+      <span data-spindle-mount="chat_composer_above" style={{ display: 'contents' }} />
 
       {/* Action bar */}
       <div data-spindle-mount="chat_toolbar">
@@ -2949,6 +3064,7 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
           >
             <Link2 size={14} />
           </button>
+          <span data-spindle-mount="chat_actions" style={{ display: 'contents' }} />
           {hasAltFields && (() => {
             const selectionCount = activeAltSelectionCount
             const hasSelection = selectionCount > 0
@@ -4043,9 +4159,9 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
                   mobileQueueHoldState === 'queueing' && styles.sendBtnQueueing
                 )}
                 onClick={handleSendClick}
-                onTouchStart={handleSendTouchStart}
-                onTouchEnd={handleSendTouchEnd}
-                onTouchCancel={handleSendTouchCancel}
+                onPointerDown={handleSendPointerDown}
+                onPointerUp={handleSendPointerUp}
+                onPointerCancel={handleSendPointerCancel}
                 disabled={isGeneratingInChat}
                 style={sendButtonStyle}
                 title={sendButtonTitle}

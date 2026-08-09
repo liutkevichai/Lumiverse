@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router'
 import { useTranslation } from 'react-i18next'
 import { motion, AnimatePresence, type Variants } from 'motion/react'
 import { useVirtualizer, type VirtualItem, type Virtualizer } from '@tanstack/react-virtual'
-import { MessageSquarePlus, MessageSquare, Trash2, Users, LogOut, FlaskConical, Gamepad2, Compass, EyeOff, Star, Pencil, Copy, GitBranch } from 'lucide-react'
+import { MessageSquarePlus, MessageSquare, Trash2, Users, LogOut, FlaskConical, Gamepad2, Compass, EyeOff, Star, Pencil, Copy, GitBranch, Maximize2, Minimize2 } from 'lucide-react'
 import { Spinner } from '@/components/shared/Spinner'
 import { chatsApi, messagesApi } from '@/api/chats'
 import { charactersApi } from '@/api/characters'
@@ -35,6 +35,13 @@ import type { CharacterPerspectiveLayer, GroupedRecentChat } from '@/types/api'
 import styles from './LandingPage.module.css'
 import clsx from 'clsx'
 import type { TFunction } from 'i18next'
+import {
+  getAvailableLandingPageTabs,
+  landingPageTabId,
+  landingPageTabPanelId,
+  normalizeLandingPageTab,
+  resolveTabArrowKey,
+} from '@/lib/landingPageTabs'
 
 type LandingSortField = 'name' | 'recent' | 'created'
 
@@ -932,6 +939,7 @@ function VirtualizedChatRows({
   return (
     <motion.div
       className={clsx(styles.virtualChats, navigatingToChat && styles.chatsLeaving)}
+      data-component="LandingPageChats"
       ref={setContainerRef}
       variants={containerVariants}
       initial="hidden"
@@ -970,6 +978,7 @@ export default function LandingPage() {
   const navigate = useNavigate()
   const landingPageChatsDisplayed = useStore((s) => s.landingPageChatsDisplayed)
   const landingPageLayoutMode = useStore((s) => s.landingPageLayoutMode)
+  const landingPageGalleryWidth = useStore((s) => s.landingPageGalleryWidth)
   const favorites = useStore((s) => s.favorites)
   const landingHiddenCharacterIds = useStore((s) => s.landingHiddenCharacterIds)
   const settingsLoaded = useStore((s) => s.settingsLoaded)
@@ -981,6 +990,41 @@ export default function LandingPage() {
   const authUser = useStore((s) => s.user)
   const hasGlobalWallpaper = useStore((s) => Boolean(s.wallpaper.global?.image_id))
   const accountLabel = authUser?.username || authUser?.name || t('account')
+  const landingPageActiveTab = useStore((s) => (s as typeof s & { landingPageActiveTab?: unknown }).landingPageActiveTab)
+  const [homepageSurfaceReady, setHomepageSurfaceReady] = useState(() => (
+    typeof document !== 'undefined' && Boolean(document.querySelector(
+      `[data-spindle-mount="${'landing_characters'}"] [data-homepage-character-library-ready="true"]`,
+    ))
+  ))
+  const selectedCharactersForReady = useRef(false)
+  useEffect(() => {
+    const readReady = () => {
+      const ready = Boolean(document.querySelector(
+        `[data-spindle-mount="${'landing_characters'}"] [data-homepage-character-library-ready="true"]`,
+      ))
+      if (!ready) selectedCharactersForReady.current = false
+      else if (!selectedCharactersForReady.current) {
+        selectedCharactersForReady.current = true
+        ;(setSetting as unknown as (key: string, value: unknown) => void)('landingPageActiveTab', 'characters')
+      }
+      setHomepageSurfaceReady(ready)
+    }
+    readReady()
+    const Observer = document.defaultView?.MutationObserver
+    if (!Observer) return undefined
+    const observer = new Observer(readReady)
+    observer.observe(document.body, { childList: true, subtree: true })
+    return () => observer.disconnect()
+  }, [setSetting])
+  const availableLandingTabs = useMemo(
+    () => getAvailableLandingPageTabs({ characterLibraryEnabled: homepageSurfaceReady }),
+    [homepageSurfaceReady],
+  )
+  const activeLandingTab = normalizeLandingPageTab(landingPageActiveTab, availableLandingTabs)
+  const handleLandingTabChange = useCallback((tab: (typeof availableLandingTabs)[number]) => {
+    if (!availableLandingTabs.includes(tab)) return
+    ;(setSetting as unknown as (key: string, value: unknown) => void)('landingPageActiveTab', tab)
+  }, [availableLandingTabs, setSetting])
 
   const [items, setItems] = useState<GroupedRecentChat[]>([])
   const [loading, setLoading] = useState(true)
@@ -1003,6 +1047,7 @@ export default function LandingPage() {
   const tempChatMenuOpenedAt = useRef(0)
   const chatNavigationTimerRef = useRef<number | null>(null)
   const fetchSequenceRef = useRef(0)
+  const loadingMoreRef = useRef(false)
 
   const profiles = useStore((s) => s.profiles)
   const activeProfileId = useStore((s) => s.activeProfileId)
@@ -1268,7 +1313,12 @@ export default function LandingPage() {
   }, [debouncedSearchQuery, landingPageChatsDisplayed, recentChatQuery, settingsLoaded, sortDirection, sortField])
 
   const loadMore = useCallback(async () => {
-    if (loadingMore || items.length >= total) return
+    // Intersection observers may deliver multiple entries during a grid
+    // resize (or while reconnecting after a column-count change). Use a ref
+    // so those synchronous deliveries cannot request the same page twice
+    // before React has rendered `loadingMore`.
+    if (loadingMoreRef.current || items.length >= total) return
+    loadingMoreRef.current = true
     const requestSequence = fetchSequenceRef.current
     setLoadingMore(true)
     try {
@@ -1283,9 +1333,10 @@ export default function LandingPage() {
     } catch (err: any) {
       console.error('[Lumiverse] Error loading more chats:', err)
     } finally {
+      loadingMoreRef.current = false
       setLoadingMore(false)
     }
-  }, [loadingMore, items.length, total, landingPageChatsDisplayed, recentChatQuery])
+  }, [items.length, total, landingPageChatsDisplayed, recentChatQuery])
 
   useEffect(() => {
     fetchChats()
@@ -1305,12 +1356,15 @@ export default function LandingPage() {
       ([entry]) => {
         if (entry.isIntersecting) loadMore()
       },
-      { rootMargin: '200px' }
+      // The landing page scrolls inside `.container`, not the window. Using
+      // that container as the root lets the sentinel be re-evaluated when a
+      // resize changes the virtual grid's height.
+      { root: scrollRef.current, rootMargin: '200px' }
     )
 
     observer.observe(sentinel)
     return () => observer.disconnect()
-  }, [items.length, total, loading, loadMore])
+  }, [items.length, total, loading, loadMore, mainWidth])
 
   const navigateToChat = useCallback((chatId: string) => {
     if (chatNavigationTimerRef.current !== null) return
@@ -1642,12 +1696,13 @@ export default function LandingPage() {
       )}
 
       <motion.div
-        className={styles.content}
+        className={clsx(styles.content, landingPageGalleryWidth === 'expanded' && styles.contentExpanded)}
+        data-component="LandingPageCharacters"
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
         transition={{ duration: 0.5 }}
       >
-        <header className={styles.header}>
+        <header className={styles.header} data-component="LandingPageHeader">
           <div className={styles.logo}>
             <div className={styles.logoIcon}>
               <div className={styles.logoGlow} />
@@ -1737,7 +1792,30 @@ export default function LandingPage() {
           </div>
         </header>
 
-        <div className={styles.landingToolbar}>
+        <div className={styles.landingToolbar} data-component="LandingPageTabs" data-spindle-mount="landing_toolbar">
+          <div className={styles.landingTabs} role="tablist" aria-label="Landing views">
+            {availableLandingTabs.map((tab) => {
+              const selected = activeLandingTab === tab
+              return (
+                <button key={tab} id={landingPageTabId(tab)} type="button" role="tab" data-landing-tab={tab}
+                  aria-selected={selected} aria-controls={landingPageTabPanelId(tab)} tabIndex={selected ? 0 : -1}
+                  onClick={() => handleLandingTabChange(tab)}
+                  onKeyDown={(event) => {
+                    const next = resolveTabArrowKey(event.key, tab, availableLandingTabs)
+                    if (!next) return
+                    event.preventDefault()
+                    handleLandingTabChange(next)
+                    window.requestAnimationFrame(() => document.getElementById(landingPageTabId(next))?.focus())
+                  }}
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '7px 10px', border: '1px solid var(--lumiverse-border)', borderRadius: 8, background: selected ? 'var(--lumiverse-primary-010)' : 'transparent', color: selected ? 'var(--lumiverse-text)' : 'var(--lumiverse-text-muted)', cursor: 'pointer' }}
+                >
+                  {tab === 'characters' ? <Users size={14} strokeWidth={1.5} /> : <MessageSquare size={14} strokeWidth={1.5} />}
+                  <span>{tab === 'characters' ? 'Characters' : 'Chats'}</span>
+                </button>
+              )
+            })}
+          </div>
+          {activeLandingTab === 'chats' && <>
           <SearchField
             value={searchQuery}
             onChange={setSearchQuery}
@@ -1769,11 +1847,27 @@ export default function LandingPage() {
           >
             <EyeOff size={15} strokeWidth={1.5} />
           </button>
+          <button
+            type="button"
+            className={clsx(styles.hiddenManagerBtn, landingPageGalleryWidth === 'expanded' && styles.galleryWidthBtnActive)}
+            onClick={() => setSetting('landingPageGalleryWidth', landingPageGalleryWidth === 'expanded' ? 'compact' : 'expanded')}
+            title={landingPageGalleryWidth === 'expanded' ? t('galleryWidth.compact') : t('galleryWidth.expanded')}
+            aria-label={landingPageGalleryWidth === 'expanded' ? t('galleryWidth.compact') : t('galleryWidth.expanded')}
+            aria-pressed={landingPageGalleryWidth === 'expanded'}
+          >
+            {landingPageGalleryWidth === 'expanded'
+              ? <Minimize2 size={15} strokeWidth={1.5} />
+              : <Maximize2 size={15} strokeWidth={1.5} />}
+          </button>
+          </>}
         </div>
 
-        <main className={styles.main} ref={mainRef}>
+        <main className={styles.main} ref={mainRef} data-component="LandingPageMain" data-spindle-mount="landing_main">
+          <div id={landingPageTabPanelId('characters')} role="tabpanel" aria-labelledby={landingPageTabId('characters')}
+            data-component="LandingPageCharacterPanel" data-spindle-mount="landing_characters"
+            hidden={activeLandingTab !== 'characters' || !homepageSurfaceReady} />
           <AnimatePresence mode="wait">
-            {!settingsLoaded || (loading && items.length === 0) ? (
+            {activeLandingTab === 'characters' ? null : !settingsLoaded || (loading && items.length === 0) ? (
               <motion.div
                 key={`loading-${skeletonLayout}`}
                 className={skeletonLayout === 'compact' ? styles.compactList : styles.gridCards}
@@ -1818,7 +1912,7 @@ export default function LandingPage() {
             )}
           </AnimatePresence>
 
-          {hasMore && (
+          {activeLandingTab === 'chats' && hasMore && (
             <div ref={sentinelRef} className={styles.loadMoreSentinel}>
               {loadingMore && (
                 <div className={styles.loadingMore}>

@@ -111,6 +111,12 @@
   box-sizing: border-box;
 }
 
+/* Default to a readable desktop measure. The user can opt into the expanded
+   gallery from the chats toolbar when they want to use a wide display. */
+.contentExpanded {
+  max-width: none;
+}
+
 /* Header */
 .header {
   display: flex;
@@ -126,6 +132,13 @@
   align-items: center;
   gap: 8px;
   margin-bottom: 20px;
+}
+
+.landingTabs {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
 }
 
 .landingSearch {
@@ -158,6 +171,12 @@
   border-color: var(--lumiverse-primary-050);
   background: var(--lumiverse-primary-010);
   outline: none;
+}
+
+.galleryWidthBtnActive {
+  color: var(--lumiverse-primary);
+  border-color: var(--lumiverse-primary-050);
+  background: var(--lumiverse-primary-010);
 }
 
 .logo {

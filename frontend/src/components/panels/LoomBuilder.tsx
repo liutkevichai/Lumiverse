@@ -67,6 +67,7 @@ import { resolveMacros as resolveMacrosApi } from '@/api/macros'
 import { useLoomBuilder } from '@/hooks/useLoomBuilder'
 import { presetsApi, type StashedPromptBlock } from '@/api/presets'
 import { usePresetProfiles } from '@/hooks/usePresetProfiles'
+import { getEffectivePromptVariableValues } from '@/hooks/preset-profile-prompt-variables'
 import { computeGroups, createBlock, createMarkerBlock, resolvePromptBlockPlacements } from '@/lib/loom/service'
 import { sanitizeCharacterTagTrigger, splitCharacterTagTriggerInput } from '@/lib/loom/characterTagTrigger'
 import {
@@ -1794,7 +1795,8 @@ export default function LoomBuilder({
     savePromptBehavior,
     saveCompletionSettings,
     saveAdvancedSettings,
-    savePromptVariableValues,
+    savePromptVariableValues: savePresetPromptVariableValues,
+    applyRuntimeBlockProfile,
     updatePresetDraft,
     flushPresetDraft,
     importFromFile,
@@ -1803,7 +1805,39 @@ export default function LoomBuilder({
     exportLegacy,
   } = useLoomBuilder()
 
-  const presetProfiles = usePresetProfiles(activePresetId, activePreset?.blocks)
+  const presetProfiles = usePresetProfiles(activePresetId, activePreset?.blocks, activePreset?.promptVariables)
+  const {
+    activeBinding,
+    activeSource,
+    activeSourceId,
+    activeChatId,
+    activePersonaId,
+    activeCharacterId,
+    activeProfileId,
+    captureDefaults: captureProfileDefaults,
+    defaults,
+    isResolved,
+    resolvedPresetId,
+    saveActivePromptVariableValues,
+    selectResolvedPreset,
+  } = presetProfiles
+  const effectivePromptVariableValues = useMemo(() => getEffectivePromptVariableValues(
+    activePreset?.id,
+    activePreset?.promptVariables ?? {},
+    activeBinding,
+  ), [activePreset?.id, activePreset?.promptVariables, activeBinding])
+  const promptVariableScopeKey = `${activeSource}:${activeSourceId ?? 'none'}:${activePreset?.id ?? 'none'}`
+  const savePromptVariableValues = useCallback(async (values: PromptVariableValues) => {
+    // Do not make an already-open modal fail merely because a background
+    // profile read has not settled yet. In that case the user is editing the
+    // preset currently shown in Loom, so persist its base values.
+    if (!isResolved || resolvedPresetId !== activePreset?.id) {
+      await savePresetPromptVariableValues(values)
+      return
+    }
+    const savedToProfile = await saveActivePromptVariableValues(values)
+    if (!savedToProfile) await savePresetPromptVariableValues(values)
+  }, [activePreset?.id, isResolved, resolvedPresetId, saveActivePromptVariableValues, savePresetPromptVariableValues])
   const presetEditorTabs = __contextMeterStore((state) => state.presetEditorTabs)
   const presetEditorToolbarItems = __contextMeterStore((state) => state.presetEditorToolbarItems)
   const addToast = __contextMeterStore((s) => s.addToast)
@@ -1811,16 +1845,16 @@ export default function LoomBuilder({
   const suppressNextProfileApplyRef = useRef<string | null>(null)
 
   const getProfileContextKey = useCallback(() => (
-    `${activePresetRef.current?.id ?? 'none'}:${presetProfiles.activeChatId ?? 'none'}:${presetProfiles.activePersonaId ?? 'none'}:${presetProfiles.activeCharacterId ?? 'none'}:${presetProfiles.activeProfileId ?? 'none'}`
-  ), [presetProfiles.activeChatId, presetProfiles.activePersonaId, presetProfiles.activeCharacterId, presetProfiles.activeProfileId])
+    `${activePresetRef.current?.id ?? 'none'}:${activeChatId ?? 'none'}:${activePersonaId ?? 'none'}:${activeCharacterId ?? 'none'}:${activeProfileId ?? 'none'}`
+  ), [activeChatId, activePersonaId, activeCharacterId, activeProfileId])
 
   const captureDefaults = useCallback(() => {
     suppressNextProfileApplyRef.current = getProfileContextKey()
-    void presetProfiles.captureDefaults()
-  }, [getProfileContextKey, presetProfiles])
+    void captureProfileDefaults()
+  }, [captureProfileDefaults, getProfileContextKey])
 
   const reapplyDefaults = useCallback(() => {
-    const binding = presetProfiles.defaults
+    const binding = defaults
     if (!binding || !activePreset?.blocks?.length) return
 
     const updatedBlocks = activePreset.blocks.map(b =>
@@ -1829,76 +1863,70 @@ export default function LoomBuilder({
 
     const changed = updatedBlocks.some((b, i) => b.enabled !== activePreset.blocks[i].enabled)
     if (changed) {
-      saveBlocks(updatedBlocks)
+      applyRuntimeBlockProfile(activePreset.id, binding.block_states, binding.prompt_variables ?? {})
       addToast({ type: 'success', message: lb('profiles.reapplied') })
     } else {
       addToast({ type: 'info', message: lb('profiles.alreadyDefault') })
     }
-  }, [presetProfiles.defaults, activePreset, saveBlocks, addToast, lb])
+  }, [defaults, activePreset, applyRuntimeBlockProfile, addToast, lb])
 
-  // Apply the resolved preset profile binding to the active preset's blocks
-  // whenever the chat/character context changes and the hook confirms its
-  // binding state is fresh for that new context (isResolved). Keying off
-  // activeChatId + activeCharacterId — not just the binding reference —
-  // guarantees the effect re-runs on every chat switch, even when two
-  // characters happen to share structurally-identical block states.
-  //
-  // activePreset is read through a ref so user-driven block toggles (which
-  // mutate activePreset) don't re-fire this effect and fight the toggle by
-  // re-applying the binding.
-  const lastProfileContextRef = useRef<string | null>(null)
+  // Profile block states are a runtime overlay. They must never be written
+  // into the shared preset merely because the active chat/persona/connection
+  // changed; doing so lets an unrelated preset save capture the wrong scope.
+  const lastProfileApplicationRef = useRef<string | null>(null)
   activePresetRef.current = activePreset
 
   useEffect(() => {
-    if (!presetProfiles.isResolved) return
+    if (!isResolved) return
 
-    const contextKey = `${activePresetRef.current?.id ?? 'none'}:${presetProfiles.activeChatId ?? 'none'}:${presetProfiles.activePersonaId ?? 'none'}:${presetProfiles.activeCharacterId ?? 'none'}:${presetProfiles.activeProfileId ?? 'none'}`
-    const contextChanged = lastProfileContextRef.current !== contextKey
+    const contextKey = `${activePresetRef.current?.id ?? 'none'}:${activeChatId ?? 'none'}:${activePersonaId ?? 'none'}:${activeCharacterId ?? 'none'}:${activeProfileId ?? 'none'}`
+    const binding = activeBinding
+    const blockStateKey = binding
+      ? JSON.stringify(Object.entries(binding.block_states).sort(([a], [b]) => a.localeCompare(b)))
+      : 'none'
+    const promptVariableKey = binding?.prompt_variables
+      ? JSON.stringify(binding.prompt_variables)
+      : 'none'
+    const applicationKey = `${contextKey}:${activeSource}:${binding?.preset_id ?? 'none'}:${blockStateKey}:${promptVariableKey}`
+    const applicationChanged = lastProfileApplicationRef.current !== applicationKey
 
     if (
-      presetProfiles.resolvedPresetId
-      && presetProfiles.resolvedPresetId !== activePresetRef.current?.id
-      && (contextChanged || !activePresetRef.current?.id)
+      resolvedPresetId
+      && resolvedPresetId !== activePresetRef.current?.id
+      && (applicationChanged || !activePresetRef.current?.id)
     ) {
-      presetProfiles.selectResolvedPreset()
+      selectResolvedPreset()
       return
     }
 
-    const binding = presetProfiles.activeBinding
-    const currentBlocks = activePresetRef.current?.blocks
-    if (!binding || !currentBlocks?.length) return
-
-    if (!contextChanged) return
+    const activeId = activePresetRef.current?.id
+    if (!activeId || !applicationChanged) return
     if (suppressNextProfileApplyRef.current === contextKey) {
       suppressNextProfileApplyRef.current = null
-      lastProfileContextRef.current = contextKey
-      markLoomRuntimeProfileContext(activePresetRef.current?.id, presetProfiles.activeChatId, presetProfiles.activeCharacterId, presetProfiles.activeProfileId)
+      lastProfileApplicationRef.current = applicationKey
+      markLoomRuntimeProfileContext(activeId, activeChatId, activeCharacterId, activeProfileId)
       return
     }
-    lastProfileContextRef.current = contextKey
-    markLoomRuntimeProfileContext(activePresetRef.current?.id, presetProfiles.activeChatId, presetProfiles.activeCharacterId, presetProfiles.activeProfileId)
-
-    const updatedBlocks = currentBlocks.map(b =>
-      b.id in binding.block_states ? { ...b, enabled: binding.block_states[b.id] } : b
+    lastProfileApplicationRef.current = applicationKey
+    applyRuntimeBlockProfile(activeId, binding?.block_states ?? null, binding?.prompt_variables ?? {})
+    markLoomRuntimeProfileContext(
+      binding ? activeId : null,
+      activeChatId,
+      activeCharacterId,
+      activeProfileId,
     )
-
-    const changed = updatedBlocks.some((b, i) => b.enabled !== currentBlocks[i].enabled)
-    if (changed) {
-      saveBlocks(updatedBlocks)
-    }
   }, [
-    presetProfiles.isResolved,
-    presetProfiles.resolvedPresetId,
-    presetProfiles.selectResolvedPreset,
-    presetProfiles.activeBinding,
-    presetProfiles.activeSource,
-    presetProfiles.activeChatId,
-    presetProfiles.activePersonaId,
-    presetProfiles.activeCharacterId,
-    presetProfiles.activeProfileId,
-    presetProfiles,
+    isResolved,
+    resolvedPresetId,
+    selectResolvedPreset,
+    activeBinding,
+    activeSource,
+    activeChatId,
+    activePersonaId,
+    activeCharacterId,
+    activeProfileId,
     activePreset?.id,
-    saveBlocks,
+    applyRuntimeBlockProfile,
   ])
 
   const [view, setView] = useState<'list' | 'edit'>('list')
@@ -1918,6 +1946,15 @@ export default function LoomBuilder({
   const [activeDragId, setActiveDragId] = useState<string | null>(null)
   const [hoveredAppendRootDropId, setHoveredAppendRootDropId] = useState<string | null>(null)
   const [armedAppendRootDropId, setArmedAppendRootDropId] = useState<string | null>(null)
+
+  useEffect(() => {
+    setShowPromptVariablesModal(false)
+  }, [
+    presetProfiles.activeChatId,
+    presetProfiles.activePersonaId,
+    presetProfiles.activeCharacterId,
+    presetProfiles.activeProfileId,
+  ])
 
   const activePresetEditorTabRef = useRef(activePresetEditorTab)
   const updatePresetDraftRef = useRef(updatePresetDraft)
@@ -2798,6 +2835,9 @@ export default function LoomBuilder({
             <button
               type="button"
               className={clsx(s.btn, s.variablesBtn)}
+              // A cached profile lookup must not make this action inert. The
+              // input bar opens the same modal from the active preset; Loom
+              // uses base values if the scoped profile is still resolving.
               onClick={() => setShowPromptVariablesModal(true)}
             >
               <Braces size={14} />
@@ -2993,9 +3033,10 @@ export default function LoomBuilder({
 
         {activePreset && (
           <PromptVariablesModal
+            key={promptVariableScopeKey}
             isOpen={showPromptVariablesModal}
             blocks={activePreset.blocks}
-            values={activePreset.promptVariables ?? {}}
+            values={effectivePromptVariableValues}
             onSave={savePromptVariableValues}
             onClose={() => setShowPromptVariablesModal(false)}
           />

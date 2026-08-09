@@ -26,7 +26,7 @@ app.put("/defaults", async (c) => {
     return c.json({ error: "preset_id and block_states are required" }, 400);
   }
   try {
-    const binding = svc.captureDefaults(userId, body.preset_id, body.block_states);
+    const binding = svc.captureDefaults(userId, body.preset_id, body.block_states, body.prompt_variables);
     return c.json(binding);
   } catch (e: any) {
     if (e.message === "Preset not found") return c.json({ error: e.message }, 404);
@@ -41,6 +41,20 @@ app.delete("/defaults", (c) => {
 
   if (!svc.deleteDefaults(userId, presetId)) return c.json({ error: "No defaults to delete" }, 404);
   return c.json({ success: true });
+});
+
+app.patch("/defaults/prompt-variables", async (c) => {
+  const userId = c.get("userId");
+  const body = await c.req.json();
+  if (!body.preset_id || !body.prompt_variables || typeof body.prompt_variables !== "object" || Array.isArray(body.prompt_variables)) {
+    return c.json({ error: "preset_id and prompt_variables are required" }, 400);
+  }
+  try {
+    return c.json(svc.updateDefaultsPromptVariables(userId, body.preset_id, body.prompt_variables));
+  } catch (e: any) {
+    if (e.message === "No defaults captured") return c.json({ error: e.message }, 404);
+    throw e;
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -65,7 +79,8 @@ app.put("/character/:characterId", async (c) => {
       userId,
       c.req.param("characterId"),
       body.preset_id,
-      body.block_states
+      body.block_states,
+      body.prompt_variables,
     );
     return c.json(binding);
   } catch (e: any) {
@@ -81,6 +96,20 @@ app.delete("/character/:characterId", (c) => {
     return c.json({ error: "No binding for this character" }, 404);
   }
   return c.json({ success: true });
+});
+
+app.patch("/character/:characterId/prompt-variables", async (c) => {
+  const userId = c.get("userId");
+  const body = await c.req.json();
+  if (!body.prompt_variables || typeof body.prompt_variables !== "object" || Array.isArray(body.prompt_variables)) {
+    return c.json({ error: "prompt_variables is required" }, 400);
+  }
+  try {
+    return c.json(svc.updateCharacterPromptVariables(userId, c.req.param("characterId"), body.prompt_variables));
+  } catch (e: any) {
+    if (e.message === "No profile binding found" || e.message === "No defaults captured") return c.json({ error: e.message }, 404);
+    throw e;
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -106,6 +135,7 @@ app.put("/persona/:personaId", async (c) => {
       c.req.param("personaId"),
       body.preset_id,
       body.block_states,
+      body.prompt_variables,
     );
     return c.json(binding);
   } catch (e: any) {
@@ -121,6 +151,20 @@ app.delete("/persona/:personaId", (c) => {
     return c.json({ error: "No binding for this persona" }, 404);
   }
   return c.json({ success: true });
+});
+
+app.patch("/persona/:personaId/prompt-variables", async (c) => {
+  const userId = c.get("userId");
+  const body = await c.req.json();
+  if (!body.prompt_variables || typeof body.prompt_variables !== "object" || Array.isArray(body.prompt_variables)) {
+    return c.json({ error: "prompt_variables is required" }, 400);
+  }
+  try {
+    return c.json(svc.updatePersonaPromptVariables(userId, c.req.param("personaId"), body.prompt_variables));
+  } catch (e: any) {
+    if (e.message === "No profile binding found" || e.message === "No defaults captured") return c.json({ error: e.message }, 404);
+    throw e;
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -149,12 +193,29 @@ app.put("/chat/:chatId", async (c) => {
       c.req.param("chatId"),
       body.preset_id,
       body.block_states || null,
+      body.prompt_variables,
       body.linked_to_defaults
     );
     return c.json(binding);
   } catch (e: any) {
     if (e.message === "Chat not found") return c.json({ error: e.message }, 404);
     if (e.message === "Preset not found") return c.json({ error: e.message }, 404);
+    throw e;
+  }
+});
+
+app.patch("/chat/:chatId/prompt-variables", async (c) => {
+  const userId = c.get("userId");
+  const body = await c.req.json();
+  if (!body.prompt_variables || typeof body.prompt_variables !== "object" || Array.isArray(body.prompt_variables)) {
+    return c.json({ error: "prompt_variables is required" }, 400);
+  }
+  try {
+    return c.json(svc.updateChatPromptVariables(userId, c.req.param("chatId"), body.prompt_variables));
+  } catch (e: any) {
+    if (e.message === "No profile binding found" || e.message === "No defaults captured") {
+      return c.json({ error: e.message }, 404);
+    }
     throw e;
   }
 });
@@ -189,7 +250,8 @@ app.put("/connection/:connectionId", async (c) => {
       userId,
       c.req.param("connectionId"),
       body.preset_id,
-      body.block_states
+      body.block_states,
+      body.prompt_variables,
     );
     return c.json(binding);
   } catch (e: any) {
@@ -205,6 +267,20 @@ app.delete("/connection/:connectionId", (c) => {
     return c.json({ error: "No binding for this connection" }, 404);
   }
   return c.json({ success: true });
+});
+
+app.patch("/connection/:connectionId/prompt-variables", async (c) => {
+  const userId = c.get("userId");
+  const body = await c.req.json();
+  if (!body.prompt_variables || typeof body.prompt_variables !== "object" || Array.isArray(body.prompt_variables)) {
+    return c.json({ error: "prompt_variables is required" }, 400);
+  }
+  try {
+    return c.json(svc.updateConnectionPromptVariables(userId, c.req.param("connectionId"), body.prompt_variables));
+  } catch (e: any) {
+    if (e.message === "No profile binding found" || e.message === "No defaults captured") return c.json({ error: e.message }, 404);
+    throw e;
+  }
 });
 
 // ---------------------------------------------------------------------------
