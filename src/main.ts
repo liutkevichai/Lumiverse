@@ -1,4 +1,3 @@
-console.log("[git:debug] === DEBUG BUILD ACTIVE — git network tracing enabled ===");
 import { unlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { env } from "./env";
