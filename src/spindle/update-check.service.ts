@@ -1,7 +1,7 @@
 import * as managerSvc from "./manager.service";
 import { probeGitRepositoryForUpdate } from "./update-check-git";
 
-const UPDATE_CHECK_INTERVAL_MS = 5 * 60 * 1_000;
+const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1_000;
 const UPDATE_CHECK_CONCURRENCY = 3;
 
 export interface ExtensionUpdateInfo {
