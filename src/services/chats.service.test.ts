@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { closeDatabase, getDb, initDatabase } from "../db/connection";
+import { eventBus } from "../ws/bus";
+import { EventType, type EventMessage } from "../ws/events";
 import {
   addGroupMember,
   addSwipe,
@@ -14,7 +16,9 @@ import {
   getMessage,
   getMessages,
   getPreviousSameRoleContent,
+  getTrailingVisibleUserMessageIds,
   listHiddenRecentChats,
+  listGroupChatSummaries,
   listRecentChats,
   listRecentChatsGrouped,
   patchMessageExtra,
@@ -188,6 +192,32 @@ describe("previous same-role content", () => {
   });
 });
 
+describe("trailing visible user messages", () => {
+  test("skips hidden turns and stops at the latest visible assistant", () => {
+    seedChat("chat", "c1", "Chat", "{}", 1);
+    seedMessage("assistant", "chat", "reply", {}, { index: 0 });
+    seedMessage("user-1", "chat", "one", {}, { index: 1, isUser: true });
+    seedMessage("hidden-assistant", "chat", "draft", { hidden: true }, { index: 2 });
+    seedMessage("user-2", "chat", "two", {}, { index: 3, isUser: true });
+    seedMessage("hidden-user", "chat", "draft", { hidden: true }, { index: 4, isUser: true });
+
+    expect(getTrailingVisibleUserMessageIds("u1", "chat"))
+      .toEqual(["user-1", "user-2"]);
+    expect(getTrailingVisibleUserMessageIds("other-user", "chat")).toEqual([]);
+  });
+
+  test("paginates through long runs of hidden messages", () => {
+    seedChat("chat", "c1", "Chat", "{}", 1);
+    seedMessage("assistant", "chat", "reply", {}, { index: 0 });
+    seedMessage("user", "chat", "queued", {}, { index: 1, isUser: true });
+    for (let index = 2; index < 140; index++) {
+      seedMessage(`hidden-${index}`, "chat", "draft", { hidden: true }, { index });
+    }
+
+    expect(getTrailingVisibleUserMessageIds("u1", "chat")).toEqual(["user"]);
+  });
+});
+
 describe("chat greeting selection", () => {
   test("persists the selected greeting index on the chat and greeting message", () => {
     getDb()
@@ -207,6 +237,30 @@ describe("chat greeting selection", () => {
     expect(chat.metadata.activeGreetingIndex).toBe(2);
     expect(greeting?.content).toBe("Alternate two");
     expect(greeting?.extra.greeting_index).toBe(2);
+  });
+});
+
+describe("chat lifecycle events", () => {
+  test("emits CHAT_CREATED after solo creation and group conversion", async () => {
+    const events: EventMessage[] = [];
+    const unsubscribe = eventBus.on(EventType.CHAT_CREATED, (event) => events.push(event));
+
+    try {
+      const solo = createChat("u1", { character_id: "c1", name: "Solo" });
+      const converted = convertSoloChatToGroup("u1", solo.id);
+      expect(converted).not.toBeNull();
+
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(events.map((event) => event.payload.id)).toEqual([solo.id, converted!.id]);
+      expect(events.every((event) => event.userId === "u1")).toBe(true);
+      expect(events[1]?.payload.chat.metadata).toEqual(expect.objectContaining({
+        group: true,
+        character_ids: ["c1"],
+      }));
+    } finally {
+      unsubscribe();
+    }
   });
 });
 
@@ -246,6 +300,52 @@ describe("recent chats", () => {
     expect(result.total).toBe(2);
     expect(result.data.map((chat) => chat.id)).toEqual(["bad", "good"]);
     expect(result.data[0].metadata).toEqual({});
+  });
+
+  test("flat recent list searches, sorts, and stays one row per chat", () => {
+    seedChat("z-newest", "c1", "Zeta newest", "{}", 300);
+    seedChat("a-middle", "c1", "Alpha middle", "{}", 200);
+    seedChat("debugger", "c2", "Branch #1", "{}", 100);
+
+    const byRecent = listRecentChats("u1", { limit: 10, offset: 0 });
+    expect(byRecent.data.map((chat) => chat.id)).toEqual(["z-newest", "a-middle", "debugger"]);
+
+    const byName = listRecentChats("u1", { limit: 10, offset: 0 }, { sort: "name", direction: "asc" });
+    expect(byName.data.map((chat) => chat.id)).toEqual(["a-middle", "debugger", "z-newest"]);
+
+    const byCreatedDesc = listRecentChats("u1", { limit: 10, offset: 0 }, { sort: "created", direction: "desc" });
+    expect(byCreatedDesc.data.map((chat) => chat.id)).toEqual(["z-newest", "a-middle", "debugger"]);
+
+    const search = listRecentChats("u1", { limit: 10, offset: 0 }, { search: "branch" });
+    expect(search.data.map((chat) => chat.id)).toEqual(["debugger"]);
+    // Search matches character names too, not just chat names.
+    const byCharacter = listRecentChats("u1", { limit: 10, offset: 0 }, { search: "beta" });
+    expect(byCharacter.total).toBe(1);
+  });
+
+  test("flat recent list hides hidden_from_recent chats", () => {
+    seedChat("shown", "c1", "Shown", "{}", 100);
+    seedChat("hidden", "c1", "Hidden", JSON.stringify({ hidden_from_recent: true }), 200);
+
+    const result = listRecentChats("u1", { limit: 10, offset: 0 });
+
+    expect(result.data.map((chat) => chat.id)).toEqual(["shown"]);
+  });
+
+  test("flat recent list enriches rows with message count and preview", () => {
+    seedChat("enriched", "c1", "Enriched", "{}", 100);
+    seedMessage("m1", "enriched", "first message", {}, { index: 0 });
+    seedMessage("m2", "enriched", "last message body", {}, { index: 1 });
+    seedChat("empty", "c2", "Empty", "{}", 50);
+
+    const result = listRecentChats("u1", { limit: 10, offset: 0 });
+
+    const enriched = result.data.find((chat) => chat.id === "enriched");
+    expect(enriched?.message_count).toBe(2);
+    expect(enriched?.last_message_preview).toBe("last message body");
+    const empty = result.data.find((chat) => chat.id === "empty");
+    expect(empty?.message_count).toBe(0);
+    expect(empty?.last_message_preview).toBe("");
   });
 
   test("groups recent chats without SQLite JSON extraction", () => {
@@ -570,6 +670,27 @@ describe("recent chats", () => {
     expect(group.metadata.branch_at_message).toBeUndefined();
     expect(getChatTree("u1", group.id)?.id).toBe(group.id);
   });
+
+  test("keeps a forked one-member converted group separate from unrelated solo RPs", () => {
+    seedChat("solo-source", "c1", "Converted RP", "{}", 100);
+    seedMessage("source-msg-1", "solo-source", "Opening", {}, { index: 0 });
+    seedMessage("source-msg-2", "solo-source", "Reply", {}, { index: 1, isUser: true });
+    seedChat("unrelated-solo", "c1", "Other RP", "{}", 300);
+    seedChat("unrelated-solo-fork", "c1", "Other RP — Branch", JSON.stringify({
+      branched_from: "unrelated-solo",
+      branch_at_message: "other-msg",
+    }), 400);
+
+    const converted = convertSoloChatToGroup("u1", "solo-source")!;
+    const convertedMessages = getMessages("u1", converted.id);
+    const fork = branchChat("u1", converted.id, convertedMessages[1].id)!;
+
+    const groupHistory = listGroupChatSummaries("u1", ["c1"]);
+
+    expect(groupHistory.map((chat) => chat.id).sort()).toEqual([converted.id, fork.id].sort());
+    expect(groupHistory.every((chat) => !chat.name.startsWith("Other RP"))).toBe(true);
+    expect(getChat("u1", converted.id)).not.toBeNull();
+  });
 });
 
 describe("bulk chat deletion", () => {
@@ -743,6 +864,25 @@ describe("avatar-bound appearance", () => {
       description: "winter-desc",
       personality: "warm",
     });
+    expect(result?.chat.metadata.active_avatar_id).toBeUndefined();
+  });
+
+  test("applies an avatar selection to the addressed group member, not the chat owner", () => {
+    seedCharacterWithExtensions("char1", appearanceExtensions);
+    seedCharacterWithExtensions("char2", appearanceExtensions);
+    getDb().query("UPDATE characters SET alternate_greetings = ? WHERE id IN (?, ?)")
+      .run(JSON.stringify(["Winter hello"]), "char1", "char2");
+    seedChat("chat1", "char1", "Group", JSON.stringify({ group: true, character_ids: ["char1", "char2"] }), 1);
+
+    const result = applyChatAppearance("u1", "chat1", {
+      type: "avatar",
+      avatar_entry_id: "winter-avatar",
+      character_id: "char2",
+    });
+
+    expect(result?.chat.metadata.group_active_avatar_ids).toEqual({ char2: "winter-image" });
+    expect(result?.chat.metadata.group_active_avatar_entry_ids).toEqual({ char2: "winter-avatar" });
+    expect(result?.chat.metadata.group_active_greeting_indices).toEqual({ char2: 1 });
     expect(result?.chat.metadata.active_avatar_id).toBeUndefined();
   });
 });

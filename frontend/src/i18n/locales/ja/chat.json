@@ -340,6 +340,8 @@
     "copyCode": "コードをコピー",
     "copy": "コピー",
     "copied": "コピーしました !",
+    "readMore": "もっと見る",
+    "showLess": "折りたたむ",
     "youtubeVideo": "YouTube ビデオ"
   },
   "messageMeta": {
@@ -364,7 +366,11 @@
     "next": "次のエピソードのスワイプ"
   },
   "portrait": {
-    "setChatBackground": "背景として設定"
+    "setChatBackground": "背景として設定",
+    "copyImageReference": "画像参照をコピー",
+    "imageReferenceCopied": "画像参照をコピーしました",
+    "imageReferenceCopyFailed": "画像参照をコピーできませんでした",
+    "galleryImage": "ギャラリー画像"
   },
   "attachments": {
     "removeImage": "画像を削除",

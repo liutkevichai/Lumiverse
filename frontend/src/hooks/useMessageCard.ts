@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next'
 import { useNavigate } from 'react-router'
 import { useStore } from '@/store'
 import { messagesApi, chatsApi } from '@/api/chats'
+import { generateUUID } from '@/lib/uuid'
 import {
   getCharacterAvatarThumbUrlById,
   getCharacterAvatarLargeUrlById,
@@ -19,6 +20,10 @@ import { imagesApi } from '@/api/images'
 import type { Message } from '@/types/api'
 import type { GenerationMetrics } from '@/types/ws-events'
 import { resolveMultiplayerMessageAuthor } from '@/lib/multiplayerMessageAuthor'
+import {
+  preloadChatNavigationSnapshot,
+  preloadChatNavigationSnapshotById,
+} from '@/lib/chatNavigationSnapshot'
 
 const CONTEXT_HISTORY_ANCHOR_KEY = 'context_history_anchor_message_id'
 
@@ -57,15 +62,27 @@ export function useMessageCard(message: Message, chatId: string) {
   const { t: tc } = useTranslation('chat', { keyPrefix: 'messageCard' })
   const navigate = useNavigate()
   const editingMessageId = useStore((s) => s.editingMessageId)
-  const setEditingMessageId = useStore((s) => s.setEditingMessageId)
+  const messageEditDraft = useStore((s) => s.messageEditDraft)
+  const beginMessageEdit = useStore((s) => s.beginMessageEdit)
+  const updateMessageEditDraft = useStore((s) => s.updateMessageEditDraft)
+  const clearMessageEdit = useStore((s) => s.clearMessageEdit)
   const updateMessage = useStore((s) => s.updateMessage)
   const addToast = useStore((s) => s.addToast)
   const isEditing = editingMessageId === message.id
-  const [editContent, setEditContent] = useState('')
-  const [editReasoning, setEditReasoning] = useState('')
-  const [showReasoningEditor, setShowReasoningEditor] = useState(false)
-  const hadReasoningRef = useRef(false)
-  const wasEditingRef = useRef(false)
+  const activeDraft = messageEditDraft?.chatId === chatId && messageEditDraft.messageId === message.id
+    ? messageEditDraft
+    : null
+  const editContent = activeDraft?.content ?? ''
+  const editReasoning = activeDraft?.reasoning ?? ''
+  const showReasoningEditor = activeDraft?.showReasoningEditor ?? false
+  const setEditContent = useCallback((content: string) => {
+    updateMessageEditDraft({ content })
+  }, [updateMessageEditDraft])
+  const setEditReasoning = useCallback((reasoning: string) => {
+    updateMessageEditDraft({ reasoning })
+  }, [updateMessageEditDraft])
+  const editAndSendRequestRef = useRef<{ fingerprint: string; requestId: string } | null>(null)
+  const [editAndSendPending, setEditAndSendPending] = useState(false)
   const removeMessage = useStore((s) => s.removeMessage)
   const openModal = useStore((s) => s.openModal)
   const activeCharacterId = useStore((s) => s.activeCharacterId)
@@ -81,7 +98,8 @@ export function useMessageCard(message: Message, chatId: string) {
   const activeChatAvatarId = useStore((s) => s.activeChatAvatarId)
   const activeChatMetadata = useStore((s) => s.activeChatMetadata)
   const setActiveChatMetadata = useStore((s) => s.setActiveChatMetadata)
-  const isBubbleMode = useStore((s) => s.chatSheldDisplayMode) === 'bubble'
+  const isBubbleMode = useStore((s) => s.chatDisplayMode) === 'bubble'
+  const branchChatOnEditAndSend = useStore((s) => s.quickToolbarSettings?.branchChatOnEditAndSend ?? true)
 
   const regeneratingMessageId = useStore((s) => s.regeneratingMessageId)
   const streamingSwipeId = useStore((s) => s.streamingSwipeId)
@@ -311,40 +329,56 @@ export function useMessageCard(message: Message, chatId: string) {
   }, [messages, message.id, message.name, isUser, activePersona])
 
   const initializeEdit = useCallback(() => {
+    const persistedMessages = messages.filter((entry) => (
+      !entry.id.startsWith('__stream_placeholder_') && !entry.id.startsWith('__regen_placeholder_')
+    ))
+    const loadedOffset = Math.max(0, useStore.getState().totalChatLength - persistedMessages.length)
+    const loadedIndex = persistedMessages.findIndex((entry) => entry.id === message.id)
+    const messageOffset = loadedOffset + Math.max(0, loadedIndex)
+
     if (!message.is_user) {
       // For assistant messages, separate reasoning from content
       const apiReasoning = typeof message.extra?.reasoning === 'string' ? message.extra.reasoning : ''
       const { cleaned, thoughts } = parseThinkingTags(message.content)
       const reasoningText = apiReasoning || thoughts
       const hasReasoning = !!reasoningText
-      hadReasoningRef.current = hasReasoning
-      setShowReasoningEditor(hasReasoning)
-      setEditReasoning(reasoningText)
-      // Clean content: strip think tags and leading blank lines
-      setEditContent(cleaned.replace(/^\n{2,}/, ''))
+      beginMessageEdit({
+        chatId,
+        messageId: message.id,
+        messageOffset,
+        messageIndexInChat: message.index_in_chat,
+        content: cleaned.replace(/^\n{2,}/, ''),
+        reasoning: reasoningText,
+        showReasoningEditor: hasReasoning,
+        hadReasoning: hasReasoning,
+      })
     } else {
-      setEditContent(message.content)
-      setEditReasoning('')
-      setShowReasoningEditor(false)
-      hadReasoningRef.current = false
+      beginMessageEdit({
+        chatId,
+        messageId: message.id,
+        messageOffset,
+        messageIndexInChat: message.index_in_chat,
+        content: message.content,
+        reasoning: '',
+        showReasoningEditor: false,
+        hadReasoning: false,
+      })
     }
-  }, [message.content, message.is_user, message.extra])
+  }, [beginMessageEdit, chatId, message.content, message.extra, message.id, message.index_in_chat, message.is_user, messages])
 
-  // Populate edit fields on the false→true transition of isEditing,
-  // so externally-triggered edits (keyboard shortcut) seed the fields too.
-  // useLayoutEffect so the content is populated before paint — useEffect
-  // leaves a frame where the textarea is empty (min-height 220px) which
-  // the virtualizer measures as a height spike ("void").
+  // Keyboard-triggered edits only publish the target id. Initialize the
+  // durable draft before paint if this target does not have one yet. A row
+  // remount caused by virtualization sees the matching draft and leaves it
+  // untouched.
   useLayoutEffect(() => {
-    if (isEditing && !wasEditingRef.current) {
+    if (isEditing && !activeDraft) {
       initializeEdit()
     }
-    wasEditingRef.current = isEditing
-  }, [isEditing, initializeEdit])
+  }, [activeDraft, isEditing, initializeEdit])
 
   const handleEdit = useCallback(() => {
-    setEditingMessageId(message.id)
-  }, [message.id, setEditingMessageId])
+    initializeEdit()
+  }, [initializeEdit])
 
   const handleSaveEdit = useCallback(async () => {
     try {
@@ -352,7 +386,7 @@ export function useMessageCard(message: Message, chatId: string) {
       const cleanContent = editContent.trim()
       let updated: Message
 
-      if (!message.is_user && hadReasoningRef.current) {
+      if (!message.is_user && activeDraft?.hadReasoning) {
         // Let the WS MESSAGE_EDITED payload reconcile the final stored message so
         // extension-postprocessed content is not overwritten by a late local merge.
         const extra = {
@@ -365,20 +399,62 @@ export function useMessageCard(message: Message, chatId: string) {
         updated = await messagesApi.update(chatId, message.id, { content: cleanContent })
       }
       updateMessage(updated.id, updated)
-      setEditingMessageId(null)
+      clearMessageEdit()
     } catch (err) {
       console.error('[MessageCard] Failed to save edit:', err)
       addToast({ type: 'error', message: t('failedSaveMessageEdit') })
     }
-  }, [chatId, message.id, editContent, editReasoning, message.is_user, message.extra, setEditingMessageId, updateMessage, addToast, t])
+  }, [activeDraft?.hadReasoning, chatId, message.id, editContent, editReasoning, message.is_user, message.extra, clearMessageEdit, updateMessage, addToast, t])
 
   const handleCancelEdit = useCallback(() => {
-    setEditingMessageId(null)
-    setEditContent('')
-    setEditReasoning('')
-    setShowReasoningEditor(false)
-    hadReasoningRef.current = false
-  }, [setEditingMessageId])
+    if (editAndSendPending) return
+    editAndSendRequestRef.current = null
+    clearMessageEdit()
+  }, [clearMessageEdit, editAndSendPending])
+
+  const handleEditAndSend = useCallback(async () => {
+    if (!message.is_user || editAndSendPending || isStreaming) return
+    const cleanContent = editContent.trim()
+    if (!cleanContent) {
+      addToast({ type: 'error', message: t('emptyEditAndSend', { defaultValue: 'Message cannot be empty' }) })
+      return
+    }
+
+    const expectedVersion = message.revision ?? 1
+    const fingerprint = `${message.id}\0${expectedVersion}\0${cleanContent}\0${branchChatOnEditAndSend ? '1' : '0'}`
+    if (editAndSendRequestRef.current?.fingerprint !== fingerprint) {
+      editAndSendRequestRef.current = { fingerprint, requestId: generateUUID() }
+    }
+    const requestId = editAndSendRequestRef.current.requestId
+
+    setEditAndSendPending(true)
+    try {
+      const result = await chatsApi.editAndSend(chatId, {
+        messageId: message.id,
+        content: cleanContent,
+        expectedVersion,
+        requestId,
+        branchChatOnEditAndSend,
+      })
+      if (branchChatOnEditAndSend) {
+        const messageLimit = useStore.getState().messagesPerPage || 50
+        await preloadChatNavigationSnapshotById(result.branchChatId, messageLimit).catch((err) => {
+          console.warn('[MessageCard] Failed to preload edit-and-send branch:', err)
+        })
+      }
+      editAndSendRequestRef.current = null
+      clearMessageEdit()
+      if (branchChatOnEditAndSend) navigate(`/chat/${result.branchChatId}`)
+    } catch (err: any) {
+      console.error('[MessageCard] Failed to edit and send:', err)
+      addToast({
+        type: 'error',
+        message: err?.body?.error || err?.message || t('failedEditAndSend', { defaultValue: 'Failed to edit and send' }),
+      })
+    } finally {
+      setEditAndSendPending(false)
+    }
+  }, [branchChatOnEditAndSend, chatId, editAndSendPending, editContent, isStreaming, message, t, addToast, clearMessageEdit, navigate])
 
   const doDeleteMessage = useCallback(async () => {
     try {
@@ -459,6 +535,10 @@ export function useMessageCard(message: Message, chatId: string) {
       onConfirm: async (name: string) => {
         try {
           const newChat = await chatsApi.branch(chatId, message.id, name)
+          const messageLimit = useStore.getState().messagesPerPage || 50
+          await preloadChatNavigationSnapshot(newChat, messageLimit).catch((err) => {
+            console.warn('[MessageCard] Failed to preload forked chat:', err)
+          })
           navigate(`/chat/${newChat.id}`)
         } catch (err) {
           console.error('[MessageCard] Failed to fork chat:', err)
@@ -501,7 +581,6 @@ export function useMessageCard(message: Message, chatId: string) {
   // back to the live roster because no per-message snapshot exists for them.
   // Non-reactive read on purpose: avoids re-rendering every card on
   // typing/presence churn.
-  // eslint-disable-next-line react-compiler/react-compiler
   const mpStore = useStore.getState()
   const mpAuthor = resolveMultiplayerMessageAuthor({
     message,
@@ -546,7 +625,9 @@ export function useMessageCard(message: Message, chatId: string) {
     isContextAnchor,
     handleEdit,
     handleSaveEdit,
+    handleEditAndSend,
     handleCancelEdit,
+    editAndSendPending,
     handleDelete,
     handleToggleHidden,
     handleToggleContextAnchor,

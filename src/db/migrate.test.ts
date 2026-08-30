@@ -17,11 +17,20 @@ describe("database migrations", () => {
       ).toEqual({ name: "094_regex_actions.sql" });
       const regexColumns = db.query("PRAGMA table_info(regex_scripts)").all() as Array<{ name: string }>;
       expect(regexColumns.some((column) => column.name === "actions")).toBe(true);
+      expect(regexColumns.some((column) => column.name === "owner_extension_identifier")).toBe(true);
+      expect(
+        db.query("SELECT name FROM _migrations WHERE name = ?").get("101_regex_script_extension_ownership.sql"),
+      ).toEqual({ name: "101_regex_script_extension_ownership.sql" });
       const linkColumns = db.query("PRAGMA table_info(lumihub_link)").all() as Array<{ name: string }>;
       expect(linkColumns.some((column) => column.name === "user_id")).toBe(true);
       expect(
         db.query("SELECT name FROM _migrations WHERE name = ?").get("095_lumihub_link_user_scope.sql"),
       ).toEqual({ name: "095_lumihub_link_user_scope.sql" });
+      expect(
+        db.query("SELECT name FROM _migrations WHERE name = ?").get("107_world_book_entry_order_index.sql"),
+      ).toEqual({ name: "107_world_book_entry_order_index.sql" });
+      const entryIndexes = db.query("PRAGMA index_list('world_book_entries')").all() as Array<{ name: string }>;
+      expect(entryIndexes.map((index) => index.name)).toContain("idx_wbe_world_book_order");
     } finally {
       db.close();
     }

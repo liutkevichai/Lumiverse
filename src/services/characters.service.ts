@@ -35,14 +35,22 @@ function canonicalCharacterExtensions(extensions: Record<string, any> | undefine
 
 // ─── Summary queries (lightweight, for character browser) ─────────────────
 
-const SUMMARY_COLUMNS = `c.id, c.library_scope, c.name, c.creator, c.folder, c.tags, c.image_id, c.created_at, c.updated_at,
+const SUMMARY_COLUMNS = `c.id, c.library_scope, c.name, c.description,
+  COALESCE(NULLIF(TRIM(c.description), ''), NULLIF(TRIM(c.personality), ''), '') AS preview_description,
+  c.creator, c.folder, c.tags, c.image_id, c.created_at, c.updated_at,
   (json_array_length(c.alternate_greetings) > 0) as has_alternate_greetings`;
+
+function getPreviewDescription(description: string | null | undefined, personality: string | null | undefined): string {
+  return description?.trim() || personality?.trim() || "";
+}
 
 function rowToSummary(row: any): CharacterSummary {
   return {
     id: row.id,
     library_scope: normalizeCharacterLibraryScope(row.library_scope),
     name: row.name,
+    description: row.description || "",
+    preview_description: row.preview_description || "",
     creator: row.creator,
     folder: row.folder || "",
     tags: JSON.parse(row.tags),
@@ -257,8 +265,69 @@ export function listCharacterSummaries(
 
   const whereStr = whereClauses.join(" AND ");
 
+  const chatRecencyJoin = `
+    LEFT JOIN (
+      SELECT character_id, MAX(last_chatted_at) AS last_chatted_at
+      FROM (
+        SELECT character_id, MAX(updated_at) AS last_chatted_at
+        FROM chats
+        WHERE user_id = ?
+          AND character_id IS NOT NULL
+          AND COALESCE(
+            CASE WHEN json_valid(metadata)
+              THEN json_extract(metadata, '$.hidden_from_recent')
+            END,
+            0
+          ) NOT IN (1, 'true')
+          AND COALESCE(
+            CASE WHEN json_valid(metadata)
+              THEN json_extract(metadata, '$.group')
+            END,
+            0
+          ) NOT IN (1, 'true')
+        GROUP BY character_id
+
+        UNION ALL
+
+        SELECT participant.value AS character_id, MAX(group_chat.updated_at) AS last_chatted_at
+        FROM chats group_chat
+        JOIN json_each(
+          CASE WHEN json_valid(group_chat.metadata)
+            THEN COALESCE(json_extract(group_chat.metadata, '$.character_ids'), '[]')
+            ELSE '[]'
+          END
+        ) participant
+        WHERE group_chat.user_id = ?
+          AND COALESCE(
+            CASE WHEN json_valid(group_chat.metadata)
+              THEN json_extract(group_chat.metadata, '$.hidden_from_recent')
+            END,
+            0
+          ) NOT IN (1, 'true')
+        GROUP BY participant.value
+      ) recent_activity
+      GROUP BY character_id
+    ) cs ON cs.character_id = c.id
+  `;
+
+  // A character owns its one-on-one chats. Group chats are intentionally not
+  // counted here: assigning a single group session to every participant would
+  // overstate the number of chats for each card.
+  const chatCountJoin = `
+    LEFT JOIN (
+      SELECT character_id, COUNT(*) AS chat_count
+      FROM chats
+      WHERE user_id = ?
+        AND character_id IS NOT NULL
+        AND COALESCE(json_extract(metadata, '$.group'), 0) != 1
+      GROUP BY character_id
+    ) cs ON cs.character_id = c.id
+  `;
+
   // Sort
   let orderBy: string;
+  let extraJoin = "";
+  let queryParams = whereParams;
   if (usedFts && !sort) {
     orderBy = "ORDER BY rank"; // FTS5 relevance — only valid when MATCH was used
   } else if (search && !sort) {
@@ -272,17 +341,24 @@ export function listCharacterSummaries(
       case "created":
         orderBy = `ORDER BY c.created_at ${dir}, c.id ASC`;
         break;
+      case "most_chats":
+        extraJoin = chatCountJoin;
+        queryParams = [userId, ...whereParams];
+        orderBy = `ORDER BY COALESCE(cs.chat_count, 0) ${dir}, c.updated_at ${dir}, c.id ASC`;
+        break;
       case "recent":
       default:
-        orderBy = `ORDER BY c.updated_at ${dir}, c.id ASC`;
+        extraJoin = chatRecencyJoin;
+        queryParams = [userId, userId, ...whereParams];
+        orderBy = `ORDER BY MAX(c.updated_at, COALESCE(cs.last_chatted_at, c.updated_at)) ${dir}, c.updated_at ${dir}, c.id ASC`;
         break;
       }
   }
 
   return paginatedQuery(
-    `SELECT ${SUMMARY_COLUMNS} FROM ${fromClause} WHERE ${whereStr} ${orderBy}`,
-    `SELECT COUNT(*) as count FROM ${fromClause} WHERE ${whereStr}`,
-    whereParams,
+    `SELECT ${SUMMARY_COLUMNS} FROM ${fromClause} ${extraJoin} WHERE ${whereStr} ${orderBy}`,
+    `SELECT COUNT(*) as count FROM ${fromClause} ${extraJoin} WHERE ${whereStr}`,
+    queryParams,
     pagination,
     rowToSummary
   );
@@ -517,7 +593,7 @@ export function getCharacterAvatarInfo(
   return { image_id: row.image_id || null, avatar_path: row.avatar_path || null, avatar_crop_image_id: avatarCropImageId };
 }
 
-export type CharacterSortMode = "recent" | "discover";
+export type CharacterSortMode = "recent" | "discover" | "most_chats";
 
 export type PerspectiveLayerKind = "background" | "framing" | "subject";
 export const LANDING_PERSPECTIVE_LAYERS_KEY = "landing_perspective_layers";
@@ -796,6 +872,8 @@ export function getCharacterPreview(userId: string, id: string): CharacterPrevie
     id: character.id,
     library_scope: character.library_scope,
     name: character.name,
+    description: character.description,
+    preview_description: getPreviewDescription(character.description, character.personality),
     creator: character.creator,
     folder: character.folder,
     tags: JSON.stringify(character.tags),
@@ -833,7 +911,16 @@ export function getCharactersByIds(userId: string, ids: string[]): Map<string, C
   return result;
 }
 
-export function createCharacter(userId: string, input: CreateCharacterInput): Character {
+export interface CreateCharacterOptions {
+  /** Bulk workflows publish one library invalidation after committing. */
+  emitEvent?: boolean;
+}
+
+export function createCharacter(
+  userId: string,
+  input: CreateCharacterInput,
+  options: CreateCharacterOptions = {},
+): Character {
   const id = crypto.randomUUID();
   const now = Math.floor(Date.now() / 1000);
   const createdAt = input.created_at ?? now;
@@ -873,7 +960,9 @@ export function createCharacter(userId: string, input: CreateCharacterInput): Ch
   }
 
   const character = getCharacter(userId, id)!;
-  eventBus.emit(EventType.CHARACTER_CREATED, { id, character }, userId);
+  if (options.emitEvent !== false) {
+    eventBus.emit(EventType.CHARACTER_CREATED, { id, character }, userId);
+  }
   return character;
 }
 
@@ -1247,6 +1336,25 @@ export function findCharacterBySourceFilename(userId: string, sourceFilename: st
   return row ? rowToCharacter(row) : null;
 }
 
+/** Load migration identities once so a large import does not issue one lookup
+ * per card. Duplicate legacy identities resolve deterministically to the most
+ * recently updated character, matching the old LIMIT 1 behavior closely. */
+export function listCharacterSourceFilenameIds(userId: string): Map<string, string> {
+  const rows = getDb()
+    .query(
+      `SELECT id, json_extract(extensions, '$._lumiverse_source_filename') AS source_filename
+       FROM characters
+       WHERE user_id = ?
+         AND json_type(extensions, '$._lumiverse_source_filename') = 'text'
+       ORDER BY updated_at ASC`,
+    )
+    .all(userId) as Array<{ id: string; source_filename: string }>;
+
+  const result = new Map<string, string>();
+  for (const row of rows) result.set(row.source_filename, row.id);
+  return result;
+}
+
 export function setCharacterSourceFilename(userId: string, id: string, sourceFilename: string): void {
   const char = getCharacter(userId, id);
   if (!char) return;
@@ -1262,23 +1370,131 @@ export function deleteCharacter(userId: string, id: string): boolean {
   const marked = getDb()
     .query("UPDATE characters SET deleting = 1 WHERE id = ? AND user_id = ? AND deleting = 0")
     .run(id, userId);
-  if (marked.changes === 0) return true;
-  eventBus.emit(EventType.CHARACTER_DELETED, { id }, userId);
-  void runCharacterDeletionCascade(userId, id).catch((err) =>
+  if (marked.changes > 0) eventBus.emit(EventType.CHARACTER_DELETED, { id }, userId);
+  void scheduleCharacterDeletionCascade(userId, id).catch((err) =>
     console.error(`[characters] deletion cascade failed for ${id}:`, err instanceof Error ? err.message : err)
   );
   return true;
 }
 
+export interface CharacterBatchDeleteResult {
+  deleted: string[];
+  failed: string[];
+}
+
+/**
+ * Mark a set of characters first, then await each resumable cleanup cascade.
+ * Marking the whole set up front keeps assets shared only by members of this
+ * batch from looking live while the first member is being cleaned up.
+ */
+export async function batchDeleteCharacters(userId: string, ids: string[]): Promise<CharacterBatchDeleteResult> {
+  const uniqueIds = [...new Set(ids.filter((id) => typeof id === "string" && id.length > 0))];
+  if (uniqueIds.length === 0) return { deleted: [], failed: [] };
+
+  const existing = getCharactersByIds(userId, uniqueIds);
+  const marked: string[] = [];
+  getDb().transaction(() => {
+    const statement = getDb().query(
+      "UPDATE characters SET deleting = 1 WHERE id = ? AND user_id = ? AND deleting = 0",
+    );
+    for (const id of uniqueIds) {
+      if (!existing.has(id)) continue;
+      if (statement.run(id, userId).changes > 0) marked.push(id);
+    }
+  })();
+  for (const id of marked) eventBus.emit(EventType.CHARACTER_DELETED, { id }, userId);
+
+  const deleted: string[] = [];
+  const failed: string[] = [];
+  for (const id of uniqueIds) {
+    if (!existing.has(id)) {
+      failed.push(id);
+      continue;
+    }
+    try {
+      await scheduleCharacterDeletionCascade(userId, id);
+      if (getCharacter(userId, id)) failed.push(id);
+      else deleted.push(id);
+    } catch (err) {
+      console.error(`[characters] batch deletion cascade failed for ${id}:`, err instanceof Error ? err.message : err);
+      failed.push(id);
+    }
+  }
+  return { deleted, failed };
+}
+
+const characterDeletionCascades = new Map<string, Promise<void>>();
+
+function scheduleCharacterDeletionCascade(userId: string, id: string): Promise<void> {
+  const key = `${userId}\0${id}`;
+  const active = characterDeletionCascades.get(key);
+  if (active) return active;
+  const cascade = runCharacterDeletionCascade(userId, id).finally(() => {
+    if (characterDeletionCascades.get(key) === cascade) characterDeletionCascades.delete(key);
+  });
+  characterDeletionCascades.set(key, cascade);
+  return cascade;
+}
+
 async function runCharacterDeletionCascade(userId: string, id: string): Promise<void> {
   const existing = getCharacter(userId, id);
   if (!existing) return;
+
+  // A character FK would cascade-delete its primary chats, bypassing the
+  // non-SQL cleanup in chats.deleteChat (audio, vectors, caches and timers).
+  // Delete those chats explicitly first. Also remove the character from group
+  // metadata where it is not the primary member, so no dead member IDs remain.
+  try {
+    const chatsSvc = await import("./chats.service");
+    const primaryChats = getDb()
+      .query("SELECT id FROM chats WHERE user_id = ? AND character_id = ?")
+      .all(userId, id) as Array<{ id: string }>;
+    chatsSvc.deleteChats(userId, primaryChats.map((row) => row.id));
+
+    const groupRows = getDb().query(
+      `SELECT c.id
+         FROM chats c
+        WHERE c.user_id = ?
+          AND COALESCE(json_extract(c.metadata, '$.group'), 0) = 1
+          AND c.character_id != ?
+          AND EXISTS (
+            SELECT 1 FROM json_each(c.metadata, '$.character_ids') member
+             WHERE member.value = ?
+          )`,
+    ).all(userId, id, id) as Array<{ id: string }>;
+    for (const row of groupRows) {
+      const chat = chatsSvc.getChat(userId, row.id);
+      const members = Array.isArray(chat?.metadata?.character_ids) ? chat.metadata.character_ids : [];
+      if (members.length > 2) chatsSvc.removeGroupMember(userId, row.id, id);
+      else chatsSvc.deleteChat(userId, row.id);
+    }
+  } catch (err: any) {
+    // Focused tests may omit the chats table. Real cleanup failures must keep
+    // the tombstone in place so startup recovery can retry safely.
+    if (!/no such table: chats/i.test(String(err?.message ?? err))) throw err;
+  }
+
   const imageIds = collectCharacterImageIds(existing);
   for (const imageId of listCharacterGalleryImageIds(userId, id)) imageIds.add(imageId);
   const plan = imagesSvc.imageDeletePlan(userId, unreferencedImageIds(userId, imageIds));
 
   await imagesSvc.unlinkPaths(plan.paths);
-  if (existing.avatar_path) await filesSvc.deleteAvatar(existing.avatar_path).catch(() => {});
+  if (existing.avatar_path) {
+    const stillReferenced = (() => {
+      try {
+        return !!getDb().query(
+          `SELECT 1 AS found FROM characters
+            WHERE user_id = ? AND deleting = 0 AND avatar_path = ?
+           UNION ALL
+           SELECT 1 AS found FROM personas WHERE user_id = ? AND avatar_path = ?
+           LIMIT 1`,
+        ).get(userId, existing.avatar_path, userId, existing.avatar_path);
+      } catch {
+        return false;
+      }
+    })();
+    if (!stillReferenced) await filesSvc.deleteAvatar(existing.avatar_path).catch(() => {});
+  }
   await deleteAutoManagedCharacterWorldBooks(userId, id);
 
   getDb().transaction(() => {
@@ -1299,7 +1515,7 @@ export async function resumePendingCharacterDeletions(): Promise<number> {
   }
   for (const row of rows) {
     try {
-      await runCharacterDeletionCascade(row.user_id, row.id);
+      await scheduleCharacterDeletionCascade(row.user_id, row.id);
     } catch (err) {
       console.error(`[characters] deletion resume failed for ${row.id}:`, err instanceof Error ? err.message : err);
     }

@@ -5,6 +5,8 @@ import ProductivitySettings from '@/components/settings/ProductivitySettings'
 import { useStore } from '@/store'
 import type { HostSurfaceJsonValue, HostSurfaceRenderContext } from './host-surface-registry'
 import { QuickToolbar } from '@/components/quick-toolbar/QuickToolbar'
+import { readQuickToolbarPlacement } from '@/components/quick-toolbar/quickToolbarDock'
+import { effectiveQuickToolbarDockRequest } from '@/lib/chatSurfaceLayout'
 import { ConnectionsPicker } from '@/components/connections-picker/ConnectionsPicker'
 import LoreIndicator from '@/components/lore-indicator/LoreIndicator'
 import PortraitDock from '@/components/chat/PortraitDock'
@@ -13,15 +15,22 @@ import { Waypoints } from 'lucide-react'
 import inputStyles from '@/components/chat/InputArea.module.css'
 import { ResizablePanelFrame } from '@/components/shared/ResizablePanelFrame'
 import {
-  centerEditorRect,
-  clampEditorRectToViewport,
   DEFAULT_MIN_EDITOR_PANE_WIDTH,
   FULL_EDITOR_MIN,
+  MOBILE_EDITOR_MAX_WIDTH,
+  resolveWindowedEditorRect,
 } from '@/lib/lorebookEditorGeometry'
 import { getUiScale } from '@/lib/uiScale'
+import { launchLorebookEditorThen } from '@/lib/lorebookLauncher'
+import { setLorebookWorkspaceVisibility } from '@/lib/lorebookWorkspaceVisibility'
 import modalStyles from '@/components/modals/WorldBookEditorModal.module.css'
 
 export const PRODUCTIVITY_HOST_CONTRACT_VERSION = 1
+
+export const CONNECTIONS_PICKER_CONTRACT_SURFACES = [
+  'connections_picker.launcher',
+  'connections_picker.panel',
+] as const
 
 export const PRODUCTIVITY_HOST_SURFACES = [
   'productivity.settings.workspace',
@@ -224,17 +233,16 @@ function EnhancedLorebookWorkspaceSurface({
 }): ReactElement {
   const settings = useStore(store => store.lorebookEditorSettings)
   const setSetting = useStore(store => store.setSetting)
-  const [fullscreen, setFullscreen] = useState(false)
   const [viewport, setViewport] = useState(viewportRect)
+  const [fullscreen, setFullscreen] = useState(() => (
+    viewport.width <= MOBILE_EDITOR_MAX_WIDTH || settings.fullEditorLaunchMode === 'fullscreen'
+  ))
   const backdropPointerDownRef = useRef<EventTarget | null>(null)
   const close = useCallback(
     () => context.emit('command', workspaceCloseCommand(props, state, generation)),
     [context, generation, props, state],
   )
-  const [rect, setRect] = useState(() => centerEditorRect(
-    clampEditorRectToViewport(settings.fullRect, viewport),
-    viewport,
-  ))
+  const [rect, setRect] = useState(() => resolveWindowedEditorRect(settings.fullRect, viewport))
 
   useEffect(() => {
     const resize = () => setViewport(viewportRect())
@@ -244,10 +252,7 @@ function EnhancedLorebookWorkspaceSurface({
 
   useEffect(() => {
     if (fullscreen) return
-    setRect(centerEditorRect(
-      clampEditorRectToViewport(useStore.getState().lorebookEditorSettings.fullRect, viewport),
-      viewport,
-    ))
+    setRect(resolveWindowedEditorRect(useStore.getState().lorebookEditorSettings.fullRect, viewport))
   }, [fullscreen, viewport])
 
   useEffect(() => {
@@ -276,6 +281,7 @@ function EnhancedLorebookWorkspaceSurface({
   return (
     <div
       className={modalStyles.backdrop}
+      style={{ zIndex: 10006 }}
       onPointerDown={(event) => {
         backdropPointerDownRef.current = event.target === event.currentTarget ? event.currentTarget : null
       }}
@@ -289,6 +295,7 @@ function EnhancedLorebookWorkspaceSurface({
         onCommit={(fullRect) => {
           if (fullscreen) return
           setRect(fullRect)
+          if (viewport.width <= MOBILE_EDITOR_MAX_WIDTH) return
           setSetting('lorebookEditorSettings', {
             ...useStore.getState().lorebookEditorSettings,
             fullRect,
@@ -296,7 +303,7 @@ function EnhancedLorebookWorkspaceSurface({
         }}
         showHeader={false}
         resizable={!fullscreen}
-        aria-label="Enhanced World Book Editor"
+        aria-label="Full-Screen Lorebook Editor"
         className={`${modalStyles.modal} ${fullscreen ? modalStyles.fullscreen : ''}`}
       >
         <LorebookEditorWorkspace
@@ -305,7 +312,15 @@ function EnhancedLorebookWorkspaceSurface({
           initialEntryId={state.entryId}
           onClose={close}
           fullscreen={fullscreen}
-          onToggleFullscreen={() => setFullscreen(current => !current)}
+          onToggleFullscreen={() => setFullscreen((current) => {
+            if (current) {
+              setRect(resolveWindowedEditorRect(
+                useStore.getState().lorebookEditorSettings.fullRect,
+                viewport,
+              ))
+            }
+            return !current
+          })}
         />
       </ResizablePanelFrame>
     </div>
@@ -324,6 +339,12 @@ function LorebookWorkspaceSurface({
   const state = lorebookState(props)
   const generation = numberProp(props, 'generation', 0)
 
+  useEffect(() => {
+    const visibilitySurface = surfaceId === 'lorebook.half.workspace' ? 'half' : 'enhanced'
+    setLorebookWorkspaceVisibility(visibilitySurface, state.open)
+    return () => setLorebookWorkspaceVisibility(visibilitySurface, false)
+  }, [state.open, surfaceId])
+
   if (surfaceId === 'lorebook.enhanced.workspace') {
     if (!state.open) return null
     return <EnhancedLorebookWorkspaceSurface props={props} state={state} generation={generation} context={context} />
@@ -336,24 +357,11 @@ function LorebookWorkspaceSurface({
       forceHalfScreen
       onClose={() => context.emit('command', workspaceCloseCommand(props, state, generation))}
       onOpenFullEditor={(bookId, entryId) => {
-        context.emit('command', workspaceCloseCommand(props, state, generation))
-        const action = useStore.getState().inputBarActions.find(
-          candidate => candidate.contributionId === 'lumiverse_suite.lorebook.open_enhanced' && candidate.enabled,
+        if (!bookId) return
+        launchLorebookEditorThen(
+          { bookId, entryId, preferredTarget: 'full', source: 'half_editor' },
+          () => context.emit('command', workspaceCloseCommand(props, state, generation)),
         )
-        if (action) {
-          const payload = {
-            version: action.payloadVersion ?? 1,
-            bookId,
-            ...(entryId ? { entryId } : {}),
-            source: 'half_editor' as const,
-            invocationId: `lumiverse_suite.lorebook.open_enhanced:half:${Date.now()}`,
-          }
-          queueMicrotask(() => {
-            for (const handler of action.clickHandlers) {
-              try { handler(payload) } catch { /* extension callbacks are isolated */ }
-            }
-          })
-        }
       }}
     />
   )
@@ -415,6 +423,7 @@ function StandardProductivityHostSurface({
   stateRef.current = state
   const surfaceRootRef = useRef<HTMLElement | null>(null)
   const [connectionsAnchor, setConnectionsAnchor] = useState<HTMLElement | null>(null)
+  const quickToolbarSettings = useStore((store) => store.quickToolbarSettings)
 
   useLayoutEffect(() => {
     const root = surfaceRootRef.current?.closest<HTMLElement>(
@@ -422,14 +431,14 @@ function StandardProductivityHostSurface({
     )
     if (!root) return
     const dockRequest = surfaceId === 'quick_toolbar.workspace'
-      ? state?.variant === 'v2' ? 'strip' : 'floating'
+      ? effectiveQuickToolbarDockRequest('strip', quickToolbarSettings)
       : surfaceId === 'activated_lore.indicator' ? 'strip' : null
     if (!dockRequest) return
     root.setAttribute('data-dock-request', dockRequest)
     return () => {
       if (root.getAttribute('data-dock-request') === dockRequest) root.removeAttribute('data-dock-request')
     }
-  }, [surfaceId, state?.variant])
+  }, [quickToolbarSettings, surfaceId])
 
   useLayoutEffect(() => {
     if (surfaceId !== 'connections_picker.panel' || typeof document === 'undefined') return
@@ -455,21 +464,10 @@ function StandardProductivityHostSurface({
       content = <ProductivitySettings />
       break
     case 'quick_toolbar.workspace':
-      content = <QuickToolbar />
+      content = readQuickToolbarPlacement(quickToolbarSettings) === 'chat_top_dock' ? <></> : <QuickToolbar />
       break
     case 'connections_picker.launcher':
-      content = (
-        <button
-          type="button"
-          className={inputStyles.actionBtn}
-          data-lumiverse-connections-launcher="true"
-          onClick={() => emitCommand('open')}
-          title="Connections"
-          aria-label="Connections"
-        >
-          <Waypoints size={14} />
-        </button>
-      )
+      content = <></>
       break
     case 'connections_picker.panel':
       content = <ConnectionsPicker open={state?.open !== false} onClose={() => emitCommand('close')} anchorElement={connectionsAnchor} />

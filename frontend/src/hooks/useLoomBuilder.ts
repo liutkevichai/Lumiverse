@@ -11,7 +11,7 @@ import { bindImportedRegexesToPreset } from '@/lib/loom/preset-regex-import'
 import { flushPresetForGeneration, presetSaveCoordinator, StalePresetHydrationError } from '@/lib/loom/preset-save-coordinator'
 import { beginActiveLoomPresetSelection, transitionActiveLoomPreset } from '@/lib/loom/preset-selection-coordinator'
 import { getMacroCatalog } from '@/api/macros'
-import type { LoomPreset, PromptBlock, LoomConnectionProfile, MacroGroup, PromptVariableValues } from '@/lib/loom/types'
+import type { LoomPreset, PromptBlock, LoomConnectionProfile, MacroGroup, PromptVariableDef, PromptVariableValues } from '@/lib/loom/types'
 import {
   DEFAULT_SAMPLER_OVERRIDES,
   DEFAULT_PROMPT_BEHAVIOR,
@@ -27,14 +27,17 @@ import {
   getAvailableMacros,
   exportToSTPreset,
   sanitizeLumiHubSealedBlocksForExport,
+  createPortableLoomPresetExport,
   normalizeCategoryBlockState,
   toggleBlockWithCategoryRules,
+  toggleCategoryWithChildren,
   coerceImportedLoomPreset,
   detectImportedPresetKind,
   reconcilePromptVariableValues,
   pruneOrphanPromptVariables,
   validatePromptVariableSchema,
 } from '@/lib/loom/service'
+import { mergePromptVariableValues } from '@/hooks/preset-profile-prompt-variables'
 
 
 type LoomPrivateBlockFields = Pick<
@@ -97,7 +100,7 @@ export function useLoomBuilder() {
   const [runtimePresetProfile, setRuntimePresetProfile] = useState<{
     presetId: string
     blockStates: Record<string, boolean>
-    promptVariables: PromptVariableValues
+    promptVariables?: PromptVariableValues
   } | null>(null)
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -111,7 +114,10 @@ export function useLoomBuilder() {
           ? { ...block, enabled: runtimePresetProfile.blockStates[block.id] }
           : block
       )),
-      promptVariables: runtimePresetProfile.promptVariables,
+      promptVariables: mergePromptVariableValues(
+        activePreset.promptVariables,
+        runtimePresetProfile.promptVariables,
+      ),
     }
   }, [activePreset, runtimePresetProfile])
   const effectiveActivePresetRef = useRef<LoomPreset | null>(effectiveActivePreset)
@@ -120,13 +126,13 @@ export function useLoomBuilder() {
   const applyRuntimeBlockProfile = useCallback((
     presetId: string,
     blockStates: Record<string, boolean> | null,
-    promptVariables: PromptVariableValues = {},
+    promptVariables?: PromptVariableValues,
   ) => {
     setRuntimePresetProfile(blockStates
       ? {
           presetId,
           blockStates: { ...blockStates },
-          promptVariables: structuredClone(promptVariables),
+          ...(promptVariables ? { promptVariables: structuredClone(promptVariables) } : {}),
         }
       : null)
   }, [])
@@ -195,6 +201,7 @@ export function useLoomBuilder() {
           {
             name: p.name,
             blockCount: p.block_count,
+            coverUrl: p.cover_url ?? null,
             updatedAt: p.updated_at,
             isDefault: false,
           },
@@ -478,6 +485,36 @@ export function useLoomBuilder() {
     }
   }, [refreshRegistry])
 
+  const bulkDeletePresets = useCallback(async (presetIds: string[]) => {
+    const ids = [...new Set(presetIds)].filter(Boolean)
+    if (ids.length === 0) return []
+    await Promise.all(ids.map((id) => flushPresetForGeneration(id)))
+    const result = await presetsApi.bulkDelete(ids)
+    for (const id of result.deleted) presetSaveCoordinator.remove(id)
+    await refreshRegistry()
+    if (useStore.getState().activeLoomPresetId && result.deleted.includes(useStore.getState().activeLoomPresetId!)) {
+      activePresetRef.current = null
+      useStore.getState().setActiveLoomPreset(null)
+      setActivePreset(null)
+    }
+    try {
+      const res = await connectionsApi.list({ limit: 100 })
+      useStore.getState().setProfiles(res.data)
+    } catch {
+      // Non-fatal; the next profile refresh will pick up cleared references.
+    }
+    return result.deleted
+  }, [refreshRegistry])
+
+  const bulkExportPresets = useCallback(async (presetIds: string[]) => {
+    const ids = [...new Set(presetIds)].filter(Boolean)
+    if (ids.length === 0) return 0
+    await Promise.all(ids.map((id) => flushPresetForGeneration(id)))
+    const prepared = await presetsApi.prepareBulkExport(ids)
+    presetsApi.downloadPreparedExport(prepared.archiveUrl, prepared.filename)
+    return prepared.count
+  }, [])
+
   // Duplicate a preset
   const duplicatePreset = useCallback(async (presetId: string, newName: string) => {
     const selection = beginActiveLoomPresetSelection()
@@ -580,6 +617,86 @@ export function useLoomBuilder() {
     saveBlocks(blocks)
   }, [saveBlocks])
 
+  // Blanket category toggle: disable captures each child's enabled state on
+  // the category block; enable restores that exact snapshot.
+  const toggleCategoryChildren = useCallback((categoryId: string) => {
+    const current = effectiveActivePresetRef.current
+    if (!current) return
+    const blocks = toggleCategoryWithChildren(current.blocks, categoryId)
+    saveBlocks(blocks)
+  }, [saveBlocks])
+
+  /**
+   * Move a variable definition from one block to another, carrying its saved
+   * value bucket along. Def and value travel together in a single
+   * saveLoomValue so the backend's orphan pruning never sees the value
+   * stranded under the old block. A placement binding on the source block
+   * that pointed at the moved selector is dropped (the same cleanup
+   * cleanPlacementBinding performs on save). Returns false -- without
+   * saving -- when the move would create a duplicate name in the target.
+   */
+  const movePromptVariable = useCallback((
+    sourceBlockId: string,
+    variable: PromptVariableDef,
+    targetBlockId: string,
+  ): boolean => {
+    const current = effectiveActivePresetRef.current
+    if (!current || sourceBlockId === targetBlockId) return false
+    const sourceBlock = current.blocks.find((b) => b.id === sourceBlockId)
+    const targetBlock = current.blocks.find((b) => b.id === targetBlockId)
+    if (!sourceBlock || !targetBlock) return false
+
+    const name = variable.name?.trim()
+    if (!name) return false
+    if ((targetBlock.variables ?? []).some((v) => v.name?.trim() === name)) return false
+
+    const blocks = current.blocks.map((b) => {
+      if (b.id === sourceBlockId) {
+        const next: Partial<PromptBlock> = {
+          variables: (b.variables ?? []).filter((v) => v.id !== variable.id),
+        }
+        if (b.placementBinding?.variableId === variable.id) next.placementBinding = undefined
+        return { ...b, ...next }
+      }
+      if (b.id === targetBlockId) {
+        return { ...b, variables: [...(b.variables ?? []), variable] }
+      }
+      return b
+    })
+
+    const values = current.promptVariables ?? {}
+    const sourceBucket = values[sourceBlockId]
+    const savedName = (sourceBlock.variables ?? []).find((v) => v.id === variable.id)?.name?.trim()
+    let nextValues = values
+    if (sourceBucket) {
+      const valueKey = savedName && savedName in sourceBucket
+        ? savedName
+        : name in sourceBucket
+          ? name
+          : null
+      if (valueKey !== null) {
+        const nextSource = { ...sourceBucket }
+        const moved = nextSource[valueKey]
+        delete nextSource[valueKey]
+        nextValues = {
+          ...values,
+          [sourceBlockId]: nextSource,
+          [targetBlockId]: { ...(values[targetBlockId] ?? {}), [name]: moved },
+        }
+      }
+    }
+
+    let normalizedBlocks: PromptBlock[]
+    try {
+      normalizedBlocks = normalizeCategoryBlockState(blocks)
+      validatePromptVariableSchema(normalizedBlocks, { legacyBaseline: current.blocks })
+    } catch {
+      return false
+    }
+    void saveLoomValue(normalizedBlocks, nextValues).catch(() => {})
+    return true
+  }, [saveLoomValue])
+
   const reorderBlocks = useCallback((fromIndex: number, toIndex: number) => {
     const current = effectiveActivePresetRef.current
     if (!current) return
@@ -651,6 +768,8 @@ export function useLoomBuilder() {
     try {
       const fallbackName = fileName?.replace(/\.json$/i, '') || 'Imported Preset'
       const loom = coerceImportedLoomPreset(payload, fallbackName)
+      // marshalPreset deliberately omits loom.id. The create endpoint assigns
+      // a fresh local identity even when an older export still contains one.
       const created = await presetsApi.create(marshalPreset(loom))
       const newLoom = presetSaveCoordinator.hydrate(unmarshalPreset(created))
       await refreshRegistry()
@@ -715,10 +834,13 @@ export function useLoomBuilder() {
   }, [persistImportedPreset])
 
   // Export internal JSON
-  const exportInternal = useCallback(async () => {
-    if (!activePreset) return null
-    const exportPreset = sanitizeLumiHubSealedBlocksForExport(activePreset)
-    const regexExport = await regexApi.exportScripts(undefined, { preset_id: activePreset.id })
+  const exportInternal = useCallback(async (presetId?: string) => {
+    const targetId = presetId ?? activePreset?.id
+    if (!targetId) return null
+    await flushPresetForGeneration(targetId)
+    const source = unmarshalPreset(await presetsApi.get(targetId))
+    const exportPreset = createPortableLoomPresetExport(source)
+    const regexExport = await regexApi.exportScripts(undefined, { preset_id: targetId })
     if (regexExport.scripts.length === 0) return exportPreset
     return {
       ...exportPreset,
@@ -727,7 +849,7 @@ export function useLoomBuilder() {
         regex_scripts: regexExport.scripts,
       },
     }
-  }, [activePreset])
+  }, [activePreset?.id])
 
   // Export as legacy (SillyTavern) JSON
   const exportLegacy = useCallback(() => {
@@ -813,6 +935,8 @@ export function useLoomBuilder() {
     saveBlocks,
     saveLoomValue,
     deletePreset,
+    bulkDeletePresets,
+    bulkExportPresets,
     duplicatePreset,
     renamePreset,
     refreshRegistry,
@@ -822,7 +946,9 @@ export function useLoomBuilder() {
     removeBlock,
     updateBlock,
     toggleBlock,
+    toggleCategoryChildren,
     reorderBlocks,
+    movePromptVariable,
 
     // Sampler settings
     saveSamplerOverrides,

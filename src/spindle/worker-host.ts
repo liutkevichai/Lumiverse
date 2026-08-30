@@ -47,6 +47,7 @@ import {
   type WorldInfoInterceptorCtxDTO,
   type WorldInfoInterceptorResultDTO,
 } from "./world-info-interceptor";
+import { projectWorldInfoCaptureContext } from "./world-info-capture";
 import { toolRegistry } from "./tool-registry";
 import {
   setPromptRegexOwnedChats,
@@ -75,6 +76,14 @@ import { WorkerHostInteractionApi } from "./worker-host-interaction-api";
 import { WorkerHostPresentationApi } from "./worker-host-presentation-api";
 import { createRuntimeTransport, type RuntimeTransport } from "./runtime-transport";
 import {
+  providerRegistry,
+  PROVIDER_BROKER_KINDS,
+  type ProviderHostToWorker,
+  type ProviderWorkerToHost,
+} from "./provider-registry";
+import { getSecret } from "../services/secrets.service";
+import { getApprovedBrokerOrigins } from "../services/broker-origins.service";
+import {
   readSharedRpcEndpoint,
   registerSharedRpcRequestEndpoint,
   syncSharedRpcEndpoint,
@@ -83,6 +92,12 @@ import {
   type SharedRpcEndpointPolicy,
 } from "./shared-rpc-pool.service";
 import { getTextContent, type LlmMessage } from "../llm/types";
+import {
+  clearFrontendRuntimeCapabilities,
+  isFrontendRuntimeCapability,
+  registerFrontendRuntimeCapability,
+  unregisterFrontendRuntimeCapability,
+} from "./frontend-runtime-capabilities";
 import type { CreatePresetInput, PromptBlock, UpdatePresetInput } from "../types/preset";
 import { getDb } from "../db/connection";
 import {
@@ -276,6 +291,8 @@ type BackendProcessRuntimeToHost =
 
 type RuntimeWorkerToHost =
   | WorkerToHost
+  | { type: "register_frontend_runtime_capability"; capability: string }
+  | { type: "unregister_frontend_runtime_capability"; capability: string }
   | { type: "dlc_get_catalog"; requestId: string; userId?: string }
   | {
       type: "assemble_prompt";
@@ -429,6 +446,7 @@ type RuntimeWorkerToHost =
       userId?: string;
     }
   | { type: "uploads_get"; requestId: string; uploadId: string; userId?: string }
+  | { type: "uploads_read_chunk"; requestId: string; uploadId: string; offset: number; userId?: string }
   | { type: "uploads_delete"; requestId: string; uploadId: string; userId?: string }
   | { type: "images_upload"; requestId: string; input: ImageUploadDTO; userId?: string }
   | {
@@ -445,6 +463,7 @@ type RuntimeWorkerToHost =
       originalFilename?: string;
       owner_character_id?: string;
       owner_chat_id?: string;
+      skip_thumbnail_processing?: boolean;
       userId?: string;
     }
   | { type: "images_delete"; requestId: string; imageId: string; userId?: string }
@@ -555,7 +574,8 @@ type RuntimeWorkerToHost =
       userId?: string;
     }
   | { type: "image_gen_generate_stream"; requestId: string; input: Record<string, unknown> }
-  | { type: "image_gen_cancel_stream"; requestId: string };
+  | { type: "image_gen_cancel_stream"; requestId: string }
+  | ProviderWorkerToHost;
 
 type RuntimeHostToWorker =
   | HostToWorker
@@ -601,7 +621,8 @@ type RuntimeHostToWorker =
         | { type: "preview"; imageDataUrl: string; step?: number; totalSteps?: number; nodeId?: string }
         | { type: "done"; result: Record<string, unknown> };
     }
-  | { type: "image_gen_stream_error"; requestId: string; error: string };
+  | { type: "image_gen_stream_error"; requestId: string; error: string }
+  | ProviderHostToWorker;
 
 let cachedBackendVersion: string | null = null;
 let cachedFrontendVersion: string | null = null;
@@ -777,7 +798,14 @@ const THINKING_DISPLAY_VALUES = new Set<ThinkingDisplayDTO>([
   "omitted",
 ]);
 
-function coerceReasoningSettings(raw: unknown): ReasoningSettingsDTO | null {
+type ReasoningSettingsWithProviderOptions = ReasoningSettingsDTO & {
+  /** Z.AI's `thinking.clear_thinking` option, retained in bound profiles. */
+  clearThinking?: boolean;
+  /** Google Gemini / Vertex optional non-tool signature replay setting. */
+  replayThoughtSignatures?: boolean;
+};
+
+function coerceReasoningSettings(raw: unknown): ReasoningSettingsWithProviderOptions | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const r = raw as Record<string, unknown>;
   const effort = REASONING_EFFORT_VALUES.has(r.reasoningEffort as ReasoningEffortDTO)
@@ -794,6 +822,10 @@ function coerceReasoningSettings(raw: unknown): ReasoningSettingsDTO | null {
     suffix: typeof r.suffix === "string" ? r.suffix : "",
     autoParse: r.autoParse !== false,
     keepInHistory: typeof r.keepInHistory === "number" ? r.keepInHistory : 0,
+    ...(typeof r.clearThinking === "boolean" ? { clearThinking: r.clearThinking } : {}),
+    ...(typeof r.replayThoughtSignatures === "boolean"
+      ? { replayThoughtSignatures: r.replayThoughtSignatures }
+      : {}),
   };
 }
 
@@ -944,6 +976,10 @@ export class WorkerHost {
       resolveEffectiveUserId: (userId) => this.resolveEffectiveUserId(userId),
       enforceScopedUser: (userId) => this.enforceScopedUser(userId),
       post: (message) => this.postToWorker(message),
+    });
+    providerRegistry.configure({ getSecret, approvedBrokerOrigins: getApprovedBrokerOrigins() });
+    providerRegistry.attachWorker(this.extensionId, (message) => {
+      this.postToWorker(message);
     });
   }
 
@@ -1155,7 +1191,10 @@ export class WorkerHost {
       host: {
         descriptorVersion: 1,
         lumiverseVersion: await getBackendVersion(),
-        capabilities: SPINDLE_HOST_CAPABILITIES,
+        capabilities: Object.freeze({
+          ...SPINDLE_HOST_CAPABILITIES,
+          "frontend-runtime-capabilities-v1": 1,
+        }),
         extensionInstallationId: this.extensionId,
       },
     });
@@ -1280,16 +1319,17 @@ export class WorkerHost {
     this.worldInfoInterceptorUnregister?.();
     this.worldInfoInterceptorUnregister = null;
 
+    clearFrontendRuntimeCapabilities(this.extensionId);
+
     // Unregister all tools for this extension
     toolRegistry.unregisterByExtension(this.extensionId);
 
     // Drop any prompt-regex ownership claims so the host resumes its own pass
     clearPromptRegexOwner(this.extensionId);
 
-    // Unregister all macros registered by this extension
-    for (const macroName of this.registeredMacroNames) {
-      macroRegistry.unregisterMacro(macroName);
-    }
+    // Ownership-aware cleanup cannot remove a system macro or another
+    // extension's registration even if names have collided over time.
+    macroRegistry.unregisterByExtension(this.extensionId);
     this.registeredMacroNames.clear();
     this.macroValueCache.clear();
     this.interactionApi.clear();
@@ -1305,6 +1345,7 @@ export class WorkerHost {
     macroInterceptorChain.unregisterByExtension(this.extensionId);
     worldInfoInterceptorChain.unregisterByExtension(this.extensionId);
     unregisterSharedRpcEndpointsByOwner(this.manifest.identifier);
+    providerRegistry.detachWorker(this.extensionId);
 
     // Reject pending requests
     for (const [, pending] of this.pendingRequests) {
@@ -1605,6 +1646,16 @@ export class WorkerHost {
         break;
       case "unsubscribe_event":
         this.handleUnsubscribeEvent(msg.event);
+        break;
+      case "register_frontend_runtime_capability":
+        if (isFrontendRuntimeCapability(msg.capability)) {
+          registerFrontendRuntimeCapability(this.extensionId, msg.capability);
+        }
+        break;
+      case "unregister_frontend_runtime_capability":
+        if (isFrontendRuntimeCapability(msg.capability)) {
+          unregisterFrontendRuntimeCapability(this.extensionId, msg.capability);
+        }
         break;
       case "register_macro":
         this.handleRegisterMacro(msg.definition);
@@ -2160,6 +2211,7 @@ export class WorkerHost {
           msg.originalFilename,
           msg.owner_character_id,
           msg.owner_chat_id,
+          "skip_thumbnail_processing" in msg ? msg.skip_thumbnail_processing : undefined,
           msg.userId,
         );
         break;
@@ -2299,6 +2351,9 @@ export class WorkerHost {
       case "uploads_get":
         this.handleUploadsGet(msg.requestId, msg.uploadId, msg.userId);
         break;
+      case "uploads_read_chunk":
+        this.handleUploadsReadChunk(msg.requestId, msg.uploadId, msg.offset, msg.userId);
+        break;
       case "uploads_delete":
         this.handleUploadsDelete(msg.requestId, msg.uploadId, msg.userId);
         break;
@@ -2427,6 +2482,19 @@ export class WorkerHost {
       case "theme_generate_variables":
         this.presentationApi.handleThemeGenerateVariables(msg.requestId, msg.config);
         break;
+      case "provider_register":
+        this.handleProviderRegister(msg);
+        break;
+      case "provider_unregister":
+        this.handleProviderUnregister(msg);
+        break;
+      case "provider_result":
+        providerRegistry.handleProviderResult(msg, {
+          installationId: this.extensionId,
+          installScope: this.installScope,
+          installedByUserId: this.installedByUserId,
+        });
+        break;
       default:
         // Fail fast for unrecognized message types so the worker's
         // await request(...) doesn't hang indefinitely.
@@ -2518,18 +2586,8 @@ export class WorkerHost {
     const macroName = String(definition.name || "").trim();
     if (!macroName) return;
 
-    // Check if this would overwrite a built-in macro before registering
-    const existing = macroRegistry.getMacro(macroName);
-    if (existing?.builtIn) {
-      console.warn(
-        `[Spindle:${this.manifest.identifier}] Cannot override built-in macro: ${macroName}`
-      );
-      return;
-    }
-
-    this.registeredMacroNames.add(macroName);
-
-    macroRegistry.registerMacro({
+    const macroOrigin = { kind: "extension" as const, extensionId: this.extensionId };
+    const registered = macroRegistry.registerMacro({
       name: macroName,
       category: definition.category || `extension:${this.manifest.identifier}`,
       description: definition.description || "",
@@ -2649,13 +2707,22 @@ export class WorkerHost {
           }
         });
       },
-    });
+    }, macroOrigin);
+
+    if (!registered) {
+      console.warn(
+        `[Spindle:${this.manifest.identifier}] Cannot override macro owned by the system or another extension: ${macroName}`
+      );
+      return;
+    }
+
+    this.registeredMacroNames.add(macroName);
   }
 
   private handleUnregisterMacro(name: string): void {
     const macroName = String(name || "").trim();
     if (!macroName) return;
-    macroRegistry.unregisterMacro(macroName);
+    macroRegistry.unregisterMacro(macroName, { kind: "extension", extensionId: this.extensionId });
     this.registeredMacroNames.delete(macroName);
     this.macroValueCache.delete(macroName);
   }
@@ -2728,7 +2795,11 @@ export class WorkerHost {
           };
         });
 
-        const interceptorContext = context as Omit<InterceptorContextDTO, "signal">;
+        const interceptorContext =
+          projectWorldInfoCaptureContext(
+            context,
+            this.extensionId,
+          ) as unknown as Omit<InterceptorContextDTO, "signal">;
         this.activeInterceptorContexts.set(registrationId, interceptorContext);
         this.postToWorker({
           type: "intercept_request",
@@ -2823,6 +2894,85 @@ export class WorkerHost {
       extension_id: this.extensionId,
     };
     toolRegistry.register(tool);
+  }
+
+  private providerHostContext() {
+    return {
+      installationId: this.extensionId,
+      installScope: this.installScope,
+      installedByUserId: this.installedByUserId,
+      authenticatedSubject: this.installedByUserId,
+    };
+  }
+
+  private isValidProviderKind(kind: string): boolean {
+    return (PROVIDER_BROKER_KINDS as readonly string[]).includes(kind);
+  }
+
+  /** Invalid/missing kinds must not build a malformed `providers..register` permission string. */
+  private denyInvalidProviderKind(kind: unknown, operation: "provider_register" | "provider_unregister"): void {
+    console.warn(
+      `[Spindle:${this.manifest.identifier}] invalid provider kind ${JSON.stringify(kind ?? null)} for ${operation}`,
+    );
+    this.postToWorker({
+      type: "permission_denied",
+      permission: "providers.register",
+      operation,
+    });
+  }
+
+  private handleProviderRegister(msg: Extract<RuntimeWorkerToHost, { type: "provider_register" }>): void {
+    const providerKind = msg.kind;
+    if (!this.isValidProviderKind(providerKind)) {
+      this.denyInvalidProviderKind(providerKind, "provider_register");
+      return;
+    }
+    const permission = `providers.${providerKind}.register` as ManagedSpindlePermission;
+    if (!this.hasPermission(permission)) {
+      console.warn(
+        `[Spindle:${this.manifest.identifier}] ${PERMISSION_DENIED_PREFIX} ${permission} - Provider registration permission not granted`,
+      );
+      this.postToWorker({
+        type: "permission_denied",
+        permission,
+        operation: "provider_register",
+      });
+      return;
+    }
+    try {
+      providerRegistry.handleWorkerMessage(msg, this.providerHostContext());
+    } catch (err: any) {
+      console.warn(
+        `[Spindle:${this.manifest.identifier}] provider_register failed: ${err?.message || err}`,
+      );
+    }
+  }
+
+  private handleProviderUnregister(msg: Extract<RuntimeWorkerToHost, { type: "provider_unregister" }>): void {
+    const providerKind = msg.kind;
+    if (!this.isValidProviderKind(providerKind)) {
+      this.denyInvalidProviderKind(providerKind, "provider_unregister");
+      return;
+    }
+    const permission = `providers.${providerKind}.register` as ManagedSpindlePermission;
+    if (!this.hasPermission(permission)) {
+      console.warn(
+        `[Spindle:${this.manifest.identifier}] ${PERMISSION_DENIED_PREFIX} ${permission} - Provider registration permission not granted`,
+      );
+      this.postToWorker({
+        type: "permission_denied",
+        permission,
+        operation: "provider_unregister",
+      });
+      return;
+    }
+    try {
+      providerRegistry.handleWorkerMessage(msg, this.providerHostContext());
+    } catch (err: any) {
+      console.warn(
+        `[Spindle:${this.manifest.identifier}] provider_unregister failed: ${err?.message || err}`,
+      );
+    }
   }
 
   // ─── Generation ──────────────────────────────────────────────────────
@@ -4466,6 +4616,33 @@ export class WorkerHost {
       }
       const data = await spindleUploads.readUploadBytes(uploadId);
       this.postToWorker({ type: "response", requestId, result: { fileName: rec.fileName, size: data.byteLength, data } });
+    } catch (err: any) {
+      this.postToWorker({ type: "response", requestId, error: err.message });
+    }
+  }
+
+  private async handleUploadsReadChunk(requestId: string, uploadId: string, offset: number, userId?: string): Promise<void> {
+    try {
+      const resolvedUserId = this.resolveEffectiveUserId(userId);
+      if (!resolvedUserId) throw new Error("userId is required for operator-scoped extensions");
+      this.enforceScopedUser(resolvedUserId);
+      const rec = spindleUploads.getUpload(uploadId);
+      if (!rec || rec.ownerUserId !== resolvedUserId || rec.extensionIdentifier !== this.manifest.identifier) {
+        this.postToWorker({ type: "response", requestId, result: null });
+        return;
+      }
+      const data = await spindleUploads.readUploadChunk(uploadId, offset);
+      this.postToWorker({
+        type: "response",
+        requestId,
+        result: {
+          fileName: rec.fileName,
+          size: rec.declaredSize,
+          offset,
+          data,
+          eof: offset + data.byteLength >= rec.declaredSize,
+        },
+      });
     } catch (err: any) {
       this.postToWorker({ type: "response", requestId, error: err.message });
     }

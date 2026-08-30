@@ -89,6 +89,9 @@ function normalizeDisplayScripts(value: unknown, userId: string): RegexScript[] 
       pack_id: typeof raw.pack_id === "string" ? raw.pack_id : null,
       preset_id: typeof raw.preset_id === "string" ? raw.preset_id : null,
       character_id: typeof raw.character_id === "string" ? raw.character_id : null,
+      // Request-supplied display scripts are transient and never acquire
+      // persisted extension ownership.
+      owner_extension_identifier: null,
       metadata: isStringRecord(raw.metadata) ? raw.metadata : {},
       created_at: typeof raw.created_at === "number" ? raw.created_at : 0,
       updated_at: typeof raw.updated_at === "number" ? raw.updated_at : 0,
@@ -201,6 +204,7 @@ app.post("/apply", async (c) => {
     result: applied.result,
     touched_vars: Array.from(applied.touchedVars),
     cacheable: applied.cacheable,
+    timed_out_script_ids: Array.from(applied.timedOutScriptIds),
   });
 });
 
@@ -319,6 +323,34 @@ app.post("/:id/report-performance", async (c) => {
   });
   if (!result.script) return c.json({ error: "Not found" }, 404);
   return c.json(result.script);
+});
+
+// POST /:id/report-evidence — persist client-side execution evidence
+// (metadata.regex_evidence.quarantined) used by the display-regex tier rules.
+// Quarantine is the only field accepted: it is the only evidence that changes
+// which tier a script runs in. Successful-timing evidence was removed rather
+// than kept, because nothing read it and it could not promote a script.
+// `quarantined: false` is a valid body and clears the flag, which is how the
+// panel lets a user un-quarantine a script.
+export type RegexEvidenceReportBody = {
+  quarantined?: boolean;
+};
+
+function parseEvidenceBody(body: any): RegexEvidenceReportBody | null {
+  if (body?.quarantined === undefined) return null;
+  return { quarantined: !!body.quarantined };
+}
+
+app.post("/:id/report-evidence", async (c) => {
+  const userId = c.get("userId");
+  const body = await c.req.json().catch(() => ({}));
+  const patch = parseEvidenceBody(body);
+  if (!patch) return c.json({ error: "evidence patch requires a quarantined field" }, 400);
+  const script = svc.reportRegexScriptEvidence(userId, c.req.param("id"), {
+    quarantined: patch.quarantined,
+  });
+  if (!script) return c.json({ error: "Not found" }, 404);
+  return c.json(script);
 });
 
 // PUT /:id/toggle — quick enable/disable

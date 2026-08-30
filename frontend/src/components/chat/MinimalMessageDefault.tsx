@@ -64,6 +64,8 @@ export interface MinimalMessageDefaultProps {
   isContextAnchor: boolean
   handleEdit: () => void
   handleSaveEdit: () => void
+  handleEditAndSend: () => void
+  editAndSendPending: boolean
   handleCancelEdit: () => void
   handleDelete: () => void
   handleToggleHidden: () => void
@@ -180,8 +182,8 @@ export default function MinimalMessageDefault({
   isEditing, editContent, setEditContent, editReasoning, setEditReasoning, showReasoningEditor,
   isUser, isActivelyStreaming, displayContent, reasoning, reasoningDuration, reasoningStartedAt,
   tokenCount, generationMetrics, avatarUrl, fullAvatarUrl, displayAvatarUrl, displayName, macroUserName, isHidden, isContextAnchor,
-  handleEdit, handleSaveEdit, handleCancelEdit, handleDelete, handleToggleHidden, handleToggleContextAnchor,
-  handleFork, handlePromptBreakdown,
+  handleEdit, handleSaveEdit, handleEditAndSend, handleCancelEdit, handleDelete, handleToggleHidden, handleToggleContextAnchor,
+  handleFork, handlePromptBreakdown, editAndSendPending,
 }: MinimalMessageDefaultProps) {
   const { t } = useTranslation('chat')
   const { t: tc } = useTranslation('common')
@@ -251,10 +253,30 @@ export default function MinimalMessageDefault({
     },
   })
 
+  const isRegexActionEvent = useCallback((e: React.SyntheticEvent) => {
+    const path = typeof e.nativeEvent.composedPath === 'function'
+      ? e.nativeEvent.composedPath()
+      : [e.target]
+
+    return path.some((node) => (
+      node instanceof Element
+      && node.hasAttribute('data-lumiverse-regex-action')
+    ))
+  }, [])
+
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
     if (!canOpenContextMenu) return
+    if (isRegexActionEvent(e)) {
+      e.preventDefault()
+      return
+    }
     longPress.onContextMenu(e)
-  }, [canOpenContextMenu, longPress])
+  }, [canOpenContextMenu, isRegexActionEvent, longPress])
+
+  const handleTouchStart = useCallback((e: React.TouchEvent) => {
+    if (!canOpenContextMenu || isRegexActionEvent(e)) return
+    longPress.onTouchStart(e)
+  }, [canOpenContextMenu, isRegexActionEvent, longPress])
 
   const contextMenuItems: ContextMenuEntry[] = useMemo(() => [
     {
@@ -344,7 +366,7 @@ export default function MinimalMessageDefault({
       data-message-id={message.id}
       onClick={isSelectMode ? onToggleSelect : undefined}
       onContextMenu={handleContextMenu}
-      onTouchStart={canOpenContextMenu ? longPress.onTouchStart : undefined}
+      onTouchStart={canOpenContextMenu ? handleTouchStart : undefined}
       onTouchMove={canOpenContextMenu ? longPress.onTouchMove : undefined}
       onTouchEnd={canOpenContextMenu ? longPress.onTouchEnd : undefined}
     >
@@ -385,6 +407,7 @@ export default function MinimalMessageDefault({
             generationMetrics={generationMetrics}
             showTokenCount={showMessageTokenCount}
           />
+          <span data-spindle-mount="message_header" data-spindle-scope={`message:${message.id}:minimal:header`} style={{ display: 'contents' }} />
         </div>
 
         {/* Reasoning block — hidden during editing since the edit area shows it inline */}
@@ -403,12 +426,16 @@ export default function MinimalMessageDefault({
         )}
 
         {/* Content */}
+        <span data-spindle-mount="message_body_before" data-spindle-scope={`message:${message.id}:minimal:body-before`} style={{ display: 'contents' }} />
         {isEditing ? (
           <MessageEditArea
             editContent={editContent}
             onChangeContent={setEditContent}
             onSave={handleSaveEdit}
             onCancel={handleCancelEdit}
+            onEditAndSend={isUser ? handleEditAndSend : undefined}
+            messageId={message.id}
+            editAndSendDisabled={editAndSendPending}
             editReasoning={showReasoningEditor ? editReasoning : undefined}
             onChangeReasoning={showReasoningEditor ? setEditReasoning : undefined}
           />
@@ -426,6 +453,7 @@ export default function MinimalMessageDefault({
         ) : isActivelyStreaming ? (
           <StreamingIndicator />
         ) : null}
+        <span data-spindle-mount="message_body_after" data-spindle-scope={`message:${message.id}:minimal:body-after`} style={{ display: 'contents' }} />
 
         {/* User attachments render after content */}
         {isUser && message.extra?.attachments && message.extra.attachments.length > 0 && !isEditing && (
@@ -450,11 +478,13 @@ export default function MinimalMessageDefault({
         {!isUser && !isEditing && message.index_in_chat !== 0 && (
           <SwipeControls message={message} chatId={chatId} />
         )}
+        <span data-spindle-mount="message_swipe_indicators" data-spindle-scope={`message:${message.id}:minimal:swipe-indicators`} style={{ display: 'contents' }} />
 
         {/* Greeting navigator for first message */}
         {message.index_in_chat === 0 && !isUser && !isEditing && (
           <GreetingNav message={message} chatId={chatId} />
         )}
+        <span data-spindle-mount="message_footer" data-spindle-scope={`message:${message.id}:minimal:footer`} style={{ display: 'contents' }} />
       </div>
 
       {/* Actions (hidden in select mode) */}

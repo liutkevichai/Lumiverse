@@ -340,6 +340,8 @@
     "copyCode": "Copia codice",
     "copy": "Copia",
     "copied": "Copiato!",
+    "readMore": "Leggi di più",
+    "showLess": "Mostra meno",
     "youtubeVideo": "Video YouTube"
   },
   "messageMeta": {
@@ -364,7 +366,11 @@
     "next": "Scorri successivo"
   },
   "portrait": {
-    "setChatBackground": "Imposta come sfondo chat"
+    "setChatBackground": "Imposta come sfondo chat",
+    "copyImageReference": "Copia riferimento immagine",
+    "imageReferenceCopied": "Riferimento immagine copiato",
+    "imageReferenceCopyFailed": "Impossibile copiare il riferimento immagine",
+    "galleryImage": "Immagine della galleria"
   },
   "attachments": {
     "removeImage": "Rimuovi immagine",

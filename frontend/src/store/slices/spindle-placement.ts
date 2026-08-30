@@ -4,7 +4,11 @@ import type {
   SpindlePlacementSlice,
   SurfaceRectPrefs,
 } from '@/types/store'
-import type { SpindleDockEdge, SpindleTabLocation as TabLocation } from 'lumiverse-spindle-types'
+import type {
+  SpindleDockEdge,
+  SpindleGuideDefinition,
+  SpindleTabLocation as TabLocation,
+} from 'lumiverse-spindle-types'
 
 // ── Capacity limits ──
 
@@ -27,14 +31,22 @@ export interface DrawerTabState {
   id: string
   extensionId: string
   title: string
+
   /** Short label for below the sidebar icon (max ~8 chars). Falls back to title. */
   shortName?: string
+
   /** Description shown in command palette. Falls back to "Open {title} extension tab". */
   description?: string
+
   /** Keywords for command palette search. Extension name added automatically. */
   keywords?: string[]
+
   /** Title for the panel header navbar. Falls back to title. */
   headerTitle?: string
+
+  /** Contextual documentation supplied by the owning extension. */
+  guide?: SpindleGuideDefinition
+
   iconUrl?: string
   iconSvg?: string
   badge: string | null
@@ -60,6 +72,7 @@ export interface SettingsTabState {
   iconSvg?: string
   keywords: string[]
   sections: SettingsTabSectionState[]
+  position?: string
   order: number
   sequence: number
   root: HTMLElement
@@ -69,6 +82,7 @@ export interface CharacterEditorTabState {
   id: string
   extensionId: string
   title: string
+  guide?: SpindleGuideDefinition
   root: HTMLElement
 }
 
@@ -85,6 +99,7 @@ export interface PresetEditorTabState {
   id: string
   extensionId: string
   title: string
+  guide?: SpindleGuideDefinition
   root: HTMLElement
 }
 
@@ -143,6 +158,8 @@ export interface DockPanelState {
   iconUrl?: string
   /** Keep the requested edge instead of applying the user's dock preference. */
   respectRequestedEdge: boolean
+  /** Show the panel title while collapsed. */
+  showCollapsedTitle: boolean
   /** Extension-local persistence segment, or false to disable persistence. */
   persistGeometry?: string | false
 }

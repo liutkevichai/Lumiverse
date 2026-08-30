@@ -12,11 +12,14 @@ import type {
 import { SPINDLE_HOST_CAPABILITIES } from 'lumiverse-spindle-types'
 import type { MacroCatalogResponse } from '@/api/macros'
 import type {
+  Chat,
   ChatSummary,
   ConnectionModelsResult,
   ConnectionProfile,
+  GroupedRecentChat,
   Message,
   PaginatedResult,
+  RecentChat,
   UpdateConnectionProfileInput,
   WorldBook,
   WorldBookEntry,
@@ -115,6 +118,11 @@ import {
   type FrontendDockPanelOptions,
   type FrontendFloatWidgetOptions,
 } from './frontend-context'
+import {
+  THEME_AUTHORING_HOST_CAPABILITIES,
+  type SpindleThemeAuthoringAPI,
+} from './theme-authoring'
+import { createNativeThemeAuthoringAPI } from './theme-authoring-native'
 import { legacyCtxPermission } from './legacy-ctx-members'
 import type { SpindleSettingsTabHandle, SpindleSettingsTabOptions } from './settings-tab-bridge'
 
@@ -142,6 +150,18 @@ import {
   registerCssComponent,
   type SpindleCssComponentRegistrationOptions,
 } from './css-component-registry'
+import {
+  clearComponentOverridesForOwner,
+  registerComponentOverride as registerSpindleComponentOverride,
+  type SpindleComponentOverrideHandle,
+  type SpindleComponentOverrideRegistrationInput,
+} from './component-override-registry'
+import {
+  DATA_SPINDLE_MOUNT_ATTR,
+  DATA_SPINDLE_SCOPE_ATTR,
+  getDomDecoratorService,
+  type DecoratorOptions,
+} from './dom-decorator-service'
 import { registerHostIntentHandler, type HostIntentHandler, type JsonValue } from './host-intent-registry'
 
 declare const __APP_VERSION__: string
@@ -274,6 +294,8 @@ type FrontendExtensionUI = Omit<SpindleFrontendContext['ui'], 'createFloatWidget
   createFloatWidget(options?: FrontendFloatWidgetOptions): SpindleFloatWidgetHandle
   requestDockPanel(options: FrontendDockPanelOptions): SpindleDockPanelHandle
   registerCssComponent(options: SpindleCssComponentRegistrationOptions): () => void
+  registerComponentOverride(options: Omit<SpindleComponentOverrideRegistrationInput, 'owner' | 'generation'>): SpindleComponentOverrideHandle
+  registerDomDecorator(options: Omit<DecoratorOptions, 'owner' | 'generation'>): () => void
   registerHostIntentHandler<T extends JsonValue = JsonValue>(name: string, handler: (detail: T) => boolean): () => void
 }
 
@@ -291,6 +313,7 @@ type FrontendExtensionHost = {
 
 type FrontendExtensionContextBase = Omit<SpindleFrontendContext, 'ui' | 'messages' | 'dom'> & {
   host: FrontendExtensionHost
+  theme: SpindleThemeAuthoringAPI
   dom: FrontendExtensionDOM
   ready(): void
   deferReady(): void
@@ -629,6 +652,11 @@ async function doLoadFrontendExtension(
     throw new Error(`PERMISSION_DENIED:${permission} - ${member} requires the ${permission} permission`)
   }
   const bundleUrl = getFrontendBundleUrl(extensionId, manifest)
+  const decoratorService = getDomDecoratorService({ extensionId, generation })
+  const unloadDomDecorators = () => {
+    decoratorService.unloadGeneration(extensionId, generation)
+    decoratorService.flush()
+  }
   const eventUnsubs: (() => void)[] = []
   const trackEventUnsubscribe = (unsubscribe: () => void): (() => void) => {
     let active = true
@@ -767,7 +795,10 @@ async function doLoadFrontendExtension(
   }
   const destroyRevokedResources = (previous: readonly string[], next: readonly string[]) => {
     const revokedPermissions = previous.filter((permission) => !next.includes(permission))
-    if (revokedPermissions.length > 0) clearCssComponentsForExtension(extensionId, generation)
+    if (revokedPermissions.length > 0) {
+      clearCssComponentsForExtension(extensionId, generation)
+      clearComponentOverridesForOwner(extensionId, generation)
+    }
     stateSelectors?.revokePermissions(revokedPermissions)
     if (previous.includes('world_books') && !next.includes('world_books')) {
       destroyComponentsForExtensionPermission(extensionId, 'world_books', generation)
@@ -809,6 +840,8 @@ async function doLoadFrontendExtension(
       }
     }
     clearCssComponentsForExtension(extensionId, generation)
+    clearComponentOverridesForOwner(extensionId, generation)
+    unloadDomDecorators()
     try {
       clearPresetEditorSubscriptions()
       clearCharacterEditorSubscriptions()
@@ -1156,6 +1189,14 @@ async function doLoadFrontendExtension(
     const runtimeChatsApi = {
       listCharacterChats: chatsApiModule.chatsApi?.listCharacterChats
         ?? (async (_characterId: string): Promise<ChatSummary[]> => []),
+      listRecent: chatsApiModule.chatsApi?.listRecent
+        ?? (async (_options?: { limit?: number; offset?: number; search?: string; sort?: 'name' | 'recent' | 'created'; direction?: 'asc' | 'desc' }): Promise<PaginatedResult<RecentChat>> => ({ data: [], total: 0 } as PaginatedResult<RecentChat>)),
+      listRecentGrouped: chatsApiModule.chatsApi?.listRecentGrouped
+        ?? (async (_options?: { limit?: number; offset?: number; search?: string; sort?: 'name' | 'recent' | 'created'; direction?: 'asc' | 'desc' }): Promise<PaginatedResult<GroupedRecentChat>> => ({ data: [], total: 0 } as PaginatedResult<GroupedRecentChat>)),
+      update: chatsApiModule.chatsApi?.update
+        ?? (async (_id: string, _input: Partial<{ name: string; metadata: Record<string, unknown> }>): Promise<Chat> => ({ } as Chat)),
+      delete: chatsApiModule.chatsApi?.delete
+        ?? (async (_id: string): Promise<void> => undefined),
     }
     const runtimeConnectionsApi = {
       models: connectionsApiModule.connectionsApi?.models
@@ -1217,6 +1258,10 @@ async function doLoadFrontendExtension(
       chats: {
         listForCharacter: runtimeChatsApi.listCharacterChats,
         getMessages: runtimeMessagesApi.list,
+        listRecent: runtimeChatsApi.listRecent,
+        listRecentGrouped: runtimeChatsApi.listRecentGrouped,
+        update: runtimeChatsApi.update,
+        delete: runtimeChatsApi.delete,
       },
       worldBooks: {
         list: runtimeWorldBooksApi.listAll,
@@ -1238,6 +1283,7 @@ async function doLoadFrontendExtension(
 
     let mountSyncActive = true
     let mountRetryTimer: ReturnType<typeof setTimeout> | null = null
+    const registeredDecoratorAnchors = new Set<Element>()
     const attachMountRoots = () => {
       if (!mountSyncActive) return
       if (document.body.hasAttribute('data-chat-chrome-entering')) {
@@ -1257,12 +1303,37 @@ async function doLoadFrontendExtension(
           target.appendChild(root)
         }
       }
+      for (const node of [...registeredDecoratorAnchors]) {
+        if (node.isConnected) continue
+        decoratorService.unregisterAnchor(node)
+        registeredDecoratorAnchors.delete(node)
+      }
+      const hosts = document.querySelectorAll(`[${DATA_SPINDLE_MOUNT_ATTR}][${DATA_SPINDLE_SCOPE_ATTR}]`)
+      for (const host of hosts) {
+        const mount = host.getAttribute(DATA_SPINDLE_MOUNT_ATTR)
+        const scope = host.getAttribute(DATA_SPINDLE_SCOPE_ATTR)
+        if (!mount || !scope?.trim()) continue
+        decoratorService.registerAnchor({
+          mount,
+          scope,
+          owner: extensionId,
+          generation,
+          node: host,
+        })
+        registeredDecoratorAnchors.add(host)
+      }
     }
 
     const mountObserver = new MutationObserver(() => {
       attachMountRoots()
     })
-    mountObserver.observe(document.body, { childList: true, subtree: true })
+    mountObserver.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: [DATA_SPINDLE_MOUNT_ATTR, DATA_SPINDLE_SCOPE_ATTR],
+    })
+    attachMountRoots()
 
     const cleanupMountInfra = () => {
       mountSyncActive = false
@@ -1271,6 +1342,8 @@ async function doLoadFrontendExtension(
         mountRetryTimer = null
       }
       mountObserver.disconnect()
+      unloadDomDecorators()
+      registeredDecoratorAnchors.clear()
       for (const dismiss of [...modalDisposers]) {
         try { dismiss() } catch { /* no-op */ }
       }
@@ -1291,7 +1364,7 @@ async function doLoadFrontendExtension(
     const host = Object.freeze({
       descriptorVersion: 1 as const,
       lumiverseVersion: LUMIVERSE_VERSION,
-      capabilities: SPINDLE_HOST_CAPABILITIES,
+      capabilities: Object.freeze({ ...SPINDLE_HOST_CAPABILITIES, ...THEME_AUTHORING_HOST_CAPABILITIES }),
       extensionInstallationId: extensionId,
       surfaces: createHostSurfaceAPI({
         extensionId,
@@ -1331,6 +1404,10 @@ async function doLoadFrontendExtension(
 
     const baseContext: FrontendExtensionContextBase = {
       host,
+      theme: createNativeThemeAuthoringAPI(
+        assertFrontendActive,
+        (member) => assertCanonicalPermission('app_manipulation', member),
+      ),
       locale,
       dom,
       ready() {
@@ -1470,6 +1547,24 @@ async function doLoadFrontendExtension(
             options,
             `${extensionId}:${generation}:${generateUUID()}`,
           ))
+        },
+        registerComponentOverride(options) {
+          assertFrontendActive()
+          const handle = registerSpindleComponentOverride({
+            ...options,
+            owner: extensionId,
+            generation,
+          })
+          trackEventUnsubscribe(() => handle.destroy())
+          return handle
+        },
+        registerDomDecorator(options) {
+          assertFrontendActive()
+          return trackEventUnsubscribe(decoratorService.registerDecorator({
+            ...options,
+            owner: extensionId,
+            generation,
+          }))
         },
         registerHostIntentHandler<T extends JsonValue = JsonValue>(name: string, handler: (detail: T) => boolean) {
           assertFrontendActive()
@@ -2160,6 +2255,8 @@ async function doLoadFrontendExtension(
         clearLiveRootsForExtension(extensionId, generation)
         clearTabMobilityHandle(extensionId, generation)
         clearCssComponentsForExtension(extensionId, generation)
+        clearComponentOverridesForOwner(extensionId, generation)
+        unloadDomDecorators()
         forgetExtensionIdentity(extensionId)
         identityRegistered = false
 
@@ -2333,7 +2430,15 @@ export async function unloadFrontendExtension(
     if (pendingLoad) pendingLoad.invalidated = true
   }
   const loaded = loadedExtensions.get(extensionId)
-  if (!loaded) return
+  if (!loaded) {
+    // Disabled extensions can still have retained placement state after an
+    // interrupted or older frontend load. Purge it even when the loader no
+    // longer has a cleanup closure for that extension.
+    destroyAllUIEventBindingsForExtension(extensionId)
+    destroyAllComponentsForExtension(extensionId)
+    destroyAllPlacementsForExtension(extensionId)
+    return
+  }
 
   loaded.cleanup(true)
 

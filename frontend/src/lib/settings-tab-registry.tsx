@@ -4,6 +4,7 @@ import {
   Compass, Reply, HardDrive, Puzzle, Database, Hash, Activity,
   Globe, Bell, Import, Brain, Terminal, Volume2, Plug, Search, UserRound,
   PackageOpen, KeyRound,
+  Keyboard,
 } from 'lucide-react'
 import { useStore } from '@/store'
 import { joinExtensionSettingsTabs } from '@/lib/spindle/settings-tab-bridge'
@@ -71,8 +72,9 @@ export const SETTINGS_TABS: SettingsTabEntry[] = [
     tabName: 'Display & Layout',
     tabDescription: 'Panel width, sidebar position, and layout options',
     tabIcon: PanelRight,
-    keywords: ['display', 'layout', 'sidebar', 'drawer', 'width', 'panel', 'position', 'modal', 'chat heads'],
+    keywords: ['display', 'layout', 'sidebar', 'drawer', 'width', 'panel', 'position', 'modal', 'chat heads', 'long messages', 'read more'],
     sections: [
+      { key: 'longMessages', titleKey: 'display.longMessages.title', titleFallback: 'Long Messages', keywords: ['long messages', 'assistant messages', 'collapse', 'read more', 'show less', 'message height'] },
       { key: 'modalWidth', titleKey: 'display.modalWidth.title', titleFallback: 'Modal Width', keywords: ['modal width', 'width', 'max width', 'full', 'comfortable', 'compact', 'custom'] },
       { key: 'drawer', titleKey: 'display.drawer.title', titleFallback: 'Drawer', keywords: ['drawer', 'sidebar', 'side', 'panel width', 'tab position', 'tab size', 'tab labels'] },
       { key: 'toast', titleKey: 'display.toast.title', titleFallback: 'Notifications', keywords: ['toast', 'toast position', 'popup position', 'alert position'] },
@@ -151,11 +153,11 @@ export const SETTINGS_TABS: SettingsTabEntry[] = [
     id: 'webSearch',
     shortName: 'Web Search',
     tabName: 'Web Search',
-    tabDescription: 'Configure SearXNG-backed web search for council tools',
+    tabDescription: 'Configure SearXNG, Exa, or Tavily web search for council tools',
     tabIcon: Search,
-    keywords: ['web search', 'searxng', 'search', 'browse', 'internet', 'web', 'council tool'],
+    keywords: ['web search', 'searxng', 'exa', 'search', 'browse', 'internet', 'web', 'council tool'],
     sections: [
-      { key: 'general', titleKey: 'webSearch.title', titleFallback: 'Web Search', keywords: ['web search', 'searxng', 'browse', 'internet', 'council tool'] },
+      { key: 'general', titleKey: 'webSearch.title', titleFallback: 'Web Search', keywords: ['web search', 'searxng', 'exa', 'browse', 'internet', 'council tool'] },
     ],
     component: INLINE_SENTINEL,
   },
@@ -215,7 +217,7 @@ export const SETTINGS_TABS: SettingsTabEntry[] = [
     tabIcon: Sliders,
     keywords: ['advanced', 'debug', 'config', 'technical', 'expert', 'context filters', 'reasoning'],
     sections: [
-      { key: 'general', titleKey: 'advanced.title', titleFallback: 'Advanced', keywords: ['advanced', 'image optimization', 'long term memory', 'chunking', 'retrieval', 'query', 'formatting', 'similarity', 'top k', 'context filters', 'reasoning'] },
+      { key: 'general', titleKey: 'advanced.title', titleFallback: 'Advanced', keywords: ['advanced', 'long term memory', 'chunking', 'retrieval', 'query', 'formatting', 'similarity', 'top k', 'context filters', 'reasoning'] },
     ],
     component: INLINE_SENTINEL,
   },
@@ -228,6 +230,18 @@ export const SETTINGS_TABS: SettingsTabEntry[] = [
     keywords: ['lumihub', 'cloud', 'sync', 'sharing', 'online', 'hub'],
     sections: [
       { key: 'general', titleKey: 'lumihub.title', titleFallback: 'LumiHub', keywords: ['lumihub', 'cloud', 'sync', 'manifest', 'sharing', 'online'] },
+    ],
+    component: INLINE_SENTINEL,
+  },
+  {
+    id: 'illarin',
+    shortName: 'Illarin',
+    tabName: 'Illarin',
+    tabDescription: 'Illarin asset delivery and account linking',
+    tabIcon: Globe,
+    keywords: ['illarin', 'cloud', 'sync', 'assets', 'online', 'link'],
+    sections: [
+      { key: 'general', titleKey: 'illarin.title', titleFallback: 'Illarin', keywords: ['illarin', 'link', 'device code', 'assets'] },
     ],
     component: INLINE_SENTINEL,
   },
@@ -247,6 +261,15 @@ export const SETTINGS_TABS: SettingsTabEntry[] = [
     tabDescription: 'System health, performance metrics, and debug info',
     tabIcon: Activity,
     keywords: ['diagnostics', 'health', 'performance', 'debug', 'info', 'system', 'status', 'metrics'],
+    component: INLINE_SENTINEL,
+  },
+  {
+    id: 'streamDeck',
+    shortName: 'Stream Deck',
+    tabName: 'Stream Deck Integration',
+    tabDescription: 'Create and revoke restricted tokens for the Stream Deck plugin',
+    tabIcon: Keyboard,
+    keywords: ['stream deck', 'elgato', 'hardware', 'shortcut', 'integration token'],
     component: INLINE_SENTINEL,
   },
 
@@ -271,8 +294,11 @@ export const SETTINGS_TABS: SettingsTabEntry[] = [
     tabName: 'Operator Panel',
     tabDescription: 'Server management, updates, and restart controls',
     tabIcon: Terminal,
-    keywords: ['operator', 'server', 'restart', 'update', 'git', 'branch', 'logs', 'admin'],
+    keywords: ['operator', 'server', 'restart', 'update', 'git', 'branch', 'logs', 'admin', 'image processing', 'image optimization', 'thumbnails', 'sharp'],
     role: 'owner',
+    sections: [
+      { key: 'imageProcessing', titleKey: 'operator.imageProcessing', titleFallback: 'Image Processing', keywords: ['image processing', 'image optimization', 'thumbnails', 'rebuild thumbnails', 'sharp', 'small tier', 'large tier', 'deferred'] },
+    ],
     component: INLINE_SENTINEL,
   },
   {
@@ -308,7 +334,7 @@ export const SETTINGS_TABS: SettingsTabEntry[] = [
 ]
 
 /** Filter settings tabs based on current user role. */
-export function getVisibleSettingsTabs(userRole?: string): SettingsTabEntry[] {
+export function getVisibleSettingsTabs(userRole?: string, productivityTabPosition?: string): SettingsTabEntry[] {
   const isOwner = userRole === 'owner'
   const isAdmin = isOwner || userRole === 'admin'
 
@@ -319,7 +345,8 @@ export function getVisibleSettingsTabs(userRole?: string): SettingsTabEntry[] {
     return false
   })
 
-  return joinExtensionSettingsTabs(visibleCoreTabs, userRole, SETTINGS_TABS)
+  const pos = productivityTabPosition ?? (typeof useStore !== 'undefined' ? (useStore.getState() as any)?.productivityTabPosition : undefined) ?? 'after-display'
+  return joinExtensionSettingsTabs(visibleCoreTabs, userRole, SETTINGS_TABS, undefined, pos)
 }
 
 /**

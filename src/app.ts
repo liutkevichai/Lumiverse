@@ -36,12 +36,14 @@ import { embeddingsRoutes } from "./routes/embeddings.routes";
 import { tokenizersRoutes } from "./routes/tokenizers.routes";
 import { spindleOAuthRoutes } from "./routes/spindle-oauth.routes";
 import { lumihubCallbackRoute, lumihubRoutes } from "./routes/lumihub.routes";
+import { illarinRoutes } from "./routes/illarin.routes";
 import { systemRoutes } from "./routes/system.routes";
 import { migrateRoutes } from "./routes/migrate.routes";
 import { stMigrationRoutes } from "./routes/st-migration.routes";
 import { googleDriveRoutes } from "./routes/google-drive.routes";
 import { dropboxRoutes } from "./routes/dropbox.routes";
 import { presetProfilesRoutes } from "./routes/preset-profiles.routes";
+import { docsRoutes } from "./routes/docs.routes";
 import { loadoutsRoutes } from "./routes/loadouts.routes";
 import { regexScriptsRoutes } from "./routes/regex-scripts.routes";
 import { expressionsRoutes } from "./routes/expressions.routes";
@@ -62,6 +64,7 @@ import { themeAssetsRoutes } from "./routes/theme-assets.routes";
 import { notificationSoundsRoutes } from "./routes/notification-sounds.routes";
 import { bootstrapRoutes } from "./routes/bootstrap.routes";
 import { userDataRoutes } from "./routes/user-data.routes";
+import { streamDeckIntegrationRoutes, streamDeckManagementRoutes } from "./routes/stream-deck.routes";
 import { wsHandler } from "./ws/handler";
 import { issueTicket } from "./ws/tickets";
 import { rateLimit } from "./middleware/rate-limit";
@@ -73,6 +76,8 @@ import {
 import { authLockoutService } from "./services/auth-lockout.service";
 import { getClientIp } from "./utils/client-ip";
 import { listSsoLoginOptions } from "./services/sso-providers.service";
+import { userMediaServingHeaders } from "./utils/user-media-headers";
+import { getImageFilePathPublic } from "./services/images.service";
 
 const app = new Hono();
 const SIGN_IN_AUTH_PATTERN = /^\/api\/auth\/sign-in(?:\/|$)/;
@@ -428,18 +433,27 @@ if (error) {
 
 // Image gen results — unauthenticated, public access for push notifications and embeds
 app.get("/api/v1/image-gen/results/:id", async (c) => {
-  const { getImageFilePathPublic } = await import("./services/images.service");
   const id = c.req.param("id");
   const size = c.req.query("size") as "sm" | "lg" | undefined;
   const tier = size === "sm" || size === "lg" ? size : undefined;
   const filepath = await getImageFilePathPublic(id, tier);
   if (!filepath) return c.json({ error: "Not found" }, 404);
-  const response = new Response(Bun.file(filepath));
+  const file = Bun.file(filepath);
+  const response = new Response(file);
   response.headers.set("Cache-Control", "public, max-age=86400");
+  // This route is unauthenticated: apply the stored-XSS boundary (sandbox CSP,
+  // nosniff, active-content demotion) before the bytes reach any browser.
+  for (const [key, value] of Object.entries(userMediaServingHeaders(file.type))) {
+    response.headers.set(key, value);
+  }
   return response;
 });
 
 // Auth middleware — AFTER auth handler, BEFORE routes
+// Stream Deck uses dedicated, hashed, revocable tokens rather than browser
+// sessions. Keep this deliberately narrow and outside the general v1 API.
+app.route("/api/integrations/stream-deck/v1", streamDeckIntegrationRoutes);
+
 app.get("/api/v1/sso-providers/login-options", (c) => {
   return c.json(listSsoLoginOptions());
 });
@@ -455,6 +469,7 @@ app.get("/api/v1/runtime-config", (c) => {
 app.use("/api/v1/*", requireAuth);
 
 app.route("/api/v1/settings", settingsRoutes);
+app.route("/api/v1/docs", docsRoutes);
 app.route("/api/v1/characters", charactersRoutes);
 app.route("/api/v1/chats", chatsRoutes);
 app.route("/api/v1/personas", personasRoutes);
@@ -496,6 +511,7 @@ app.route("/api/v1/regex-scripts", regexScriptsRoutes);
 app.route("/api/v1/characters/:characterId/expressions", expressionsRoutes);
 app.route("/api/v1/push", pushRoutes);
 app.route("/api/v1/lumihub", lumihubRoutes);
+app.route("/api/v1/illarin", illarinRoutes);
 app.route("/api/v1/memory-cortex", memoryCortexRoutes);
 app.route("/api/v1/operator", operatorRoutes);
 app.route("/api/v1/tts-connections", ttsConnectionsRoutes);
@@ -508,6 +524,7 @@ app.route("/api/v1/web-search", webSearchRoutes);
 app.route("/api/v1/global-addons", globalAddonsRoutes);
 app.route("/api/v1/bootstrap", bootstrapRoutes);
 app.route("/api/v1/user-data", userDataRoutes);
+app.route("/api/v1/stream-deck", streamDeckManagementRoutes);
 
 // Issue single-use WS tickets (behind auth middleware)
 app.post("/api/v1/ws-ticket", (c) => {

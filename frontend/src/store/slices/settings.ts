@@ -30,19 +30,21 @@ export const DATA_KEYS: ReadonlySet<string> = new Set([
   'landingPageChatsDisplayed',
   'landingPageLayoutMode',
   'landingPageGalleryWidth',
-  'landingPageActiveTab',
   'landingHiddenCharacterIds',
   'charactersPerPage',
   'personasPerPage',
   'messagesPerPage',
-  'chatSheldDisplayMode',
+  'chatDisplayMode',
+  'longMessageCollapseEnabled',
+  'longMessageCollapsePreset',
+  'longMessageCollapseCustomHeight',
+  'longMessageCollapseDepth',
   'minimalUseFullAvatar',
   'bubbleUserAlign',
   'bubbleDisableHover',
   'bubbleHideAvatarBg',
   'bubbleUseFullAvatar',
   'bubbleOpacity',
-  'chatSheldEnterToSend',
   'saveDraftInput',
   'chatWidthMode',
   'chatContentMaxWidth',
@@ -173,6 +175,13 @@ let persistenceGeneration = 0
 let localSettingsRevision = 0
 const localSettingRevisions = new Map<string, number>()
 let persistenceScope: string | null = null
+
+/** Per-user, per-device preference; seeded once from the legacy synced row. */
+export const DEVICE_ENTER_TO_SEND_STORAGE_KEY = 'lumiverse:device:input-bar-enter-to-send'
+const LEGACY_SETTINGS_KEY_RENAMES: Readonly<Record<string, string>> = Object.freeze({
+  chatSheldDisplayMode: 'chatDisplayMode',
+})
+const LEGACY_ENTER_TO_SEND_SETTING_KEY = 'chatSheldEnterToSend'
 let lastCommittedSettingsKeys = new Set<string>()
 type SettingsTraceData = Record<string, unknown>
 
@@ -207,6 +216,27 @@ export function canPersistPortraitDockInitialization(fullSettingsLoaded: boolean
 
 function bridgeStorageKey(key: string): string {
   return persistenceScope ? `${key}:${persistenceScope}` : key
+}
+
+function deviceEnterToSendStorageKey(): string {
+  return bridgeStorageKey(DEVICE_ENTER_TO_SEND_STORAGE_KEY)
+}
+
+function readDeviceEnterToSend(): boolean | null {
+  try {
+    const value = localStorage.getItem(deviceEnterToSendStorageKey())
+    if (value === 'true') return true
+    if (value === 'false') return false
+  } catch {}
+  return null
+}
+
+function persistDeviceEnterToSend(value: boolean): void {
+  try {
+    localStorage.setItem(deviceEnterToSendStorageKey(), String(value))
+  } catch {
+    // The setting remains usable when browser storage is unavailable.
+  }
 }
 
 /** Select the authenticated user's local persistence bridge. */
@@ -601,14 +631,18 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
   charactersPerPage: 50,
   personasPerPage: 24,
   messagesPerPage: 50,
-  chatSheldDisplayMode: 'minimal',
+  chatDisplayMode: 'minimal',
+  longMessageCollapseEnabled: false,
+  longMessageCollapsePreset: 'comfortable',
+  longMessageCollapseCustomHeight: 500,
+  longMessageCollapseDepth: 0,
   minimalUseFullAvatar: false,
   bubbleUserAlign: 'right',
   bubbleDisableHover: false,
   bubbleHideAvatarBg: false,
   bubbleUseFullAvatar: false,
   bubbleOpacity: 1,
-  chatSheldEnterToSend: true,
+  inputBarEnterToSend: true,
   saveDraftInput: false,
   chatWidthMode: 'full',
   chatContentMaxWidth: 900,
@@ -649,6 +683,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
     enabled: false,
     position: 'user',
     includePreviousGeneration: false,
+    format: '[OOC: {{$regenInput}}]',
   },
   swipeGesturesEnabled: true,
   showMessageTokenCount: true,
@@ -694,6 +729,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
     interceptorTimeoutMs: 10_000,
     dockPanelDesktopSide: 'right',
     infoLoggingEnabled: true,
+    extensionUpdateToastDisabled: {},
   },
   voiceSettings: {
     sttProvider: 'webspeech' as const,
@@ -715,7 +751,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
     },
     narrationVoice: null,
   },
-  ...({ landingPageActiveTab: 'characters', ...PRODUCTIVITY_DEFAULTS } as any),
+  ...PRODUCTIVITY_DEFAULTS,
 
   connectionsOrder: normalizeConnectionsOrder(),
 
@@ -750,11 +786,28 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
     if (settings.drawerSettings && typeof settings.drawerSettings === 'object') {
       patch.drawerSettings = { ...get().drawerSettings, ...settings.drawerSettings }
     }
+    if (settings.spindleSettings && typeof settings.spindleSettings === 'object') {
+      const current = get().spindleSettings
+      const disabled = settings.spindleSettings.extensionUpdateToastDisabled
+      patch.spindleSettings = {
+        ...current,
+        ...settings.spindleSettings,
+        extensionUpdateToastDisabled:
+          disabled && typeof disabled === 'object' && !Array.isArray(disabled)
+            ? { ...disabled }
+            : current.extensionUpdateToastDisabled,
+      }
+    }
     if (settings.connectionsOrder && typeof settings.connectionsOrder === 'object') {
       patch.connectionsOrder = normalizeConnectionsOrder(settings.connectionsOrder)
     }
 
     set(patch as any)
+    if (Object.prototype.hasOwnProperty.call(settings, 'activeProfileId')) {
+      const raw = settings.activeProfileId
+      const id = raw == null || raw === '' ? null : String(raw)
+      get().setActiveProfile(id, 'bootstrap_reconcile')
+    }
   },
 
   setVoiceSettings: (partial) =>
@@ -778,6 +831,10 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
     }),
 
   setSetting: (key, value, source: SettingsWriteSource = 'user') => {
+    if (key === 'inputBarEnterToSend') {
+      get().setInputBarEnterToSend(value as boolean)
+      return
+    }
     const previous = (get() as unknown as Record<string, unknown>)[key as string]
     const changed = !pendingValuesMatch(previous, value)
     traceSettings('setSetting', {
@@ -817,6 +874,11 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
         })
       }
     }
+  },
+
+  setInputBarEnterToSend: (enabled) => {
+    persistDeviceEnterToSend(enabled)
+    set({ inputBarEnterToSend: enabled })
   },
 
   setTheme: (theme) => {
@@ -1065,6 +1127,8 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
       })
       if (!isCurrentLoad()) return
       const patch: Record<string, any> = {}
+      const migratedProductivityKeys = new Set<string>()
+      const promotedProductivityFallbacks = new Set<string>()
       const defaults = get()
       const pendingImageGenerationPatch = {
         ...(readPendingImageGenerationPatch() ?? {}),
@@ -1073,6 +1137,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
       const hasPendingImageGenerationPatch = Object.keys(pendingImageGenerationPatch).length > 0
       let reconciledImageGeneration = false
       let migratedCharacterFilterTab = false
+      const legacySettingsToPersist: Record<string, unknown> = {}
       // Retroactive purge: `activeLumiPresetId` was a defunct preset pointer
       // that still ghost-drove generation for users with a stale value. It has
       // no UI setter; wipe it from the DB on load so it stops resolving to a
@@ -1081,15 +1146,52 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
         if (!isCurrentLoad()) return
         settingsApi.delete('activeLumiPresetId').catch(() => {})
       }
-      for (const row of rows) {
+      // A legacy host may have persisted only the namespaced compatibility row.
+      // Promote that row into the canonical hydration stream once; after this
+      // point the canonical blob is the sole authority and the mirror is
+      // repaired from it below.
+      const hydrationRows = [...rows]
+      const rowsByKey = new Map(rows.map((row) => [row.key, row]))
+      for (const [key, fallbackKeys] of Object.entries(PRODUCTIVITY_PRIVATE_FALLBACKS)) {
+        if (rowsByKey.has(key)) continue
+        const fallback = fallbackKeys.map((fallbackKey) => rowsByKey.get(fallbackKey)).find(Boolean)
+        if (!fallback) continue
+        hydrationRows.push({ ...fallback, key })
+        promotedProductivityFallbacks.add(key)
+      }
+      for (const row of hydrationRows) {
+        const canonicalKey = LEGACY_SETTINGS_KEY_RENAMES[row.key] ?? row.key
         if (
-          !DATA_KEYS.has(row.key)
-          || hasNewerLocalSetting(row.key, localRevisionAtLoadStart)
+          !DATA_KEYS.has(canonicalKey)
+          || hasNewerLocalSetting(canonicalKey, localRevisionAtLoadStart)
+          // Prefer a canonical setting row when both its legacy and current
+          // names are present in the account.
+          || (canonicalKey !== row.key && rows.some((candidate) => candidate.key === canonicalKey))
         ) continue
-          const storedValue = row.key === 'imageGeneration'
-            ? migrateStoredImageGeneration(row.value)
-            : migrateProductivitySetting(row.key, row.value)
-        patch[row.key] = mergeStoredSetting((defaults as any)[row.key], storedValue)
+        const storedValue = canonicalKey === 'imageGeneration'
+          ? migrateStoredImageGeneration(row.value)
+          : migrateProductivitySetting(canonicalKey, row.value)
+        if (canonicalKey === 'quickToolbarSettings' && !pendingValuesMatch(storedValue, row.value)) {
+          migratedProductivityKeys.add(canonicalKey)
+        }
+        patch[canonicalKey] = mergeStoredSetting((defaults as any)[canonicalKey], storedValue)
+        if (canonicalKey !== row.key) legacySettingsToPersist[canonicalKey] = patch[canonicalKey]
+      }
+
+      // This preference was historically synced with the account. Seed each
+      // device once from that committed backend row, then keep later changes
+      // local so phones and desktops can choose different send-key behavior.
+      const deviceEnterToSend = readDeviceEnterToSend()
+      if (deviceEnterToSend !== null) {
+        patch.inputBarEnterToSend = deviceEnterToSend
+      } else {
+        const backendEnterToSend = rows.find((row) => row.key === 'inputBarEnterToSend')?.value
+          ?? rows.find((row) => row.key === LEGACY_ENTER_TO_SEND_SETTING_KEY)?.value
+        const migratedEnterToSend = typeof backendEnterToSend === 'boolean'
+          ? backendEnterToSend
+          : defaults.inputBarEnterToSend
+        persistDeviceEnterToSend(migratedEnterToSend)
+        patch.inputBarEnterToSend = migratedEnterToSend
       }
 
       // Recover any settings the previous page wrote to localStorage but may
@@ -1104,6 +1206,9 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
           const pendingValue = k === 'imageGeneration'
             ? migrateStoredImageGeneration(v)
             : migrateProductivitySetting(k, v)
+          if (k === 'quickToolbarSettings' && !pendingValuesMatch(pendingValue, v)) {
+            migratedProductivityKeys.add(k)
+          }
           patch[k] = mergeStoredSetting(patch[k] ?? (defaults as any)[k], pendingValue)
         }
       }
@@ -1160,8 +1265,11 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
         }
       }
       const requestedActiveLoomPresetId = patch.activeLoomPresetId as string | null | undefined
+      const hasIncomingActiveProfileId = Object.prototype.hasOwnProperty.call(patch, 'activeProfileId')
+      const incomingActiveProfileId = hasIncomingActiveProfileId ? patch.activeProfileId : undefined
       if (!isCurrentLoad()) return
       delete patch.activeLoomPresetId
+      if (hasIncomingActiveProfileId) delete patch.activeProfileId
       if (Object.keys(patch).length > 0) {
         traceSettings('loadSettings:merge', {
           loadGeneration,
@@ -1194,6 +1302,13 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
           loadGeneration,
           portraitDockAfter: portraitDockTraceSummary(get().portraitDockSettings),
         })
+        if (!isCurrentLoad()) return
+      }
+      if (hasIncomingActiveProfileId) {
+        const id = incomingActiveProfileId == null || incomingActiveProfileId === ''
+          ? null
+          : String(incomingActiveProfileId)
+        get().setActiveProfile(id, 'settings_reconcile')
         if (!isCurrentLoad()) return
       }
       if (requestedActiveLoomPresetId !== undefined && selection) {
@@ -1249,7 +1364,22 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
       })
       // Compatibility rows are repaired only after canonical hydration has
       // completed; they are never allowed to race or lead the initial load.
+      // Persist one-shot productivity migrations as well. Without this
+      // write-through, every SETTINGS_UPDATED/load cycle re-reads the stale
+      // V2 chat-column rectangle and the extension can put it back in memory.
+      for (const key of migratedProductivityKeys) {
+        const value = patch[key]
+        if (value !== undefined) persistKey(key, value, 'suite-normalization')
+      }
+      for (const key of promotedProductivityFallbacks) {
+        const value = patch[key]
+        if (value !== undefined) persistKey(key, value, 'suite-normalization')
+      }
       persistProductivityFallbacks(patch, new Map(rows.map((row) => [row.key, row.value])))
+      for (const [key, value] of Object.entries(legacySettingsToPersist)) {
+        if (!isCurrentLoad()) return
+        persistKey(key, value, 'compatibility')
+      }
       if (pendingKeys) {
         for (const [key, value] of Object.entries(pendingKeys)) {
           if (!DATA_KEYS.has(key) || key === 'imageGeneration') continue

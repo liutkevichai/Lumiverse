@@ -1,14 +1,19 @@
 import type {
+  Chat,
   ChatSummary,
   ConnectionModelsResult,
   ConnectionProfile,
+  GroupedRecentChat,
   Message,
   PaginatedResult,
+  RecentChat,
   UpdateConnectionProfileInput,
   WorldBook,
   WorldBookEntry,
 } from '@/types/api'
-import type { AppStore } from '@/types/store'
+import type { ActiveProfileSwitchReason, AppStore } from '@/types/store'
+
+export type { ActiveProfileSwitchReason }
 
 export interface FrontendStore {
   getState(): AppStore
@@ -27,7 +32,16 @@ export interface FrontendConnectionsAPI {
   subscribe(handler: (value: ConnectionActiveState) => void): () => void
   models(id: string): Promise<ConnectionModelsResult>
   setActive(id: string | null): void
+  setActiveAcknowledged(id: string | null, reason?: ActiveProfileSwitchReason): Promise<void>
   update(id: string, input: UpdateConnectionProfileInput): Promise<ConnectionProfile>
+}
+
+export interface RecentChatsQuery {
+  limit?: number
+  offset?: number
+  search?: string
+  sort?: 'name' | 'recent' | 'created'
+  direction?: 'asc' | 'desc'
 }
 
 export interface FrontendChatsAPI {
@@ -36,6 +50,11 @@ export interface FrontendChatsAPI {
     chatId: string,
     options?: { limit?: number; tail?: boolean },
   ): Promise<PaginatedResult<Message>>
+  /** Flat one-row-per-chat recent list with server-side search/sort and per-row preview enrichment. */
+  listRecent(options?: RecentChatsQuery): Promise<PaginatedResult<RecentChat>>
+  listRecentGrouped(options?: RecentChatsQuery): Promise<PaginatedResult<GroupedRecentChat>>
+  update(chatId: string, input: Partial<{ name: string; metadata: Record<string, unknown> }>): Promise<Chat>
+  delete(chatId: string): Promise<void>
   updateMessage?(chatId: string, messageId: string, input: { content?: string }): Promise<unknown>
 }
 
@@ -88,10 +107,18 @@ export interface FrontendDomainDependencies {
   connections: {
     models(id: string): Promise<ConnectionModelsResult>
     update(id: string, input: UpdateConnectionProfileInput): Promise<ConnectionProfile>
+    acknowledgeActive?(request: {
+      id: string | null
+      reason: ActiveProfileSwitchReason
+    }): Promise<void>
   }
   chats: {
     listForCharacter(characterId: string): Promise<ChatSummary[]>
     getMessages(chatId: string, options?: { limit?: number; tail?: boolean }): Promise<PaginatedResult<Message>>
+    listRecent(options?: RecentChatsQuery): Promise<PaginatedResult<RecentChat>>
+    listRecentGrouped(options?: RecentChatsQuery): Promise<PaginatedResult<GroupedRecentChat>>
+    update(chatId: string, input: Partial<{ name: string; metadata: Record<string, unknown> }>): Promise<Chat>
+    delete(chatId: string): Promise<void>
   }
   worldBooks: {
     list(): Promise<WorldBook[]>
@@ -304,6 +331,13 @@ export function createFrontendDomainApi(
       dependencies.store.getState().setActiveProfile(id)
     },
 
+    async setActiveAcknowledged(id, reason = 'user_selection') {
+      requirePermission('generation', 'ctx.connections.setActive')
+      dependencies.store.getState().setActiveProfile(id, reason)
+      await dependencies.connections.acknowledgeActive?.({ id, reason })
+      assertUsable()
+    },
+
     async update(id, input) {
       requirePermission('generation', 'ctx.connections.update')
       const result = await dependencies.connections.update(id, input)
@@ -329,6 +363,39 @@ export function createFrontendDomainApi(
       })
       assertUsable()
       return result
+    },
+
+    async listRecent(options) {
+      assertUsable()
+      const result = await dependencies.chats.listRecent({
+        ...options,
+        limit: safeRecentLimit(options?.limit ?? 50),
+      })
+      assertUsable()
+      return result
+    },
+
+    async listRecentGrouped(options) {
+      assertUsable()
+      const result = await dependencies.chats.listRecentGrouped({
+        ...options,
+        limit: safeRecentLimit(options?.limit ?? 50),
+      })
+      assertUsable()
+      return result
+    },
+
+    async update(chatId, input) {
+      requirePermission('chats', 'ctx.chats.update')
+      const result = await dependencies.chats.update(chatId, input)
+      assertUsable()
+      return result
+    },
+
+    async delete(chatId) {
+      requirePermission('chats', 'ctx.chats.delete')
+      await dependencies.chats.delete(chatId)
+      assertUsable()
     },
   }
 

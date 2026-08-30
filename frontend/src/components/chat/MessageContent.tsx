@@ -1,8 +1,10 @@
 import { useMemo, useRef, useLayoutEffect, useState, useEffect, useCallback, useSyncExternalStore, useDeferredValue } from 'react'
 import { useTranslation } from 'react-i18next'
+import { ChevronDown } from 'lucide-react'
 import { marked } from 'marked'
 import { highlightCode } from '@/lib/codeHighlight'
 import { processMarkdownInHtmlIsland } from './htmlIslandMarkdown'
+import { resolveGalleryImageId } from '@/lib/galleryImageReference'
 import { parseOOC } from '@/lib/oocParser'
 import { createEmphasisAwareRenderer } from '@/lib/markedEmphasisRenderer'
 import { createStrictTildeTokenizer } from '@/lib/markedTokenizer'
@@ -30,6 +32,12 @@ import { useStore } from '@/store'
 import i18n from '@/i18n'
 import { useDisplayRegex } from '@/hooks/useDisplayRegex'
 import {
+  getLongMessageCollapseHeight,
+  isLongMessageCollapseEligible,
+  isLongMessageOverflowing,
+  longMessageExpansionKey,
+} from '@/lib/longMessageCollapse'
+import {
   REGEX_SELECTIONS_CHANGED_EVENT,
   dispatchRegexAction,
   getRegexBlockSelectionCost,
@@ -37,6 +45,7 @@ import {
   type RegexActionActivation,
   type ResolvedRegexActionPayload,
 } from '@/lib/regex/actionBus'
+import { attachRegexActionLongPress } from '@/lib/regex/actionLongPress'
 import { toast } from '@/lib/toast'
 import { OOCBlock as OOCBlockComponent, OOCIrcChatRoom } from './ooc'
 import type { IrcEntry } from './ooc'
@@ -59,7 +68,7 @@ interface MessageContentProps {
   findQuery?: string
 }
 
-// Custom renderer for sheld prose classes
+// Custom renderer for chat prose classes
 const renderer = createEmphasisAwareRenderer({
   emClass: styles.proseItalic,
   strongClass: styles.proseBold,
@@ -1151,14 +1160,33 @@ function notifyMessageContentLayout(el: HTMLElement): void {
   dispatchMessageContentLayout(el)
 }
 
-function IsolatedHtml({ html, isStreaming }: { html: string; isStreaming: boolean }) {
+function replaceHtmlPreservingImages(root: HTMLElement | ShadowRoot, html: string): void {
+  const stableImgs = new Map<string, HTMLImageElement>()
+  for (const img of root.querySelectorAll<HTMLImageElement>('img[src]')) {
+    const src = img.getAttribute('src')
+    if (src && !stableImgs.has(src)) stableImgs.set(src, img)
+  }
+
+  root.innerHTML = html
+
+  for (const newImg of root.querySelectorAll<HTMLImageElement>('img[src]')) {
+    const src = newImg.getAttribute('src')
+    if (!src) continue
+    const preserved = stableImgs.get(src)
+    if (preserved && newImg.parentNode) {
+      newImg.replaceWith(preserved)
+      stableImgs.delete(src)
+    }
+  }
+}
+export function IsolatedHtml({ html, isStreaming }: { html: string; isStreaming: boolean }) {
   const ref = useRef<HTMLDivElement>(null)
 
   useLayoutEffect(() => {
     const el = ref.current
     if (!el) return
     const shadow = el.shadowRoot ?? el.attachShadow({ mode: 'open' })
-    shadow.innerHTML = `<style data-lumi-island-base>${ISLAND_BASE_CSS}</style>${html}`
+    replaceHtmlPreservingImages(shadow, `<style data-lumi-island-base>${ISLAND_BASE_CSS}</style>${html}`)
     for (const actionEl of shadow.querySelectorAll<HTMLElement>('[data-lumiverse-regex-action]')) {
       actionEl.style.cursor = 'pointer'
     }
@@ -1303,7 +1331,7 @@ function getChatFindHighlightRoots(container: HTMLElement): ChatFindHighlightRoo
  * src across innerHTML replacements, so images don't redo the cache lookup,
  * decode, paint cycle on every chat re-render.
  */
-function ProseHtml({ html, className }: { html: string; className?: string }) {
+export function ProseHtml({ html, className }: { html: string; className?: string }) {
   const ref = useRef<HTMLDivElement>(null)
   const lastHtmlRef = useRef<string | null>(null)
 
@@ -1312,35 +1340,13 @@ function ProseHtml({ html, className }: { html: string; className?: string }) {
     if (!el) return
     if (lastHtmlRef.current === html) return
 
-    const stableImgs = new Map<string, HTMLImageElement>()
-    if (lastHtmlRef.current !== null) {
-      for (const img of el.querySelectorAll<HTMLImageElement>('img[src]')) {
-        const src = img.getAttribute('src')
-        if (src && !stableImgs.has(src)) stableImgs.set(src, img)
-      }
-    }
-
-    el.innerHTML = html
+    replaceHtmlPreservingImages(el, html)
     lastHtmlRef.current = html
-
-    if (stableImgs.size > 0) {
-      for (const newImg of el.querySelectorAll<HTMLImageElement>('img[src]')) {
-        const src = newImg.getAttribute('src')
-        if (!src) continue
-        const preserved = stableImgs.get(src)
-        if (preserved && newImg.parentNode) {
-          newImg.replaceWith(preserved)
-          stableImgs.delete(src)
-        }
-      }
-    }
-
     notifyMessageContentLayout(el)
   }, [html])
 
   return <div ref={ref} className={className} />
 }
-
 function TrustedYouTubeEmbed({ embed }: { embed: TrustedYouTubeEmbed }) {
   return (
     <div className={styles.youtubeEmbedWrap}>
@@ -1375,6 +1381,8 @@ function assetStem(name: string): string {
 
 /** Look up an asset reference in the map — tries exact, then stem. Handles embeded:// URIs. */
 function resolveAssetId(src: string, assetMap: Record<string, string>): string | undefined {
+  const galleryImageId = resolveGalleryImageId(src, assetMap)
+  if (galleryImageId) return galleryImageId
   // Strip Risu embeded:// prefix
   const cleaned = src.startsWith('embeded://') ? src.slice('embeded://'.length) : src
   return assetMap[cleaned] ?? assetMap[assetStem(cleaned)]
@@ -1505,11 +1513,11 @@ export default function MessageContent({
   const macroCtx = useMemo(() => ({ charName, userName }), [charName, userName])
   const preprocessOpts = useMemo(
     () => (messageId
-      ? { messageId, role: (isUser ? 'user' : 'assistant') as 'user' | 'assistant' }
+      ? { messageId, chatId, role: (isUser ? 'user' : 'assistant') as 'user' | 'assistant' }
       : undefined),
-    [messageId, isUser],
+    [messageId, chatId, isUser],
   )
-  const regexAppliedContent = useDisplayRegex(interceptorCleanedContent, isUser, depth, macroCtx, preprocessOpts)
+  const regexAppliedContent = useDisplayRegex(interceptorCleanedContent, isUser, depth, macroCtx, preprocessOpts, isStreaming)
 
   const risuResolvedContent = useMemo(
     () => {
@@ -1532,10 +1540,41 @@ export default function MessageContent({
   const blocks = useMemo(() => parseOOC(renderContent), [renderContent])
   const oocEnabled = useStore((s) => s.oocEnabled)
   const lumiaOOCStyle = useStore((s) => s.lumiaOOCStyle)
+  const longMessageCollapseEnabled = useStore((s) => s.longMessageCollapseEnabled)
+  const longMessageCollapsePreset = useStore((s) => s.longMessageCollapsePreset)
+  const longMessageCollapseCustomHeight = useStore((s) => s.longMessageCollapseCustomHeight)
+  const longMessageCollapseDepth = useStore((s) => s.longMessageCollapseDepth)
+  const expansionKey = chatId && messageId ? longMessageExpansionKey(chatId, messageId) : null
+  const longMessageExpanded = useStore((s) => (
+    expansionKey ? s.expandedLongMessageKeys.includes(expansionKey) : false
+  ))
+  const setLongMessageExpanded = useStore((s) => s.setLongMessageExpanded)
+  const longMessageEligible = isLongMessageCollapseEligible({
+    enabled: longMessageCollapseEnabled,
+    isUser,
+    depth,
+    collapseDepth: longMessageCollapseDepth,
+    chatId,
+    messageId,
+  })
+  const longMessageMaxHeight = getLongMessageCollapseHeight(
+    longMessageCollapsePreset,
+    longMessageCollapseCustomHeight,
+  )
   const containerRef = useRef<HTMLDivElement>(null)
+  const contentBodyRef = useRef<HTMLDivElement>(null)
   const prevTextLenRef = useRef(0)
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null)
   const [regexSelectionVersion, setRegexSelectionVersion] = useState(0)
+  const [longMessageOverflowing, setLongMessageOverflowing] = useState(false)
+
+  const measureLongMessageOverflow = useCallback(() => {
+    const body = contentBodyRef.current
+    const next = longMessageEligible
+      && !!body
+      && isLongMessageOverflowing(Math.max(body.scrollHeight, body.offsetHeight), longMessageMaxHeight)
+    setLongMessageOverflowing((current) => current === next ? current : next)
+  }, [longMessageEligible, longMessageMaxHeight])
 
   useEffect(() => {
     const refresh = () => setRegexSelectionVersion((version) => version + 1)
@@ -1583,14 +1622,24 @@ export default function MessageContent({
     const container = containerRef.current
     if (!container || isStreaming || !chatId) return
 
-    const activate = (event: MouseEvent | KeyboardEvent) => {
-      if (event instanceof KeyboardEvent && event.key !== 'Enter' && event.key !== ' ') return
-      const target = event.composedPath().find((node): node is Element => (
+    const findActionTarget = (event: Event): Element | null => (
+      event.composedPath().find((node): node is Element => (
         node instanceof Element && node.hasAttribute('data-lumiverse-regex-action')
-      ))
-      if (!target) return
+      )) ?? null
+    )
+
+    type ConfiguredAction = (typeof regexScripts)[number]['actions'][number]
+    type ResolvedAction = { payload: ResolvedRegexActionPayload; configured: ConfiguredAction }
+
+    const findConfiguredAction = (payload: Partial<ResolvedRegexActionPayload>) => regexScripts
+      .find((script) => script.id === payload.scriptId && !script.disabled && script.target.includes('display'))
+      ?.actions.find((action) => action.id === payload.id)
+
+    // Shared shape/config validation — silently ignores anything that is not
+    // a well-formed, currently-configured regex action.
+    const resolveConfigured = (target: Element): ResolvedAction | null => {
       const encoded = target.getAttribute('data-lumiverse-regex-action')
-      if (!encoded) return
+      if (!encoded) return null
       try {
         const payload = JSON.parse(decodeURIComponent(encoded)) as Partial<ResolvedRegexActionPayload>
         if (
@@ -1601,61 +1650,115 @@ export default function MessageContent({
           typeof payload.cost !== 'number' || !Number.isFinite(payload.cost) || payload.cost <= 0 ||
           typeof payload.limit !== 'number' || !Number.isFinite(payload.limit) || payload.limit < 0 ||
           typeof payload.content !== 'string' || (payload.type !== 'effects' && !payload.content.trim())
-        ) return
-        if (regexActionsSuperseded) {
-          event.preventDefault()
-          event.stopPropagation()
-          toast.info(t('toast.regexActionExpired'))
-          return
-        }
-        const configured = regexScripts
-          .find((script) => script.id === payload.scriptId && !script.disabled && script.target.includes('display'))
-          ?.actions.find((action) => action.id === payload.id)
-        if (
-          !configured ||
-          configured.type !== payload.type ||
-          configured.multi_select !== payload.multi_select
-        ) return
+        ) return null
+        const configured = findConfiguredAction(payload)
+        if (!configured) return null
+        if (configured.type !== payload.type || configured.multi_select !== payload.multi_select) return null
+        return { payload: payload as ResolvedRegexActionPayload, configured }
+      } catch {
+        return null
+      }
+    }
+
+    const isUsedOrDisabled = (target: Element, configured: ConfiguredAction, payload: ResolvedRegexActionPayload): boolean => {
+      const usageKey = configured.multi_select ? `${payload.instanceId}:${payload.id}` : payload.instanceId
+      const blockHasSelection = Object.keys(actionUsage || {}).some((key) => (
+        key === payload.instanceId || key.startsWith(`${payload.instanceId}:`)
+      ))
+      const alreadyUsed = configured.multi_select
+        ? !!actionUsage?.[payload.instanceId] || !!actionUsage?.[usageKey]
+        : blockHasSelection
+      return target.getAttribute('aria-disabled') === 'true' || alreadyUsed
+    }
+
+    const dispatchActivation = (resolved: ResolvedAction, queue: boolean): void => {
+      const { payload, configured } = resolved
+      dispatchRegexAction({
+        id: payload.id,
+        type: payload.type,
+        multi_select: configured.multi_select,
+        cost: payload.cost,
+        limit: payload.limit,
+        title: typeof payload.title === 'string' ? payload.title : '',
+        subtitle: typeof payload.subtitle === 'string' ? payload.subtitle : '',
+        content: payload.content,
+        scriptId: payload.scriptId,
+        instanceId: payload.instanceId,
+        chatId,
+        messageId,
+        ...(configured.effects?.length ? { effects: configured.effects } : {}),
+        ...(queue ? { queue: true } : {}),
+      })
+    }
+
+    // Ctrl/cmd-click or right-click queues the action content into the
+    // composer instead of claiming and sending it, so the user can build on
+    // top of it. Plain clicks and keyboard activation keep sending.
+    const queueIntent = (event: MouseEvent | KeyboardEvent): boolean => (
+      event instanceof MouseEvent && (event.type === 'contextmenu' || event.ctrlKey || event.metaKey)
+    )
+
+    // Touch/pen long-press produces the same queue activation. The
+    // controller suppresses the synthetic click (and any synthesized
+    // contextmenu) that follow the hold, so the gesture queues exactly once.
+    const longPress = attachRegexActionLongPress({
+      container,
+      findTarget: findActionTarget,
+      isQueueable: (target) => {
+        const resolved = resolveConfigured(target)
+        if (!resolved) return false
+        const { payload, configured } = resolved
+        if (configured.multi_select || payload.type !== 'send') return false
+        if (regexActionsSuperseded) return false
+        if (isUser && configured.effects?.length) return false
+        return !isUsedOrDisabled(target, configured, payload)
+      },
+      onQueue: (target) => {
+        const resolved = resolveConfigured(target)
+        if (!resolved) return
+        dispatchActivation(resolved, true)
+      },
+    })
+
+    const activate = (event: MouseEvent | KeyboardEvent) => {
+      if (event instanceof KeyboardEvent && event.key !== 'Enter' && event.key !== ' ') return
+      const target = findActionTarget(event)
+      if (!target) return
+      if (longPress.shouldSuppressEvent(event, target)) {
         event.preventDefault()
         event.stopPropagation()
-        if (isUser && configured.effects?.length) {
-          toast.info(t('toast.regexActionAssistantOnly'))
-          return
-        }
-        const usageKey = configured.multi_select ? `${payload.instanceId}:${payload.id}` : payload.instanceId
-        const blockHasSelection = Object.keys(actionUsage || {}).some((key) => (
-          key === payload.instanceId || key.startsWith(`${payload.instanceId}:`)
-        ))
-        const alreadyUsed = configured.multi_select
-          ? !!actionUsage?.[payload.instanceId] || !!actionUsage?.[usageKey]
-          : blockHasSelection
-        if (target.getAttribute('aria-disabled') === 'true' || alreadyUsed) {
-          toast.info(t('toast.regexActionAlreadyUsed'))
-          return
-        }
-        dispatchRegexAction({
-          id: payload.id,
-          type: payload.type,
-          multi_select: configured.multi_select,
-          cost: payload.cost,
-          limit: payload.limit,
-          title: typeof payload.title === 'string' ? payload.title : '',
-          subtitle: typeof payload.subtitle === 'string' ? payload.subtitle : '',
-          content: payload.content,
-          scriptId: payload.scriptId,
-          instanceId: payload.instanceId,
-          chatId,
-          messageId,
-          ...(configured.effects?.length ? { effects: configured.effects } : {}),
-        })
-      } catch {}
+        return
+      }
+      const resolved = resolveConfigured(target)
+      if (!resolved) return
+      const { payload, configured } = resolved
+      if (regexActionsSuperseded) {
+        event.preventDefault()
+        event.stopPropagation()
+        toast.info(t('toast.regexActionExpired'))
+        return
+      }
+      event.preventDefault()
+      event.stopPropagation()
+      if (isUser && configured.effects?.length) {
+        toast.info(t('toast.regexActionAssistantOnly'))
+        return
+      }
+      if (isUsedOrDisabled(target, configured, payload)) {
+        toast.info(t('toast.regexActionAlreadyUsed'))
+        return
+      }
+      dispatchActivation(resolved, queueIntent(event))
     }
 
     container.addEventListener('click', activate)
     container.addEventListener('keydown', activate)
+    container.addEventListener('contextmenu', activate)
     return () => {
       container.removeEventListener('click', activate)
       container.removeEventListener('keydown', activate)
+      container.removeEventListener('contextmenu', activate)
+      longPress.destroy()
     }
   }, [chatId, messageId, isUser, isStreaming, regexScripts, actionUsage, regexActionsSuperseded, t, regexSelectionVersion])
 
@@ -1802,6 +1905,7 @@ export default function MessageContent({
       pendingRaf = window.requestAnimationFrame(() => {
         pendingRaf = 0
         if (cancelled) return
+        measureLongMessageOverflow()
         notifyMessageContentLayout(container)
       })
     }
@@ -1820,7 +1924,7 @@ export default function MessageContent({
     let observer: ResizeObserver | null = null
     if (isStreaming) {
       observer = new ResizeObserver(scheduleLayoutNotify)
-      observer.observe(container)
+      observer.observe(contentBodyRef.current ?? container)
 
       mutationObserver = new MutationObserver(scheduleLayoutNotify)
       mutationObserver.observe(container, { childList: true, subtree: true, attributes: true, characterData: true })
@@ -1850,37 +1954,37 @@ export default function MessageContent({
     // layout events already notify MessageList via scheduleLayoutNotify(), so
     // re-creating observers on every renderContent change is unnecessary and
     // causes observer churn during fast streaming.
-  }, [isStreaming])
+  }, [isStreaming, measureLongMessageOverflow])
 
   // While streaming, ratchet the content container's min-height upward so that
   // transient DOM shrinkage (unclosed tags snapping shut, image placeholders
   // collapsing, etc.) cannot make the virtualized row height oscillate. The
   // lock is applied directly to the DOM to avoid React re-render thrash.
   useLayoutEffect(() => {
-    const container = containerRef.current
-    if (!container) return
+    const contentBody = contentBodyRef.current
+    if (!contentBody) return
 
     if (!isStreaming) {
-      container.style.minHeight = ''
+      contentBody.style.minHeight = ''
       return
     }
 
     // offsetHeight is zoom-invariant under Lumiverse's body-level CSS zoom,
     // whereas getBoundingClientRect() would return scaled pixels and the lock
     // would be applied twice.
-    let maxHeight = container.offsetHeight
-    container.style.minHeight = `${maxHeight}px`
+    let maxHeight = contentBody.offsetHeight
+    contentBody.style.minHeight = `${maxHeight}px`
 
     const updateMinHeight = () => {
-      const h = container.offsetHeight
+      const h = contentBody.offsetHeight
       if (h > maxHeight) {
         maxHeight = h
-        container.style.minHeight = `${h}px`
+        contentBody.style.minHeight = `${h}px`
       }
     }
 
     const observer = new ResizeObserver(updateMinHeight)
-    observer.observe(container)
+    observer.observe(contentBody)
 
     return () => observer.disconnect()
   }, [isStreaming])
@@ -1955,6 +2059,23 @@ export default function MessageContent({
 
     return elements
   }, [blocks, oocEnabled, lumiaOOCStyle, isStreaming])
+
+  useLayoutEffect(() => {
+    measureLongMessageOverflow()
+  }, [measureLongMessageOverflow, renderContent, renderedBlocks])
+
+  const handleLongMessageToggle = useCallback(() => {
+    if (!chatId || !messageId) return
+    const container = containerRef.current
+    dispatchCollapsibleToggleLayoutEvent(container)
+    setLongMessageExpanded(chatId, messageId, !longMessageExpanded)
+    window.requestAnimationFrame(() => {
+      const current = containerRef.current
+      if (!current) return
+      measureLongMessageOverflow()
+      dispatchMessageContentLayout(current)
+    })
+  }, [chatId, longMessageExpanded, measureLongMessageOverflow, messageId, setLongMessageExpanded])
 
   // Highlight rendered text nodes instead of rewriting the source Markdown or
   // sanitized HTML. This preserves formatting, display regexes, OOC layouts,
@@ -2040,8 +2161,37 @@ export default function MessageContent({
         ref={containerRef}
         className={clsx(styles.content, isUser ? styles.contentUser : styles.contentChar)}
       >
-        {renderedBlocks}
-        <SpindleMessageWidgets messageId={messageId} />
+        <div
+          id={longMessageEligible ? `long-message-body-${messageId}` : undefined}
+          className={clsx(
+            styles.longMessageViewport,
+            longMessageEligible && !longMessageExpanded && styles.longMessageViewportConstrained,
+            longMessageEligible && !longMessageExpanded && longMessageOverflowing && styles.longMessageViewportOverflowing,
+          )}
+          style={longMessageEligible && !longMessageExpanded ? { maxHeight: longMessageMaxHeight } : undefined}
+        >
+          <div ref={contentBodyRef} className={styles.longMessageBody}>
+            {renderedBlocks}
+      <SpindleMessageWidgets messageId={messageId} chatId={chatId} />
+          </div>
+        </div>
+        {longMessageEligible && longMessageOverflowing && (
+          <button
+            type="button"
+            className={clsx(styles.longMessageToggle, longMessageExpanded && styles.longMessageToggleExpanded)}
+            onClick={handleLongMessageToggle}
+            aria-expanded={longMessageExpanded}
+            aria-controls={`long-message-body-${messageId}`}
+            data-long-message-toggle="true"
+          >
+            <span className={styles.longMessageTogglePill}>
+              <span>{longMessageExpanded ? t('messageContent.showLess') : t('messageContent.readMore')}</span>
+              <span className={styles.longMessageToggleIconFrame} aria-hidden="true">
+                <ChevronDown className={styles.longMessageToggleIcon} size={13} strokeWidth={2.4} />
+              </span>
+            </span>
+          </button>
+        )}
       </div>
       <ImageLightbox src={lightboxSrc} onClose={handleLightboxClose} />
     </>

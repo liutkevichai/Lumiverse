@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import {
   BookOpen,
   Copy,
@@ -17,6 +17,8 @@ import {
 import clsx from 'clsx'
 import { ApiError } from '@/api/client'
 import { worldBooksApi } from '@/api/world-books'
+import { wsClient } from '@/ws/client'
+import { EventType } from '@/ws/events'
 import {
   backfillEntryMetadata,
   buildEntryGridTemplate,
@@ -25,7 +27,8 @@ import {
   resolveVisibleColumns,
 } from '@/lib/lorebookEntryColumns'
 import { filterBooks } from '@/lib/lorebookBookSearch'
-import { createEntrySearchIndex, filterEntriesByQuery } from '@/lib/lorebookEntrySearch'
+import { createEntrySearchIndex, searchEntriesByQuery } from '@/lib/lorebookEntrySearch'
+import { runLorebookReorderIfCurrent } from '@/lib/lorebookMutationGuard'
 import {
   buildBulkFieldPatch,
   EMPTY_BULK_FIELD_FORM,
@@ -35,6 +38,7 @@ import {
   type BulkPositionSelection,
   type BulkTriggerSelection,
 } from '@/lib/lorebookBulkPatch'
+import { arrayMove } from '@dnd-kit/sortable'
 import { useLorebookTokenCounts } from './useLorebookTokenCounts'
 import { useLorebookEditorLayoutSettings } from './useLorebookEditorLayoutSettings'
 import type {
@@ -105,6 +109,8 @@ export default function LorebookEditorWorkspace({
   const [selectedEntryId, setSelectedEntryId] = useState<string | null>(initialEntryId ?? null)
   const [selectedIds, setSelectedIds] = useState<string[]>([])
   const [loading, setLoading] = useState(false)
+  const [entriesComplete, setEntriesComplete] = useState(false)
+  const [reordering, setReordering] = useState(false)
   const [savedAt, setSavedAt] = useState<number | null>(null)
   const [conflicts, setConflicts] = useState<Record<string, EntryConflictState>>({})
   // Every bulk control starts in the same "leave as is" state `enabled` already
@@ -119,6 +125,7 @@ export default function LorebookEditorWorkspace({
   const [bulkEnabled, setBulkEnabled] = useState<BulkEnabledSelection>(EMPTY_BULK_FIELD_FORM.enabled)
   const [bulkVisible, setBulkVisible] = useState(false)
   const [typeFilter, setTypeFilter] = useState<'all' | TriggerType>('all')
+  const entrySearchInputRef = useRef<HTMLInputElement | null>(null)
   const pendingDrafts = useRef<Record<string, Partial<WorldBookEntry>>>({})
   const saveQueues = useRef<Record<string, Promise<void>>>({})
   const debounceTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
@@ -166,35 +173,48 @@ export default function LorebookEditorWorkspace({
   selectedBookIdRef.current = selectedBookId
   const requestedEntriesBookId = useRef<string | null>(null)
   const entriesRequestSeq = useRef(0)
+  const entriesAbortRef = useRef<AbortController | null>(null)
+
+  useEffect(() => () => entriesAbortRef.current?.abort(), [])
+
+  useEffect(() => {
+    setSavedAt(null)
+    setEntrySearch('')
+    setTypeFilter('all')
+  }, [selectedBookId])
 
   const loadEntries = useCallback((bookId: string, preserveSelection = true): Promise<void> => {
     requestedEntriesBookId.current = bookId
     const seq = ++entriesRequestSeq.current
+    entriesAbortRef.current?.abort()
+    const controller = new AbortController()
+    entriesAbortRef.current = controller
     setLoading(true)
+    setEntriesComplete(false)
     return (async () => {
       try {
-        const result = await worldBooksApi.listEntries(bookId, {
-          limit: 1000,
-          sort_by: 'order',
-          sort_dir: 'asc',
-        })
+        const result = await worldBooksApi.listAllEntries(bookId, { signal: controller.signal })
         // A newer request started while this one was in flight — a book switch,
         // Refresh, or the reload that ends every bulk action. That answer is the
         // current one, so this older payload is dropped rather than committed
         // over the top of it.
         if (seq !== entriesRequestSeq.current) return
-        commitEntries(result.data)
+        commitEntries(result)
+        setEntriesComplete(true)
         setSelectedEntryId((current) => {
           const pending = pendingInitialEntryId.current
-          if (pending && result.data.some((entry) => entry.id === pending)) {
+          if (pending && result.some((entry) => entry.id === pending)) {
             pendingInitialEntryId.current = null
             return pending
           }
-          if (preserveSelection && current && result.data.some((entry) => entry.id === current)) return current
-          return result.data[0]?.id ?? null
+          if (preserveSelection && current && result.some((entry) => entry.id === current)) return current
+          return result[0]?.id ?? null
         })
-        setSelectedIds((current) => current.filter((id) => result.data.some((entry) => entry.id === id)))
+        setSelectedIds((current) => current.filter((id) => result.some((entry) => entry.id === id)))
+      } catch (error) {
+        if (!controller.signal.aborted) throw error
       } finally {
+        if (entriesAbortRef.current === controller) entriesAbortRef.current = null
         // Only the newest request owns the spinner; a superseded one clearing it
         // would report "loaded" while the current fetch is still out.
         if (seq === entriesRequestSeq.current) setLoading(false)
@@ -222,6 +242,12 @@ export default function LorebookEditorWorkspace({
     setSelectedBookId((current) => current ?? initialBookId ?? result.data[0]?.id ?? null)
     if (resolved && requestedEntriesBookId.current !== resolved) void loadEntries(resolved, false)
   }, [initialBookId, loadEntries])
+
+  useEffect(() => {
+    return wsClient.on(EventType.WORLD_BOOK_LIBRARY_CHANGED, () => {
+      void loadBooks()
+    })
+  }, [loadBooks])
 
   // The two opening requests, issued in the same tick.
   //
@@ -288,22 +314,40 @@ export default function LorebookEditorWorkspace({
   const filteredBooks = useMemo(() => filterBooks(books, bookSearch), [bookSearch, books])
 
   /**
-   * One index for the life of the workspace. It memoises the lowercased fields
-   * per entry OBJECT, so it needs no invalidation and must not be rebuilt when
-   * the query changes — rebuilding it per keystroke would restore the very cost
-   * it exists to remove.
+   * One index for the life of the workspace. It memoises normalized authored
+   * fields and source offsets per entry object, checking its authored values for
+   * edits. It must not be rebuilt when the query changes — rebuilding it per
+   * keystroke would restore the very cost it exists to remove.
    */
   const entrySearchIndex = useMemo(() => createEntrySearchIndex(), [])
 
-  const filteredEntries = useMemo(() => {
-    // Type filter first: it is a property read, so it shrinks the set before any
-    // substring work, and it leaves the search index untouched when no query is
-    // active (`filterEntriesByQuery` then returns its input by reference).
-    const byType = typeFilter === 'all'
-      ? entries
-      : entries.filter((entry) => getTriggerType(entry) === typeFilter)
-    return filterEntriesByQuery(byType, entrySearch, entrySearchIndex)
-  }, [entries, entrySearch, entrySearchIndex, typeFilter])
+  const entrySearchResults = useMemo(
+    () => searchEntriesByQuery(entries, entrySearch, entrySearchIndex),
+    [entries, entrySearch, entrySearchIndex],
+  )
+  const searchActive = entrySearchResults !== null
+  const queryEntries = useMemo(
+    () => entrySearchResults?.map((result) => result.entry) ?? entries,
+    [entries, entrySearchResults],
+  )
+  const entrySearchResultsById = useMemo(
+    () => new Map(entrySearchResults?.map((result) => [result.entry.id, result]) ?? []),
+    [entrySearchResults],
+  )
+  const filteredEntries = useMemo(
+    () => typeFilter === 'all'
+      ? queryEntries
+      : queryEntries.filter((entry) => getTriggerType(entry) === typeFilter),
+    [queryEntries, typeFilter],
+  )
+
+  // `listAllEntries` always requests `sort_by: 'order'`, which is this editor's
+  // custom-order view. There is no alternate sort control in this workspace.
+  const reorderEnabled = !loading
+    && !reordering
+    && entriesComplete
+    && entrySearch.trim() === ''
+    && typeFilter === 'all'
 
   // Background token counting. Everything it produces is client-only: it reaches
   // the Tokens column through a module-level cache and `useSyncExternalStore`,
@@ -316,10 +360,19 @@ export default function LorebookEditorWorkspace({
   } = useLorebookTokenCounts(filteredEntries, true)
 
   const typeCounts = useMemo(() => ({
-    constant: entries.filter((entry) => getTriggerType(entry) === 'constant').length,
-    keyword: entries.filter((entry) => getTriggerType(entry) === 'keyword').length,
-    vector: entries.filter((entry) => getTriggerType(entry) === 'vector').length,
-  }), [entries])
+    constant: queryEntries.filter((entry) => getTriggerType(entry) === 'constant').length,
+    keyword: queryEntries.filter((entry) => getTriggerType(entry) === 'keyword').length,
+    vector: queryEntries.filter((entry) => getTriggerType(entry) === 'vector').length,
+  }), [queryEntries])
+
+  const handleWorkspaceKeyDown = useCallback((event: ReactKeyboardEvent<HTMLElement>) => {
+    if (event.defaultPrevented || event.altKey || event.shiftKey) return
+    if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 'f') return
+    event.preventDefault()
+    event.stopPropagation()
+    entrySearchInputRef.current?.focus()
+    entrySearchInputRef.current?.select()
+  }, [])
 
   const selectedEntry = entries.find((entry) => entry.id === selectedEntryId) ?? null
   const selectedBook = books.find((book) => book.id === selectedBookId) ?? null
@@ -383,6 +436,40 @@ export default function LorebookEditorWorkspace({
       return next
     })
   }, [commitEntries])
+
+  const reorderEntries = useCallback(async (activeId: string, overId: string) => {
+    if (!selectedBookId || !reorderEnabled || activeId === overId) return
+    const reorderBookId = selectedBookId
+    const currentEntries = entriesRef.current
+    const oldIndex = currentEntries.findIndex((entry) => entry.id === activeId)
+    const newIndex = currentEntries.findIndex((entry) => entry.id === overId)
+    if (oldIndex < 0 || newIndex < 0) return
+
+    const orderedEntries = arrayMove(currentEntries, oldIndex, newIndex)
+    const orderedIds = orderedEntries.map((entry) => entry.id)
+    const expectedRevisions = expectedRevisionMap(currentEntries, orderedIds)
+    setReordering(true)
+    commitEntries(orderedEntries)
+    try {
+      await runLorebookReorderIfCurrent({
+        bookId: reorderBookId,
+        getCurrentBookId: () => selectedBookIdRef.current,
+        reorder: () => worldBooksApi.reorderEntries(reorderBookId, {
+          ordered_ids: orderedIds,
+          expected_revisions: expectedRevisions,
+        }).then(() => undefined),
+        refresh: () => loadEntries(reorderBookId),
+        onSaved: () => setSavedAt(Date.now()),
+      })
+    } catch (error) {
+      if (selectedBookIdRef.current !== reorderBookId) return
+      const payload = conflictPayload(error)
+      if (payload) applyConflict(payload, {})
+      await loadEntries(reorderBookId)
+    } finally {
+      setReordering(false)
+    }
+  }, [applyConflict, commitEntries, loadEntries, reorderEnabled, selectedBookId])
 
   const saveEntry = useCallback((entryId: string, updates: Partial<WorldBookEntry>) => {
     pendingDrafts.current[entryId] = { ...pendingDrafts.current[entryId], ...updates }
@@ -541,6 +628,7 @@ export default function LorebookEditorWorkspace({
   return (
     <section
       className={clsx(styles.workspace, variant === 'half' && styles.halfWorkspace)}
+      onKeyDownCapture={handleWorkspaceKeyDown}
       style={{
         '--lorebook-books-width': `${settings.booksPaneWidth}px`,
         '--lorebook-entries-width': `${variant === 'half' ? settings.halfEntriesPaneWidth : settings.entriesPaneWidth}px`,
@@ -578,8 +666,8 @@ export default function LorebookEditorWorkspace({
             <button
               type="button"
               onClick={() => onOpenFullEditor?.(selectedBookId, selectedEntryId)}
-              title="Open full editor"
-              aria-label="Open full editor"
+              title="Full-Screen Lorebook Editor"
+              aria-label="Full-Screen Lorebook Editor"
             >
               <ExternalLink size={14} />
             </button>
@@ -612,6 +700,11 @@ export default function LorebookEditorWorkspace({
           )}
         </div>
       </header>
+      <span
+        data-spindle-mount="lorebook_workspace"
+        data-spindle-scope={`lorebook:${selectedBookId ?? 'none'}:workspace`}
+        className={styles.spindleWorkspaceMount}
+      />
 
       <div className={styles.panes} ref={panesRef}>
         {variant === 'full' && (
@@ -683,9 +776,13 @@ export default function LorebookEditorWorkspace({
             onCreateBook={() => void createBook()}
             entrySearch={entrySearch}
             setEntrySearch={setEntrySearch}
+            entrySearchInputRef={entrySearchInputRef}
+            searchActive={searchActive}
+            matchCount={filteredEntries.length}
+            totalEntryCount={entries.length}
             bulkVisible={bulkVisible}
             setBulkVisible={setBulkVisible}
-            entryCount={entries.length}
+            entryCount={queryEntries.length}
             typeCounts={typeCounts}
             typeFilter={typeFilter}
             setTypeFilter={setTypeFilter}
@@ -705,9 +802,18 @@ export default function LorebookEditorWorkspace({
           />
 
           <EntryTable
+            bookId={selectedBookId}
             entries={entries}
             filteredEntries={filteredEntries}
+            searchResultsById={entrySearchResultsById}
+            searchActive={searchActive}
+            searchQuery={entrySearch}
+            typeFilter={typeFilter}
+            onClearSearch={() => setEntrySearch('')}
+            onClearTypeFilter={() => setTypeFilter('all')}
             loading={loading}
+            reorderEnabled={reorderEnabled}
+            onReorder={reorderEntries}
             visibleColumns={visibleColumns}
             entryGridTemplate={entryGridTemplate}
             entryTableMinWidth={entryTableMinWidth}
@@ -744,30 +850,32 @@ export default function LorebookEditorWorkspace({
             <span>Editing Entry</span>
             <span>{savedAt ? 'Saved' : ''}</span>
           </div>
-          {selectedEntry ? (
-            <>
-              {conflicts[selectedEntry.id] && (
-                <div className={styles.conflictBanner} role="alert">
-                  <strong>Newer server revision detected.</strong>
-                  <span>Your unsaved draft is preserved.</span>
-                  <button type="button" onClick={() => void resolveConflict(selectedEntry.id, true)}>Reapply draft</button>
-                  <button type="button" onClick={() => void resolveConflict(selectedEntry.id, false)}>Use server version</button>
-                </div>
-              )}
-              {/* Keyed on id + conflict state only. Including the revision remounted
-                  the editor on every background save — including the automatic token
-                  estimate — which reset local field state mid-edit. */}
-              <WorldBookEntryEditor
-                key={`${selectedEntry.id}:${conflicts[selectedEntry.id] ? 'conflict' : 'clean'}`}
-                entry={selectedEntry}
-                onUpdate={debouncedSaveEntry}
-                onImmediateUpdate={saveEntry}
-                density="compact"
-              />
-            </>
-          ) : (
-            <div className={styles.empty}>Select an entry to edit.</div>
-          )}
+          <div className={styles.inspectorBody}>
+            {selectedEntry ? (
+              <>
+                {conflicts[selectedEntry.id] && (
+                  <div className={styles.conflictBanner} role="alert">
+                    <strong>Newer server revision detected.</strong>
+                    <span>Your unsaved draft is preserved.</span>
+                    <button type="button" onClick={() => void resolveConflict(selectedEntry.id, true)}>Reapply draft</button>
+                    <button type="button" onClick={() => void resolveConflict(selectedEntry.id, false)}>Use server version</button>
+                  </div>
+                )}
+                {/* Keyed on id + conflict state only. Including the revision remounted
+                    the editor on every background save — including the automatic token
+                    estimate — which reset local field state mid-edit. */}
+                <WorldBookEntryEditor
+                  key={`${selectedEntry.id}:${conflicts[selectedEntry.id] ? 'conflict' : 'clean'}`}
+                  entry={selectedEntry}
+                  onUpdate={debouncedSaveEntry}
+                  onImmediateUpdate={saveEntry}
+                  density="compact"
+                />
+              </>
+            ) : (
+              <div className={styles.empty}>Select an entry to edit.</div>
+            )}
+          </div>
         </aside>
       </div>
     </section>

@@ -56,6 +56,8 @@ export type UpdateCharacterInput = Partial<CreateCharacterInput>;
 export interface CharacterSummary {
   id: string;
   name: string;
+  description: string;
+  preview_description: string;
   creator: string;
   folder: string;
   tags: string[];
@@ -117,6 +119,10 @@ export interface RecentChat {
   character_name: string;
   character_avatar_path: string | null;
   character_image_id: string | null;
+  /** Total messages in the chat; rides along so list UIs avoid per-row fetches. */
+  message_count: number;
+  /** First 280 chars of the newest message, for list previews. */
+  last_message_preview: string;
 }
 
 export interface GroupedRecentChat {
@@ -262,6 +268,8 @@ export interface Message {
   parent_message_id: string | null;
   branch_id: string | null;
   created_at: number;
+  /** Optimistic-concurrency token from messages.revision (server default 1). */
+  revision?: number;
 }
 
 export interface ChatMessageSearchMatch {
@@ -343,6 +351,7 @@ export interface ConnectionModelsResult {
 }
 
 export interface EmbeddingModelsPreviewInput {
+  profile_id?: string
   provider?: EmbeddingConfig['provider']
   api_url?: string
   api_key?: string
@@ -776,6 +785,7 @@ export interface PresetRegistryItem {
   name: string;
   provider: string;
   block_count: number;
+  cover_url?: string | null;
   updated_at: number;
 }
 
@@ -783,6 +793,8 @@ export interface PresetRegistryItem {
 export interface CharacterGalleryItem {
   id: string;
   image_id: string;
+  /** Portable source for Markdown image embeds, preserved across CharX installs. */
+  reference: string;
   caption: string;
   sort_order: number;
   created_at: number;
@@ -1254,9 +1266,31 @@ export interface WorldBookEntryBulkActionResult {
   target_book_id?: string;
 }
 
+export type EmbeddingProvider = 'openai-compatible' | 'openai' | 'mistral' | 'cohere' | 'openrouter' | 'electronhub' | 'bananabread' | 'nanogpt' | 'nvidia-nim' | 'google_vertex';
+
+export interface EmbeddingProviderProfile {
+  api_url: string;
+  model: string;
+  dimensions: number | null;
+  send_dimensions: boolean;
+  retrieval_top_k: number;
+  hybrid_weight_mode: 'keyword_first' | 'balanced' | 'vector_first';
+  preferred_context_size: number;
+  batch_size: number;
+  similarity_threshold: number;
+  rerank_cutoff: number;
+  vectorize_world_books: boolean;
+  vectorize_chat_messages: boolean;
+  vectorize_chat_documents: boolean;
+  chat_memory_mode: 'conservative' | 'balanced' | 'aggressive';
+  request_timeout: number;
+  vertex_region?: string;
+  has_api_key: boolean;
+}
+
 export interface EmbeddingConfig {
   enabled: boolean;
-  provider: 'openai-compatible' | 'openai' | 'openrouter' | 'electronhub' | 'bananabread' | 'nanogpt';
+  provider: EmbeddingProvider;
   api_url: string;
   model: string;
   dimensions: number | null;
@@ -1273,6 +1307,7 @@ export interface EmbeddingConfig {
   chat_memory_mode: 'conservative' | 'balanced' | 'aggressive';
   request_timeout: number;
   has_api_key: boolean;
+  provider_profiles?: Partial<Record<EmbeddingProvider, EmbeddingProviderProfile>>;
   /** True when the server owner has enabled a shared embedding config and the
    *  current user is a non-owner inheriting it. The form should be read-only
    *  and the config is not user-editable while this flag is set. */
@@ -1512,6 +1547,19 @@ export interface BulkImportResultItem {
 export interface BulkImportResult {
   results: BulkImportResultItem[]
   summary: { total: number; imported: number; skipped: number; failed: number }
+}
+
+export type CharacterImportJobStatus = 'accepting' | 'processing' | 'complete' | 'cancelled' | 'error'
+
+export interface CharacterImportJob {
+  jobId: string
+  status: CharacterImportJobStatus
+  total: number
+  uploaded: number
+  processed: number
+  results: BulkImportResultItem[]
+  summary: { total: number; imported: number; skipped: number; failed: number }
+  error?: string
 }
 
 export interface BulkPersonaImportResult {

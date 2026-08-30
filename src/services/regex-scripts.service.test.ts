@@ -4,12 +4,19 @@ import {
   activatePresetBoundRegexScripts,
   applyRegexScripts,
   createRegexScript,
+  deleteRegexScript,
   exportRegexScripts,
   getCharacterBoundScripts,
   getRegexScript,
   getRegexScriptByScriptId,
+  getRegexScriptsByPresetId,
+  getSpindleExtensionRegexFolderVersion,
   importRegexScripts,
   importCharacterBoundRegexScripts,
+  installLumiHubPresetRegexScripts,
+  importPresetBoundRegexScripts,
+  resolveLumiHubPresetRegexInstallFolder,
+  retireLumiHubPresetRegexScriptsForUpdate,
   reportRegexScriptPerformance,
   switchPresetBoundRegexScripts,
   toggleRegexScript,
@@ -54,6 +61,7 @@ function runtimeScript(overrides: Partial<RegexScript>): RegexScript {
     pack_id: null,
     preset_id: null,
     character_id: null,
+    owner_extension_identifier: null,
     metadata: {},
     created_at: 0,
     updated_at: 0,
@@ -100,6 +108,7 @@ beforeAll(() => {
     pack_id TEXT,
     preset_id TEXT,
     character_id TEXT,
+    owner_extension_identifier TEXT,
     metadata TEXT NOT NULL DEFAULT '{}',
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
@@ -114,6 +123,162 @@ beforeEach(() => {
   const db = getDb();
   db.query("DELETE FROM regex_scripts").run();
   db.query("DELETE FROM settings").run();
+});
+
+describe("extension regex ownership", () => {
+  test("attributes an explicitly versioned Spindle folder without affecting unversioned scripts", () => {
+    const versioned = createRegexScript(USER_ID, {
+      name: "Versioned",
+      find_regex: "versioned",
+      folder: "Extension scripts",
+      metadata: { author_note: "preserved", _lumiverse_spindle_extension: { identifier: "spoof", version: "9" } },
+    }, { extensionIdentifier: "extension.a", extensionFolderVersion: "2.4.0" }) as RegexScript;
+    const unversioned = createRegexScript(USER_ID, {
+      name: "Unversioned",
+      find_regex: "unversioned",
+      folder: "Extension scripts",
+    }, { extensionIdentifier: "extension.a" }) as RegexScript;
+    const unfiled = createRegexScript(USER_ID, {
+      name: "Unfiled",
+      find_regex: "unfiled",
+    }, { extensionIdentifier: "extension.a", extensionFolderVersion: "2.4.0" }) as RegexScript;
+
+    expect(versioned.metadata).toEqual({
+      author_note: "preserved",
+      _lumiverse_spindle_extension: { identifier: "extension.a", version: "2.4.0" },
+    });
+    expect(getSpindleExtensionRegexFolderVersion(versioned)).toBe("2.4.0");
+    expect(getSpindleExtensionRegexFolderVersion(unversioned)).toBeNull();
+    expect(getSpindleExtensionRegexFolderVersion(unfiled)).toBeNull();
+  });
+
+  test("preserves, replaces, and clears protected Spindle folder attribution on update", () => {
+    const created = createRegexScript(USER_ID, {
+      name: "Versioned",
+      find_regex: "versioned",
+      folder: "Extension scripts",
+    }, { extensionIdentifier: "extension.a", extensionFolderVersion: "1.0.0" }) as RegexScript;
+
+    const preserved = updateRegexScript(USER_ID, created.id, {
+      metadata: { extension_value: true },
+    }, { extensionIdentifier: "extension.a" }) as RegexScript;
+    expect(preserved.metadata).toEqual({
+      extension_value: true,
+      _lumiverse_spindle_extension: { identifier: "extension.a", version: "1.0.0" },
+    });
+
+    const replaced = updateRegexScript(USER_ID, created.id, {}, {
+      extensionIdentifier: "extension.a",
+      extensionFolderVersion: "2.0.0",
+    }) as RegexScript;
+    expect(getSpindleExtensionRegexFolderVersion(replaced)).toBe("2.0.0");
+
+    const cleared = updateRegexScript(USER_ID, created.id, {}, {
+      extensionIdentifier: "extension.a",
+      extensionFolderVersion: null,
+    }) as RegexScript;
+    expect(getSpindleExtensionRegexFolderVersion(cleared)).toBeNull();
+    expect(cleared.metadata._lumiverse_spindle_extension).toBeUndefined();
+  });
+
+  test("rejects invalid Spindle folder-version values", () => {
+    expect(createRegexScript(USER_ID, {
+      name: "Invalid version",
+      find_regex: "invalid",
+      folder: "Extension scripts",
+    }, { extensionIdentifier: "extension.a", extensionFolderVersion: 2 })).toBe(
+      "folder_version must be a string or null",
+    );
+    expect(createRegexScript(USER_ID, {
+      name: "Long version",
+      find_regex: "long",
+      folder: "Extension scripts",
+    }, { extensionIdentifier: "extension.a", extensionFolderVersion: "v".repeat(101) })).toBe(
+      "folder_version exceeds maximum length (100 characters)",
+    );
+  });
+
+  test("stamps extension-created scripts and strips host-owned bindings", () => {
+    const created = createRegexScript(USER_ID, {
+      name: "Owned",
+      find_regex: "owned",
+      preset_id: "attempted-preset",
+      pack_id: "attempted-pack",
+      character_id: "attempted-character",
+    }, { extensionIdentifier: "extension.a" });
+
+    expect(typeof created).not.toBe("string");
+    const script = created as RegexScript;
+    expect(script.owner_extension_identifier).toBe("extension.a");
+    expect(script.preset_id).toBeNull();
+    expect(script.pack_id).toBeNull();
+    expect(script.character_id).toBeNull();
+
+    const updated = updateRegexScript(USER_ID, script.id, { name: "Updated" }, {
+      extensionIdentifier: "extension.a",
+    });
+    expect(typeof updated).not.toBe("string");
+    expect((updated as RegexScript).name).toBe("Updated");
+  });
+
+  test("treats unattributed, foreign, and preset-bound scripts as read-only without disabling them", async () => {
+    const legacy = createRegexScript(USER_ID, { name: "Legacy", find_regex: "legacy" }) as RegexScript;
+    const foreign = createRegexScript(USER_ID, { name: "Foreign", find_regex: "foreign" }, {
+      extensionIdentifier: "extension.b",
+    }) as RegexScript;
+    const bound = createRegexScript(USER_ID, { name: "Bound", find_regex: "bound" }, {
+      extensionIdentifier: "extension.a",
+    }) as RegexScript;
+    updateRegexScript(USER_ID, bound.id, { preset_id: "preset-1" });
+
+    for (const script of [legacy, foreign, bound]) {
+      expect(updateRegexScript(USER_ID, script.id, { name: "Hijacked" }, {
+        extensionIdentifier: "extension.a",
+      })).toBe("Regex script is not an unbound script owned by this extension");
+      expect(deleteRegexScript(USER_ID, script.id, {
+        extensionIdentifier: "extension.a",
+      })).toBe("Regex script is not an unbound script owned by this extension");
+      expect(getRegexScript(USER_ID, script.id)).not.toBeNull();
+    }
+
+    expect(await applyRegexScripts(
+      "legacy",
+      [mustGetScript(legacy.id)],
+      "ai_output",
+    )).toBe("");
+  });
+
+  test("allows explicitly-authorized editors to mutate protected scripts without taking ownership", () => {
+    const legacy = createRegexScript(USER_ID, { name: "Legacy", find_regex: "legacy" }) as RegexScript;
+    const foreign = createRegexScript(USER_ID, {
+      name: "Foreign",
+      find_regex: "foreign",
+      folder: "Foreign extension",
+    }, {
+      extensionIdentifier: "extension.b",
+      extensionFolderVersion: "2.4.0",
+    }) as RegexScript;
+    const bound = createRegexScript(USER_ID, { name: "Bound", find_regex: "bound" }) as RegexScript;
+    updateRegexScript(USER_ID, bound.id, { preset_id: "preset-1" });
+
+    const context = { extensionIdentifier: "editor.extension", allowUnownedMutation: true };
+    const updatedLegacy = updateRegexScript(USER_ID, legacy.id, { name: "Edited legacy" }, context) as RegexScript;
+    expect(updatedLegacy.name).toBe("Edited legacy");
+    expect(updatedLegacy.owner_extension_identifier).toBeNull();
+
+    const updatedForeign = updateRegexScript(USER_ID, foreign.id, {
+      name: "Edited foreign",
+      metadata: { editor_note: "preserved" },
+    }, context) as RegexScript;
+    expect(updatedForeign.owner_extension_identifier).toBe("extension.b");
+    expect(updatedForeign.metadata.editor_note).toBe("preserved");
+    expect(getSpindleExtensionRegexFolderVersion(updatedForeign)).toBe("2.4.0");
+
+    expect((updateRegexScript(USER_ID, bound.id, { name: "Edited bound" }, context) as RegexScript).name)
+      .toBe("Edited bound");
+    expect(deleteRegexScript(USER_ID, foreign.id, context)).toBe(true);
+    expect(getRegexScript(USER_ID, foreign.id)).toBeNull();
+  });
 });
 
 describe("regex export", () => {
@@ -561,6 +726,97 @@ describe("regex performance reporting", () => {
     expect(updated && typeof updated !== "string" ? updated.metadata.regex_performance : undefined).toBeUndefined();
   });
 
+  test("clears a display warning after a fast run of the same script version", () => {
+    const created = createRegexScript(USER_ID, {
+      name: "Recovered Display Script",
+      find_regex: "one",
+    });
+    expect(typeof created).not.toBe("string");
+
+    const script = created as Exclude<typeof created, string>;
+    reportRegexScriptPerformance(USER_ID, script.id, {
+      elapsedMs: 5200,
+      source: "display_client",
+    });
+
+    const result = reportRegexScriptPerformance(USER_ID, script.id, {
+      elapsedMs: 20,
+      source: "display_client",
+    });
+
+    expect(result.cleared).toBe(true);
+    expect(result.script?.metadata?.regex_performance).toBeUndefined();
+  });
+
+  test("does not clear a warning from a different execution source", () => {
+    const created = createRegexScript(USER_ID, {
+      name: "Prompt Slow Script",
+      find_regex: "one",
+    });
+    expect(typeof created).not.toBe("string");
+
+    const script = created as Exclude<typeof created, string>;
+    reportRegexScriptPerformance(USER_ID, script.id, {
+      elapsedMs: 5200,
+      source: "prompt_backend",
+    });
+
+    const result = reportRegexScriptPerformance(USER_ID, script.id, {
+      elapsedMs: 20,
+      source: "display_client",
+    });
+
+    expect(result.cleared).toBe(false);
+    expect(result.script?.metadata?.regex_performance?.source).toBe("prompt_backend");
+  });
+
+  test("allows either display execution path to clear a display warning", () => {
+    const created = createRegexScript(USER_ID, {
+      name: "Backend Display Script",
+      find_regex: "one",
+    });
+    expect(typeof created).not.toBe("string");
+
+    const script = created as Exclude<typeof created, string>;
+    reportRegexScriptPerformance(USER_ID, script.id, {
+      elapsedMs: 5200,
+      source: "display_backend",
+    });
+
+    const result = reportRegexScriptPerformance(USER_ID, script.id, {
+      elapsedMs: 20,
+      source: "display_client",
+    });
+
+    expect(result.cleared).toBe(true);
+  });
+
+  test("clears a matching backend warning after a fast backend execution", async () => {
+    const created = createRegexScript(USER_ID, {
+      name: "Recovered Prompt Script",
+      find_regex: "one",
+    });
+    expect(typeof created).not.toBe("string");
+
+    const script = created as Exclude<typeof created, string>;
+    reportRegexScriptPerformance(USER_ID, script.id, {
+      elapsedMs: 5200,
+      source: "prompt_backend",
+    });
+
+    await applyRegexScripts(
+      "one",
+      [mustGetScript(script.id)],
+      "ai_output",
+      undefined,
+      undefined,
+      undefined,
+      { source: "prompt_backend" },
+    );
+
+    expect(mustGetScript(script.id).metadata.regex_performance).toBeUndefined();
+  });
+
   test("accepts the full JS regex flag set d/g/i/m/s/u/v/y", () => {
     for (const flag of ["d", "g", "i", "m", "s", "u", "v", "y"]) {
       const created = createRegexScript(USER_ID, {
@@ -653,6 +909,259 @@ describe("regex JSON overwrite imports", () => {
     toggleRegexScript(USER_ID, updated.id, false, { activePresetId: "new-preset" });
     expect(mustGetScript(updated.id).disabled).toBe(false);
   });
+
+  test("isolates LumiHub preset script IDs and stamps version attribution", () => {
+    const global = createRegexScript(USER_ID, {
+      name: "User global",
+      script_id: "shared_preset_import",
+      find_regex: "global",
+    });
+    expect(typeof global).not.toBe("string");
+
+    const result = importPresetBoundRegexScripts(
+      USER_ID,
+      "preset-historical",
+      "Historical preset",
+      [{
+        name: "Bundled preset regex",
+        script_id: "shared_preset_import",
+        find_regex: "bundled",
+        disabled: false,
+      }],
+      {
+        source: "lumihub",
+        hubPresetId: "hub-preset-1",
+        presetVersion: "1.4.0",
+      },
+    );
+
+    expect(result).toEqual({ imported: 1, skipped: 0 });
+    expect(mustGetScript((global as RegexScript).id)).toMatchObject({
+      find_regex: "global",
+      preset_id: null,
+      script_id: "shared_preset_import",
+    });
+
+    const [bundled] = getRegexScriptsByPresetId(USER_ID, "preset-historical");
+    expect(bundled).toMatchObject({
+      folder: "Historical preset · LumiHub",
+      script_id: "",
+      metadata: {
+        imported_script_id: "shared_preset_import",
+        _lumiverse_lumihub_preset: {
+          id: "hub-preset-1",
+          version: "1.4.0",
+          folderName: "Historical preset",
+        },
+      },
+    });
+    expect(getRegexScriptByScriptId(USER_ID, "shared_preset_import", { presetId: "preset-historical" })?.id)
+      .toBe(bundled.id);
+  });
+
+  test("archives only attributed older preset regexes and never a same-named local folder", () => {
+    const local = createRegexScript(USER_ID, {
+      name: "Local folder peer",
+      find_regex: "local",
+      folder: "Historical preset",
+      disabled: false,
+    }) as RegexScript;
+
+    importPresetBoundRegexScripts(
+      USER_ID,
+      "preset-historical",
+      "Historical preset",
+      [{ name: "Bundled v1", find_regex: "v1", disabled: false }],
+      { source: "lumihub", hubPresetId: "hub-preset-1", presetVersion: "1.0.0" },
+    );
+    const v1 = getRegexScriptsByPresetId(USER_ID, "preset-historical")[0];
+
+    const retired = retireLumiHubPresetRegexScriptsForUpdate(USER_ID, {
+      presetId: "preset-historical",
+      hubPresetId: "hub-preset-1",
+      previousHubPresetId: "hub-preset-1",
+      previousVersion: "1.0.0",
+      incomingVersion: "2.0.0",
+      presetName: "Historical preset",
+    });
+
+    expect(retired).toEqual({ archivedIds: [v1.id], replacedIds: [] });
+    expect(mustGetScript(v1.id)).toMatchObject({
+      disabled: true,
+      folder: "Historical preset · v1.0.0",
+      metadata: { _lumiverse_lumihub_preset: { id: "hub-preset-1", version: "1.0.0" } },
+    });
+    expect(mustGetScript(local.id)).toMatchObject({
+      disabled: false,
+      folder: "Historical preset",
+      metadata: {},
+    });
+
+    const currentFolder = resolveLumiHubPresetRegexInstallFolder(
+      USER_ID,
+      "preset-historical",
+      "hub-preset-1",
+      "Historical preset",
+    );
+    expect(currentFolder).toBe("Historical preset · LumiHub");
+
+    importPresetBoundRegexScripts(
+      USER_ID,
+      "preset-historical",
+      "Historical preset",
+      [{ name: "Bundled v2", find_regex: "v2", disabled: false }],
+      {
+        source: "lumihub",
+        hubPresetId: "hub-preset-1",
+        presetVersion: "2.0.0",
+        folderName: currentFolder,
+      },
+    );
+    const v2 = getRegexScriptsByPresetId(USER_ID, "preset-historical")
+      .find((script) => script.metadata._lumiverse_lumihub_preset?.version === "2.0.0")!;
+
+    activatePresetBoundRegexScripts(USER_ID, "preset-historical");
+    expect(mustGetScript(v1.id).disabled).toBe(true);
+    expect(mustGetScript(v2.id)).toMatchObject({ disabled: false, folder: "Historical preset · LumiHub" });
+    expect(mustGetScript(local.id).disabled).toBe(false);
+  });
+
+  test("moves a legacy unqualified LumiHub folder into the reserved namespace on update", () => {
+    importPresetBoundRegexScripts(
+      USER_ID,
+      "preset-legacy-folder",
+      "Legacy folder preset",
+      [{ name: "Bundled v1", find_regex: "v1", disabled: false }],
+      { source: "lumihub", hubPresetId: "hub-legacy-folder", presetVersion: "1.0.0" },
+    );
+
+    expect(resolveLumiHubPresetRegexInstallFolder(
+      USER_ID,
+      "preset-legacy-folder",
+      "hub-legacy-folder",
+      "Legacy folder preset",
+    )).toBe("Legacy folder preset · LumiHub");
+
+    installLumiHubPresetRegexScripts(USER_ID, {
+      presetId: "preset-legacy-folder",
+      presetName: "Legacy folder preset",
+      hubPresetId: "hub-legacy-folder",
+      presetVersion: "2.0.0",
+      previous: {
+        hubPresetId: "hub-legacy-folder",
+        version: "1.0.0",
+        presetName: "Legacy folder preset",
+      },
+      // Real LumiHub exports preserve the author's original folder on every
+      // script. It must not override the host's dedicated LumiHub folder.
+      scripts: [{
+        name: "Bundled v2",
+        find_regex: "v2",
+        folder: "Legacy folder preset",
+        disabled: false,
+      }],
+    });
+
+    const bundled = getRegexScriptsByPresetId(USER_ID, "preset-legacy-folder");
+    expect(bundled.find((script) => script.metadata._lumiverse_lumihub_preset?.version === "1.0.0"))
+      .toMatchObject({ disabled: true, folder: "Legacy folder preset · v1.0.0" });
+    expect(bundled.find((script) => script.metadata._lumiverse_lumihub_preset?.version === "2.0.0"))
+      .toMatchObject({ folder: "Legacy folder preset · LumiHub" });
+  });
+
+  test("preserves every payload folder through a LumiHub update", () => {
+    const install = (version: string) => installLumiHubPresetRegexScripts(USER_ID, {
+      presetId: "preset-multiple-folders",
+      presetName: "ThreadBare",
+      hubPresetId: "hub-multiple-folders",
+      presetVersion: version,
+      previous: version === "1.0.0" ? undefined : {
+        hubPresetId: "hub-multiple-folders",
+        version: "1.0.0",
+        presetName: "ThreadBare",
+      },
+      scripts: [
+        { name: `Stella ${version}`, find_regex: `stella-${version}`, folder: "Stella Interactive Cards", disabled: false },
+        { name: `Rules ${version}`, find_regex: `rules-${version}`, folder: "Thread Rules", disabled: false },
+      ],
+    });
+
+    install("1.0.0");
+    expect(getRegexScriptsByPresetId(USER_ID, "preset-multiple-folders").map((script) => script.folder).sort())
+      .toEqual(["Stella Interactive Cards · LumiHub", "Thread Rules · LumiHub"]);
+
+    install("2.0.0");
+    const folders = getRegexScriptsByPresetId(USER_ID, "preset-multiple-folders")
+      .map((script) => script.folder)
+      .sort();
+    expect(folders).toEqual([
+      "Stella Interactive Cards · LumiHub",
+      "Stella Interactive Cards · v1.0.0",
+      "Thread Rules · LumiHub",
+      "Thread Rules · v1.0.0",
+    ]);
+  });
+
+  test("retroactively attributes legacy preset-owned regexes before archiving them", () => {
+    const legacy = createRegexScript(USER_ID, {
+      name: "Legacy bundled regex",
+      find_regex: "legacy",
+      folder: "Legacy preset",
+      preset_id: "preset-legacy",
+    }) as RegexScript;
+
+    const retired = retireLumiHubPresetRegexScriptsForUpdate(USER_ID, {
+      presetId: "preset-legacy",
+      hubPresetId: "hub-new-id",
+      previousHubPresetId: "hub-old-id",
+      previousVersion: "0.9.0",
+      incomingVersion: "1.0.0",
+      presetName: "Legacy preset",
+    });
+
+    expect(retired.archivedIds).toEqual([legacy.id]);
+    expect(mustGetScript(legacy.id)).toMatchObject({
+      disabled: true,
+      folder: "Legacy preset · v0.9.0",
+      metadata: { _lumiverse_lumihub_preset: { id: "hub-new-id", version: "0.9.0" } },
+    });
+  });
+
+  test("rolls back a partial update and preserves the previous enabled set", () => {
+    installLumiHubPresetRegexScripts(USER_ID, {
+      presetId: "preset-safe-update",
+      presetName: "Safe update preset",
+      hubPresetId: "hub-safe-update",
+      presetVersion: "1.0.0",
+      scripts: [{ name: "Bundled v1", find_regex: "v1", disabled: false }],
+    });
+    const [v1] = getRegexScriptsByPresetId(USER_ID, "preset-safe-update");
+    activatePresetBoundRegexScripts(USER_ID, "preset-safe-update");
+    expect(mustGetScript(v1.id).disabled).toBe(false);
+
+    expect(() => installLumiHubPresetRegexScripts(USER_ID, {
+      presetId: "preset-safe-update",
+      presetName: "Safe update preset",
+      hubPresetId: "hub-safe-update",
+      presetVersion: "2.0.0",
+      previous: {
+        hubPresetId: "hub-safe-update",
+        version: "1.0.0",
+        presetName: "Safe update preset",
+      },
+      scripts: [
+        { name: "Valid v2", find_regex: "v2", disabled: false },
+        { name: "Invalid v2", find_regex: "(", disabled: false },
+      ],
+    })).toThrow("LumiHub preset regex import was incomplete (1/2)");
+
+    expect(getRegexScriptsByPresetId(USER_ID, "preset-safe-update")).toHaveLength(1);
+    expect(mustGetScript(v1.id)).toMatchObject({
+      disabled: false,
+      folder: "Safe update preset · LumiHub",
+      metadata: { _lumiverse_lumihub_preset: { id: "hub-safe-update", version: "1.0.0" } },
+    });
+  });
 });
 
 describe("raw capture processing", () => {
@@ -683,6 +1192,7 @@ describe("raw capture processing", () => {
       pack_id: null,
       preset_id: null,
       character_id: null,
+      owner_extension_identifier: null,
       metadata: {},
       created_at: 0,
       updated_at: 0,
@@ -903,6 +1413,40 @@ describe("regex match actions", () => {
 });
 
 describe("associative regex actions", () => {
+  test("renders omitted optional named captures as empty action attributes", async () => {
+    const created = createRegexScript(USER_ID, {
+      name: "Optional requirement",
+      find_regex: "<choice>(?<label>[^<]+)</choice>(?:<req>(?<req>[^<]*)</req>)?",
+      replace_string: '<button data-req="$<req>" data-regex-action="choose">$<label></button>',
+      placement: ["ai_output"],
+      target: ["display"],
+      actions: [{
+        id: "choose",
+        type: "send",
+        multi_select: false,
+        cost: "1",
+        limit: "3",
+        title: "$<label>",
+        subtitle: "",
+        content: "Choose $<label>",
+      }],
+    });
+    expect(typeof created).not.toBe("string");
+
+    const output = await applyRegexScripts(
+      "<choice>North</choice>",
+      [created as RegexScript],
+      "ai_output",
+      undefined,
+      undefined,
+      undefined,
+      { source: "display_backend" },
+    );
+
+    expect(output).toContain('data-req=""');
+    expect(output).not.toContain("$<req>");
+  });
+
   test("persists actions and resolves their capture templates per replacement", async () => {
     const created = createRegexScript(USER_ID, {
       name: "Choices",

@@ -4,7 +4,24 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 
 import { createPortal } from 'react-dom'
 import { motion, AnimatePresence } from 'motion/react'
-import { X, Upload, Trash2, Copy, MessageSquare, User, UserPlus, Plus, ImagePlus, Download, Code2, GripVertical, ExternalLink, Hash, MoreHorizontal } from 'lucide-react'
+import {
+  X,
+  Upload,
+  Trash2,
+  Copy,
+  MessageSquare,
+  User,
+  UserPlus,
+  Plus,
+  ImagePlus,
+  Download,
+  Code2,
+  GripVertical,
+  ExternalLink,
+  Hash,
+  MoreHorizontal,
+  CircleHelp,
+} from 'lucide-react'
 import {
   DndContext,
   closestCenter,
@@ -47,6 +64,8 @@ import { useLongPress } from '@/hooks/useLongPress'
 import type { Character, CharacterGalleryItem, WorldBook } from '@/types/api'
 import type { WallpaperRef } from '@/types/store'
 import { toast } from '@/lib/toast'
+import { copyTextToClipboard } from '@/lib/clipboard'
+import { galleryImageMarkdown } from '@/lib/galleryImageReference'
 import { wsClient } from '@/ws/client'
 import { EventType } from '@/ws/events'
 import { Button } from '@/components/shared/FormComponents'
@@ -76,6 +95,7 @@ import AlternateFieldEditor from './AlternateFieldEditor'
 import AlternateAvatarManager from './AlternateAvatarManager'
 import type { AlternateAvatarEntry } from './AlternateAvatarManager'
 import CharacterTokenReportModal, { type CharacterTokenReportItem } from './CharacterTokenReportModal'
+import { GuideViewer } from '@/components/shared/GuideViewer'
 
 const DEBOUNCE_MS = 2000
 const MAX_PERSPECTIVE_LAYERS = 5
@@ -400,6 +420,7 @@ export default function CharacterEditorPage() {
   const [fields, setFields] = useState<Record<string, string>>({})
   const [tags, setTags] = useState<string[]>([])
   const [newTag, setNewTag] = useState('')
+  const [guideOpen, setGuideOpen] = useState(false)
   const [alternateGreetings, setAlternateGreetings] = useState<string[]>([])
   const [alternateCharacterName, setAlternateCharacterName] = useState('')
   const [extensionsJson, setExtensionsJson] = useState('')
@@ -453,6 +474,11 @@ export default function CharacterEditorPage() {
     document.addEventListener('keydown', handleEscape)
     return () => document.removeEventListener('keydown', handleEscape)
   }, [isOpen, close])
+
+  /// Guide Viewer 
+  useEffect(() => {
+  setGuideOpen(false)
+}, [activeTab])
 
   // Reset tab and force re-sync when switching to a different character.
   // Keyed on editingCharacterId (a stable string) so store-driven object
@@ -631,8 +657,10 @@ export default function CharacterEditorPage() {
       }
     }
     loadWorldBooks()
+    const offLibraryChanged = wsClient.on(EventType.WORLD_BOOK_LIBRARY_CHANGED, loadWorldBooks)
     return () => {
       cancelled = true
+      offLibraryChanged()
     }
   }, [editingCharacterId])
 
@@ -692,7 +720,21 @@ export default function CharacterEditorPage() {
     }
   }, [activeChatId, setActiveChatWallpaper, setSceneBackground, t])
 
+  const copyGalleryImageReference = useCallback((item: CharacterGalleryItem) => {
+    const markdown = galleryImageMarkdown(item, t('characterEditor.galleryImage'))
+    setGalleryContextMenu(null)
+    void copyTextToClipboard(markdown)
+      .then(() => toast.success(t('characterEditor.imageReferenceCopied')))
+      .catch(() => toast.error(t('characterEditor.imageReferenceCopyFailed')))
+  }, [t])
+
   const galleryContextMenuItems: ContextMenuEntry[] = galleryContextMenu ? [
+    {
+      key: 'copy-image-reference',
+      label: t('characterEditor.copyImageReference'),
+      icon: <Copy size={14} />,
+      onClick: () => copyGalleryImageReference(galleryContextMenu.item),
+    },
     {
       key: 'set-chat-background',
       label: t('characterEditor.setAsChatBackground'),
@@ -1857,16 +1899,20 @@ export default function CharacterEditorPage() {
                 {/* Tab bar */}
                 <div className={styles.tabBar}>
                   {tabs.map((tab) => (
-                    <button
-                      key={tab.id}
-                      type="button"
-                      className={clsx(styles.tab, activeTab === tab.id && styles.tabActive)}
-                      onClick={() => setActiveTab(tab.id)}
-                    >
-                      {tab.label}
-                    </button>
-                  ))}
-                </div>
+                  <button
+                    key={tab.id}
+                    type="button"
+                    className={clsx(
+                    styles.tab,
+                      activeTab === tab.id && styles.tabActive,
+                  )}
+                    onClick={() => setActiveTab(tab.id)}
+                >
+                 {tab.label}
+                </button>
+               ))}
+                <span data-spindle-mount="character_editor_tab" data-spindle-scope={`character-editor:${editingCharacterId ?? 'none'}:tab`} style={{ display: 'contents' }} />
+              </div>
 
                 {/* Tab content */}
                 <div className={styles.tabContent}>
@@ -2449,8 +2495,26 @@ export default function CharacterEditorPage() {
                   )}
 
                   {activeExtensionTab && (
-                    <SpindleCharacterEditorTabContent tab={activeExtensionTab} />
+                    <div className={styles.extensionTabShell}>
+                  {activeExtensionTab.guide && (
+                    <div className={styles.extensionGuideRow}>
+                      <button
+                        type="button"
+                        className={styles.extensionGuideButton}
+                        onClick={() => setGuideOpen(true)}
+                        aria-label={`Open guide for ${activeExtensionTab.title}`}
+                        title="Open guide"
+                      >
+                        <CircleHelp size={15} strokeWidth={1.7} />
+                      </button>
+                    </div>
                   )}
+
+                    <SpindleCharacterEditorTabContent
+                      tab={activeExtensionTab}
+                    />
+                  </div>
+                )}
                 </div>
               </>
             )}
@@ -2467,6 +2531,17 @@ export default function CharacterEditorPage() {
       onClose={() => setGalleryContextMenu(null)}
     />
     <ImageLightbox src={galleryLightboxSrc} onClose={() => setGalleryLightboxSrc(null)} />
+    {activeExtensionTab?.guide && (
+  <GuideViewer
+    isOpen={guideOpen}
+    onClose={() => setGuideOpen(false)}
+    guide={{
+      kind: 'markdown',
+      ...activeExtensionTab.guide,
+    }}
+    title={activeExtensionTab.title}
+  />
+)}
 
     {character && (
       <CharacterTokenReportModal

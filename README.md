@@ -59,7 +59,7 @@ All commands below assume you have already cloned the repo and are working from 
 
 The launcher will:
 1. Install Bun if not found
-2. Upgrade Bun versions older than 1.3.13 to the latest stable release
+2. Upgrade unsupported Bun versions to the latest stable release (minimum 1.4.0)
 3. Run the **first-time setup wizard** (admin account, port, extension storage, optional SMART disk monitoring)
 4. Install backend dependencies and serve the existing frontend build if one is available
 5. Start the backend with the runner and IPC bridge when launched interactively
@@ -117,7 +117,7 @@ In your Space's **Settings → Persistent storage**, attach a storage bucket and
 In the **Files** tab of your Space, create a file named `Dockerfile` with the following contents:
 
 ```dockerfile
-FROM oven/bun:1-slim
+FROM oven/bun:1.4.0-slim@sha256:e0ee68d16ccb9927bf02aa7dd8fd4bf3369ee6d46da04faa72b05ce8bfd135f6
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -261,6 +261,7 @@ Configuration is managed through `.env` (see `.env.example` for all options). Se
 | `AUTH_SECRET` | No | *derived* | Session signing secret (auto-derived from identity file) |
 | `FRONTEND_DIR` | No | — | Path to built frontend dist for static serving |
 | `TRUSTED_ORIGINS` | No | `localhost` | Comma-separated CORS origins |
+| `TRUSTED_PROXIES` | No | *private ranges* | Reverse proxies allowed to supply client IPs via `X-Forwarded-For`/`Forwarded`/`X-Real-IP`, as IPs or CIDRs (e.g. `203.0.113.10,10.0.0.0/8`). When set, ONLY listed peers are trusted — required for proxies with public addresses; also closes LAN XFF spoofing. |
 
 Owner password is stored hashed in `data/owner.credentials` (created by the setup wizard). To reset: `bun run reset-password`.
 
@@ -362,4 +363,4 @@ scripts/
 
 ## License
 
-[Lumiverse Community License v2.0](LICENSE.md) — source-available for personal, academic, and non-profit use. See the license for full terms.
+[Lumiverse Community License v2.1](LICENSE.md) — source-available for personal, academic, and non-profit use. See the license for full terms.

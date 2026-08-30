@@ -9,17 +9,22 @@ import {
   type ChangeEvent,
   type CompositionEvent,
   type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
   type Ref,
+  type RefObject,
   type ReactNode,
   type SyntheticEvent,
   type TextareaHTMLAttributes,
 } from 'react'
 import { useTranslation } from 'react-i18next'
 import { createPortal } from 'react-dom'
-import { Minimize2, Maximize2, Hash, Search, Replace as ReplaceIcon, ChevronUp, ChevronDown, X } from 'lucide-react'
+import { Minimize2, Maximize2, Hash, Search, Replace as ReplaceIcon, ChevronUp, ChevronDown, X, Eye, Pencil } from 'lucide-react'
 import { getMacroCatalog } from '@/api/macros'
 import { getAvailableMacros } from '@/lib/loom/service'
 import type { MacroGroup } from '@/lib/loom/types'
+import MessageContent from '@/components/chat/MessageContent'
+import { useStore } from '@/store'
+import { calculateExpandedEditorScrollRecovery } from '@/lib/expandedTextEditorViewport'
 import {
   findExpandedTextMatches,
   replaceAllExpandedTextMatches,
@@ -217,6 +222,8 @@ interface ExpandedTextEditorProps {
    * isn't a prompt template — e.g. databank document bodies.
    */
   markdownOnly?: boolean
+  /** The compact field that launched this modal. Hidden visually while open. */
+  sourceRef?: RefObject<HTMLTextAreaElement | null>
 }
 
 type TextSelectionDirection = 'forward' | 'backward' | 'none'
@@ -225,6 +232,12 @@ interface TextSelectionSnapshot {
   start: number
   end: number
   direction: TextSelectionDirection
+}
+
+interface MobileTapSnapshot {
+  target: HTMLTextAreaElement
+  clientY: number
+  scrollTop: number
 }
 
 function normalizeSelectionDirection(direction: HTMLTextAreaElement['selectionDirection']): TextSelectionDirection {
@@ -239,6 +252,27 @@ function clampSelection(selection: TextSelectionSnapshot, valueLength: number): 
     : { start: end, end: start, direction: selection.direction }
 }
 
+function shouldAutoFocusExpandedEditor(): boolean {
+  // On touch-only devices, opening the editor should remain a navigation
+  // action: let the user scroll/read first and summon the keyboard only after
+  // they tap the exact place they want to edit. Pointer/desktop users retain
+  // immediate keyboard focus.
+  return !window.matchMedia?.('(any-hover: none)').matches
+}
+
+function maskSourceTextarea(source: HTMLTextAreaElement): () => void {
+  const visibility = source.style.visibility
+  const ariaHidden = source.getAttribute('aria-hidden')
+  source.style.visibility = 'hidden'
+  source.setAttribute('aria-hidden', 'true')
+
+  return () => {
+    source.style.visibility = visibility
+    if (ariaHidden == null) source.removeAttribute('aria-hidden')
+    else source.setAttribute('aria-hidden', ariaHidden)
+  }
+}
+
 export default function ExpandedTextEditor({
   value,
   onChange,
@@ -250,6 +284,7 @@ export default function ExpandedTextEditor({
   onRefreshMacros,
   inline,
   markdownOnly,
+  sourceRef,
 }: ExpandedTextEditorProps) {
   const { t } = useTranslation('shared', { keyPrefix: 'expandedTextEditor' })
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -267,6 +302,12 @@ export default function ExpandedTextEditor({
   const lastScrolledMatchNavigationRequestRef = useRef(0)
   const macroSearchRef = useRef('')
   const showMacrosRef = useRef(false)
+  const showMarkdownPreviewRef = useRef(false)
+  const mobileTapRef = useRef<MobileTapSnapshot | null>(null)
+  const mobileRecoveryFrameRef = useRef(0)
+  const mobileRecoveryTimerRef = useRef(0)
+  const [showMarkdownPreview, setShowMarkdownPreview] = useState(false)
+  const previewUserName = useStore((state) => state.user?.name ?? state.user?.username ?? '')
   onCloseRef.current = onClose
 
   const [showMacros, setShowMacros] = useState(false)
@@ -286,11 +327,19 @@ export default function ExpandedTextEditor({
   findQueryRef.current = findQuery
   macroSearchRef.current = macroSearch
   showMacrosRef.current = showMacros
+  showMarkdownPreviewRef.current = showMarkdownPreview
 
   const findMatches = useMemo(
     () => findExpandedTextMatches(value, findQuery),
     [findQuery, value],
   )
+
+  useLayoutEffect(() => {
+    if (inline) return
+    const source = sourceRef?.current
+    if (!source) return
+    return maskSourceTextarea(source)
+  }, [inline, sourceRef])
 
   const loadMacros = useCallback(() => {
     if (macros) { onRefreshMacros?.(); return }
@@ -340,7 +389,11 @@ export default function ExpandedTextEditor({
     selectionRef.current = nextSelection
 
     if (shouldFocusSelectionRef.current && document.activeElement !== textarea) {
-      textarea.focus()
+      // Focusing an off-screen selection is allowed to scroll every ancestor
+      // (including the document) unless preventScroll is explicit. Mobile
+      // browsers do that scroll while also resizing for the keyboard, which
+      // used to move the entire expanded editor away from the tapped position.
+      textarea.focus({ preventScroll: true })
     }
 
     const currentDirection = normalizeSelectionDirection(textarea.selectionDirection)
@@ -409,7 +462,7 @@ export default function ExpandedTextEditor({
   useEffect(() => {
     if (!findMode) return
     const frame = requestAnimationFrame(() => {
-      findInputRef.current?.focus()
+      findInputRef.current?.focus({ preventScroll: true })
       findInputRef.current?.select()
     })
     return () => cancelAnimationFrame(frame)
@@ -442,31 +495,31 @@ export default function ExpandedTextEditor({
       selectionRef.current = { start: initialPos, end: initialPos, direction: 'none' }
       hasInitializedSelectionRef.current = true
       shouldRestoreSelectionRef.current = true
-      shouldFocusSelectionRef.current = true
+      shouldFocusSelectionRef.current = shouldAutoFocusExpandedEditor()
     }
     if (!shouldRestoreSelectionRef.current || isComposingRef.current) return
     restoreSelection()
-  }, [initialCursorPos, restoreSelection, value])
+  }, [initialCursorPos, restoreSelection, showMarkdownPreview, value])
 
   useEffect(() => {
     const handleEditorShortcut = (e: KeyboardEvent) => {
       const key = e.key.toLowerCase()
-      if ((e.ctrlKey || e.metaKey) && !e.altKey && key === 'f') {
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && key === 'f' && !showMarkdownPreviewRef.current) {
         e.preventDefault()
         e.stopPropagation()
         if (findModeRef.current === 'find') {
-          findInputRef.current?.focus()
+          findInputRef.current?.focus({ preventScroll: true })
           findInputRef.current?.select()
         } else {
           setFindMode('find')
         }
         return
       }
-      if ((e.ctrlKey || e.metaKey) && !e.altKey && key === 'h') {
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && key === 'h' && !showMarkdownPreviewRef.current) {
         e.preventDefault()
         e.stopPropagation()
         if (findModeRef.current === 'replace') {
-          findInputRef.current?.focus()
+          findInputRef.current?.focus({ preventScroll: true })
           findInputRef.current?.select()
         } else {
           setFindMode('replace')
@@ -490,11 +543,63 @@ export default function ExpandedTextEditor({
     }
     // Capture phase so we intercept before parent modal escape handlers
     document.addEventListener('keydown', handleEditorShortcut, true)
-    if (!inline) document.body.style.overflow = 'hidden'
+
+    const bodyOverflow = document.body.style.overflow
+    const rootOverflow = document.documentElement.style.overflow
+    if (!inline) {
+      // WebKit can scroll the root even while body overflow is locked when a
+      // virtual keyboard is presented. Lock both scrolling elements for the
+      // lifetime of the portaled modal; the editor's own scroller remains live.
+      document.body.style.overflow = 'hidden'
+      document.documentElement.style.overflow = 'hidden'
+    }
 
     return () => {
       document.removeEventListener('keydown', handleEditorShortcut, true)
-      if (!inline) document.body.style.overflow = ''
+      if (!inline) {
+        document.body.style.overflow = bodyOverflow
+        document.documentElement.style.overflow = rootOverflow
+      }
+    }
+  }, [inline])
+
+  useEffect(() => {
+    if (inline || !window.matchMedia?.('(any-hover: none)').matches) return
+
+    const recoverTappedCaret = () => {
+      cancelAnimationFrame(mobileRecoveryFrameRef.current)
+      mobileRecoveryFrameRef.current = requestAnimationFrame(() => {
+        mobileRecoveryFrameRef.current = 0
+        const tap = mobileTapRef.current
+        if (!tap || document.activeElement !== tap.target) return
+
+        const rect = tap.target.getBoundingClientRect()
+        const renderedScale = tap.target.offsetWidth > 0
+          ? rect.width / tap.target.offsetWidth
+          : 1
+        const recovery = calculateExpandedEditorScrollRecovery({
+          tapClientY: tap.clientY,
+          visibleViewportHeight: window.visualViewport?.height ?? window.innerHeight,
+          renderedScale,
+        })
+        if (recovery > 0) tap.target.scrollTop = tap.scrollTop + recovery
+
+        window.clearTimeout(mobileRecoveryTimerRef.current)
+        mobileRecoveryTimerRef.current = window.setTimeout(() => {
+          mobileTapRef.current = null
+        }, 450)
+      })
+    }
+
+    window.addEventListener('resize', recoverTappedCaret, { passive: true })
+    window.visualViewport?.addEventListener('resize', recoverTappedCaret)
+    window.visualViewport?.addEventListener('scroll', recoverTappedCaret)
+    return () => {
+      window.removeEventListener('resize', recoverTappedCaret)
+      window.visualViewport?.removeEventListener('resize', recoverTappedCaret)
+      window.visualViewport?.removeEventListener('scroll', recoverTappedCaret)
+      cancelAnimationFrame(mobileRecoveryFrameRef.current)
+      window.clearTimeout(mobileRecoveryTimerRef.current)
     }
   }, [inline])
 
@@ -510,6 +615,15 @@ export default function ExpandedTextEditor({
   const handleTextareaSelect = useCallback((e: SyntheticEvent<HTMLTextAreaElement>) => {
     captureSelection(e.currentTarget)
   }, [captureSelection])
+
+  const handleTextareaPointerDown = useCallback((e: ReactPointerEvent<HTMLTextAreaElement>) => {
+    if (e.pointerType !== 'touch' && !window.matchMedia?.('(any-hover: none)').matches) return
+    mobileTapRef.current = {
+      target: e.currentTarget,
+      clientY: e.clientY,
+      scrollTop: e.currentTarget.scrollTop,
+    }
+  }, [])
 
   const handleCompositionStart = useCallback((e: CompositionEvent<HTMLTextAreaElement>) => {
     isComposingRef.current = true
@@ -588,6 +702,17 @@ export default function ExpandedTextEditor({
     else setFindMode(mode)
   }, [closeFindPanel, findMode])
 
+  const toggleMarkdownPreview = useCallback(() => {
+    if (showMarkdownPreview) {
+      shouldRestoreSelectionRef.current = true
+      shouldFocusSelectionRef.current = true
+    } else {
+      setShowMacros(false)
+      closeFindPanel()
+    }
+    setShowMarkdownPreview(!showMarkdownPreview)
+  }, [closeFindPanel, showMarkdownPreview])
+
   const hasMacros = resolvedMacros.length > 0
   const showHighlight = hasMacros || !!markdownOnly || !!findQuery
   const highlightNodes = useMemo(
@@ -605,7 +730,7 @@ export default function ExpandedTextEditor({
         <div className={s.headerContent}>
           <h3 className={s.title}>{title}</h3>
           <div className={s.toolbar}>
-            {!markdownOnly && (
+            {!markdownOnly && !showMarkdownPreview && (
               <button
                 className={s.toolbarBtn}
                 onClick={() => { if (!showMacros) loadMacros(); setShowMacros(!showMacros) }}
@@ -614,21 +739,34 @@ export default function ExpandedTextEditor({
                 <Hash size={12} /> {showMacros ? t('hideMacros') : t('insertMacro')}
               </button>
             )}
+            {!showMarkdownPreview && (
+              <>
+                <button
+                  className={`${s.toolbarBtn} ${findMode === 'find' ? s.toolbarBtnActive : ''}`}
+                  onClick={() => toggleFindPanel('find')}
+                  type="button"
+                  aria-expanded={findMode === 'find'}
+                >
+                  <Search size={12} /> {t('find')}
+                </button>
+                <button
+                  className={`${s.toolbarBtn} ${findMode === 'replace' ? s.toolbarBtnActive : ''}`}
+                  onClick={() => toggleFindPanel('replace')}
+                  type="button"
+                  aria-expanded={findMode === 'replace'}
+                >
+                  <ReplaceIcon size={12} /> {t('findAndReplace')}
+                </button>
+              </>
+            )}
             <button
-              className={`${s.toolbarBtn} ${findMode === 'find' ? s.toolbarBtnActive : ''}`}
-              onClick={() => toggleFindPanel('find')}
+              className={`${s.toolbarBtn} ${showMarkdownPreview ? s.toolbarBtnActive : ''}`}
+              onClick={toggleMarkdownPreview}
               type="button"
-              aria-expanded={findMode === 'find'}
+              aria-pressed={showMarkdownPreview}
             >
-              <Search size={12} /> {t('find')}
-            </button>
-            <button
-              className={`${s.toolbarBtn} ${findMode === 'replace' ? s.toolbarBtnActive : ''}`}
-              onClick={() => toggleFindPanel('replace')}
-              type="button"
-              aria-expanded={findMode === 'replace'}
-            >
-              <ReplaceIcon size={12} /> {t('findAndReplace')}
+              {showMarkdownPreview ? <Pencil size={12} /> : <Eye size={12} />}
+              {showMarkdownPreview ? t('editMarkdown') : t('previewMarkdown')}
             </button>
           </div>
         </div>
@@ -636,7 +774,7 @@ export default function ExpandedTextEditor({
           <Minimize2 size={18} />
         </button>
       </div>
-      {findMode && (
+      {findMode && !showMarkdownPreview && (
         <div className={s.findPanel}>
           <div className={s.findRow}>
             <Search size={13} className={s.findIcon} />
@@ -664,7 +802,7 @@ export default function ExpandedTextEditor({
                 onClick={() => {
                   setFindQuery('')
                   setCurrentMatchIndex(0)
-                  findInputRef.current?.focus()
+                  findInputRef.current?.focus({ preventScroll: true })
                 }}
                 title={t('clearFind')}
                 aria-label={t('clearFind')}
@@ -742,7 +880,7 @@ export default function ExpandedTextEditor({
         </div>
       )}
       <div className={s.body}>
-        {showMacros && (
+        {showMacros && !showMarkdownPreview && (
           <div className={s.macroSidebar}>
             <div className={s.macroSearch}>
               <div className={s.macroSearchInner}>
@@ -782,7 +920,16 @@ export default function ExpandedTextEditor({
           </div>
         )}
         <div className={s.editorArea}>
-          {showHighlight ? (
+          {showMarkdownPreview ? (
+            <div className={s.markdownPreview}>
+              <MessageContent
+                content={value}
+                isUser={false}
+                userName={previewUserName}
+                disableInterceptors
+              />
+            </div>
+          ) : showHighlight ? (
             <div className={s.highlightContainer}>
               <div className={s.highlightInner}>
                 <pre className={s.highlightPre} aria-hidden="true">{highlightNodes}{'\n'}</pre>
@@ -792,6 +939,7 @@ export default function ExpandedTextEditor({
                   value={value}
                   onChange={handleTextareaChange}
                   onSelect={handleTextareaSelect}
+                  onPointerDown={handleTextareaPointerDown}
                   onKeyDown={handleTextareaKeyDown}
                   onCompositionStart={handleCompositionStart}
                   onCompositionEnd={handleCompositionEnd}
@@ -807,6 +955,7 @@ export default function ExpandedTextEditor({
               value={value}
               onChange={handleTextareaChange}
               onSelect={handleTextareaSelect}
+              onPointerDown={handleTextareaPointerDown}
               onKeyDown={handleTextareaKeyDown}
               onCompositionStart={handleCompositionStart}
               onCompositionEnd={handleCompositionEnd}
@@ -935,6 +1084,7 @@ export const ExpandableTextarea = forwardRef<HTMLTextAreaElement, ExpandableText
           macros={macros}
           onRefreshMacros={onRefreshMacros}
           markdownOnly={markdownOnly}
+          sourceRef={textareaRef}
         />
       )}
     </div>

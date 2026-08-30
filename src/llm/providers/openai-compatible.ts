@@ -112,6 +112,15 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
     return url;
   }
 
+  /** Resolve the request URL separately from model/auth endpoints so providers
+   * can route opt-in chat features without changing their stable API base. */
+  protected chatCompletionsUrl(
+    apiUrl: string,
+    _request: GenerationRequest,
+  ): string {
+    return `${this.baseUrl(apiUrl)}/chat/completions`;
+  }
+
   /** Override to add provider-specific headers (e.g. OpenRouter's HTTP-Referer). */
   protected extraHeaders(_apiKey: string): Record<string, string> {
     return {};
@@ -136,7 +145,7 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
     apiUrl: string,
     request: GenerationRequest
   ): Promise<GenerationResponse> {
-    const url = `${this.baseUrl(apiUrl)}/chat/completions`;
+    const url = this.chatCompletionsUrl(apiUrl, request);
     const body = this.buildBody(request, false);
 
     const res = await fetchWithPreflightAbort(url, {
@@ -200,7 +209,7 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
     apiUrl: string,
     request: GenerationRequest
   ): AsyncGenerator<StreamChunk, void, unknown> {
-    const url = `${this.baseUrl(apiUrl)}/chat/completions`;
+    const url = this.chatCompletionsUrl(apiUrl, request);
     const body = this.buildBody(request, true);
 
     const res = await fetchWithPreflightAbort(url, {
@@ -290,8 +299,14 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
 
           if (finishReason) {
             // Emit accumulated tool calls on the finish chunk
+            // A few OpenAI-compatible proxies emit non-contiguous tool-call
+            // indexes (for example, their only call is indexed at 1). Arrays
+            // retain those holes through `.map()`, leaking `undefined` calls
+            // to consumers. Emit a dense array ordered by the provider index.
             const toolCalls: ToolCallResult[] | undefined = toolCallBuffer.length > 0
-              ? toolCallBuffer.map(tc => ({ name: tc.name, args: JSON.parse(tc.argsJson || "{}"), call_id: tc.id || crypto.randomUUID() }))
+              ? toolCallBuffer
+                  .filter((tc): tc is { id: string; name: string; argsJson: string } => !!tc)
+                  .map(tc => ({ name: tc.name, args: JSON.parse(tc.argsJson || "{}"), call_id: tc.id || crypto.randomUUID() }))
               : undefined;
             yield {
               token: content || "",
@@ -453,9 +468,19 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
     if (m.reasoning_details?.length) {
       return { reasoning_details: m.reasoning_details };
     }
-    return m.reasoning_content
+    return m.reasoning_content && this.replayReasoningContentOnPlainAssistant(m)
       ? { reasoning_content: m.reasoning_content }
       : {};
+  }
+
+  /**
+   * Most OpenAI-compatible relays retain native reasoning on ordinary history
+   * turns. Providers whose APIs only accept `reasoning_content` on tool-call
+   * continuations override this hook; the explicit tool-call branch above is
+   * intentionally unaffected.
+   */
+  protected replayReasoningContentOnPlainAssistant(_message: LlmMessage): boolean {
+    return true;
   }
 
   /** Keys that are internal to Lumiverse and should never be sent to any provider API. */

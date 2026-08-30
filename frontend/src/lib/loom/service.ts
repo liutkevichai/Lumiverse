@@ -222,6 +222,10 @@ function migratePreset(preset: LoomPreset): LoomPreset {
       block.categoryMode = block.marker === 'category'
         ? coerceCategoryMode(block.categoryMode)
         : null
+      // Blanket-disable snapshots only make sense on category blocks.
+      block.savedChildEnabled = block.marker === 'category' && isRecord(block.savedChildEnabled)
+        ? Object.fromEntries(Object.entries(block.savedChildEnabled).filter((entry): entry is [string, boolean] => typeof entry[0] === 'string' && typeof entry[1] === 'boolean'))
+        : undefined
       if (block.sealedSource === 'lumihub') {
         block.sealed = true
       }
@@ -280,6 +284,40 @@ function extractLumihubMeta(meta: Record<string, any>): Record<string, unknown> 
   return Object.keys(bag).length > 0 ? bag : null
 }
 
+/**
+ * New installs carry an authoritative source marker. Older LumiHub presets
+ * predate that marker, so a stored published version remains the compatibility
+ * fallback only when no explicit source has been recorded.
+ */
+export function shouldShowLumiHubPresetBadge(
+  preset: Pick<LoomPreset, 'presetVersion' | 'lumihubMeta'>,
+): boolean {
+  return getRemotePresetOrigin(preset) === 'lumihub'
+}
+
+export type RemotePresetOrigin = 'lumihub' | 'illarin'
+
+/** Resolve explicit provenance, retaining the legacy LumiHub-version fallback. */
+export function getRemotePresetOrigin(
+  preset: Pick<LoomPreset, 'presetVersion' | 'lumihubMeta'>,
+): RemotePresetOrigin | null {
+  const installSource = preset.lumihubMeta?._lumiverse_install_source
+  if (installSource === 'lumihub' || installSource === 'illarin') return installSource
+  if (typeof installSource === 'string') return null
+  return preset.presetVersion ? 'lumihub' : null
+}
+
+function markPresetAsLocalImport(preset: LoomPreset): LoomPreset {
+  const migrated = migratePreset(preset)
+  migrated.lumihubMeta = {
+    ...(migrated.lumihubMeta ?? {}),
+    // A file import is a local copy even when its export retains attribution.
+    // This prevents it from presenting as, or being updated as, a Hub install.
+    _lumiverse_install_source: 'local',
+  }
+  return migrated
+}
+
 function extractPassthroughMetadata(meta: Record<string, any>): Record<string, unknown> {
   const bag: Record<string, unknown> = {}
   for (const [key, value] of Object.entries(meta)) {
@@ -330,32 +368,41 @@ export function detectImportedPresetKind(data: unknown): 'loom' | 'legacy' | nul
 
 export function coerceImportedLoomPreset(data: unknown, fallbackName: string): LoomPreset {
   if (looksLikeWrappedLumiHubPresetData(data)) {
-    return migratePreset({
+    const wrappedCoverUrl = typeof data.cover_url === 'string'
+      ? data.cover_url
+      : typeof data.coverUrl === 'string'
+        ? data.coverUrl
+        : typeof data.preset.coverUrl === 'string'
+          ? data.preset.coverUrl
+          : typeof (data.preset as any).cover_url === 'string'
+            ? (data.preset as any).cover_url
+            : null
+    return markPresetAsLocalImport({
       ...data.preset,
       name: data.preset.name || fallbackName,
-      coverUrl: typeof data.cover_url === 'string' ? data.cover_url : null,
+      coverUrl: wrappedCoverUrl,
     } as LoomPreset)
   }
 
   if (looksLikeLoomPresetData(data)) {
-    return migratePreset({
+    return markPresetAsLocalImport({
       ...data,
       name: data.name || fallbackName,
     })
   }
 
   if (looksLikeBackendLoomPresetData(data)) {
-    return unmarshalPreset(data)
+    return markPresetAsLocalImport(unmarshalPreset(data))
   }
 
   if (looksLikeLegacyPresetData(data)) {
-    return importFromSTPreset(data, fallbackName)
+    return markPresetAsLocalImport(importFromSTPreset(data, fallbackName))
   }
 
   throw new Error('Unrecognized preset JSON format')
 }
 
-function looksLikeWrappedLumiHubPresetData(data: unknown): data is { preset: LoomPreset; cover_url?: unknown } {
+function looksLikeWrappedLumiHubPresetData(data: unknown): data is { preset: LoomPreset; cover_url?: unknown; coverUrl?: unknown } {
   return isRecord(data)
     && data.type === 'lumiverse_preset'
     && isRecord(data.preset)
@@ -441,6 +488,51 @@ export function toggleBlockWithCategoryRules(
     if (!categoryGroup.children.some((child) => child.id === block.id)) return block
     return { ...block, enabled: block.id === blockId }
   })
+}
+
+/**
+ * Blanket enable/disable for a category and all of its children — the
+ * distinct category-row control beside the marker's own eye toggle.
+ *
+ * Disabling snapshots every child's enabled state onto the category block
+ * (`savedChildEnabled`, persisted with the preset) and turns the marker and
+ * all children off. Enabling restores that exact snapshot — a mixed
+ * child state comes back mixed — instead of enabling everything
+ * indiscriminately. Children missing from the snapshot (added while the
+ * category was blanket-disabled) keep their current state. The result runs
+ * through category normalization so a radio category still ends with at
+ * most one active child even when the snapshot predates that rule.
+ */
+export function toggleCategoryWithChildren(
+  blocks: PromptBlock[],
+  categoryId: string,
+): PromptBlock[] {
+  const category = blocks.find((block) => block.id === categoryId && block.marker === 'category')
+  if (!category) return blocks
+
+  const group = computeGroups(blocks).find((candidate) => candidate.categoryBlock?.id === categoryId)
+  const childIds = new Set((group?.children ?? []).map((child) => child.id))
+  const disabling = category.enabled
+  const snapshot = category.savedChildEnabled
+
+  const toggled = blocks.map((block) => {
+    if (block.id === categoryId) {
+      return {
+        ...block,
+        enabled: !disabling,
+        // Capture on disable; consume on enable.
+        savedChildEnabled: disabling
+          ? Object.fromEntries((group?.children ?? []).map((child) => [child.id, child.enabled === true]))
+          : undefined,
+      }
+    }
+    if (!childIds.has(block.id)) return block
+    if (disabling) return { ...block, enabled: false }
+    if (!snapshot || !(block.id in snapshot)) return block
+    return { ...block, enabled: snapshot[block.id] === true }
+  })
+
+  return normalizeCategoryBlockState(toggled)
 }
 
 // ============================================================================
@@ -565,6 +657,13 @@ export function sanitizeLumiHubSealedBlocksForExport<T extends LoomPreset>(loom:
       }
     }),
   }
+}
+
+/** Remove the installation-local identity before a Loom preset leaves this library. */
+export function createPortableLoomPresetExport(loom: LoomPreset): Omit<LoomPreset, 'id'> {
+  const sanitized = sanitizeLumiHubSealedBlocksForExport(loom)
+  const { id: _localPresetId, ...portable } = sanitized
+  return portable
 }
 
 function getLumiHubSealedExportKey(block: PromptBlock, manifestKeys: Set<string>): string | null {
@@ -1140,6 +1239,7 @@ export function buildRegistryEntry(preset: LoomPreset): LoomRegistryEntry {
   return {
     name: preset.name,
     blockCount: preset.blocks?.length || 0,
+    coverUrl: preset.coverUrl ?? null,
     updatedAt: preset.updatedAt || Date.now(),
     isDefault: preset.isDefault || false,
   }

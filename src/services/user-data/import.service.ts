@@ -45,6 +45,7 @@ import {
   parseManifest,
   embeddingConfigsMatch,
   NDJSON_FORMAT_VERSION,
+  NDJSON_MAX_RECORD_BYTES,
   type ArchiveManifest,
   type ArchiveEmbeddingConfig,
 } from "./manifest";
@@ -68,17 +69,12 @@ const IMPORT_DISK_HEADROOM_BYTES = 64 * 1024 * 1024;
 /** Reject archives over this compressed size at upload time. */
 export const MAX_COMPRESSED_BYTES = 5 * 1024 * 1024 * 1024; // 5 GB
 
-/** Reject any NDJSON line longer than this in current-format archives. */
-const MAX_NDJSON_LINE_BYTES = 4 * 1024 * 1024;
-
 /**
- * Archives created before the fixed-window importer can contain a single
- * database row larger than the current 4 MiB line limit (typically an old
- * message, card field, or settings blob). Keep a larger, still bounded cap
- * for that historical data so it remains portable without weakening the
- * normal import path for newly-created archives.
+ * ZIP32 archives and format-1 ZIP64 archives predate a trustworthy record
+ * size contract. Accept their historical large rows up to the same bounded
+ * ceiling enforced by the current exporter.
  */
-const LEGACY_MAX_NDJSON_LINE_BYTES = 64 * 1024 * 1024;
+const LEGACY_MAX_NDJSON_LINE_BYTES = NDJSON_MAX_RECORD_BYTES;
 
 /** Read compressed archive data in fixed-size windows during extraction. */
 const ARCHIVE_READ_BYTES = 64 * 1024;
@@ -1512,13 +1508,18 @@ interface ApplyContext {
 }
 
 /**
- * New archives carry an explicit format marker and are limited to 4 MiB per
- * record. Archives without it predate the fixed-window export format and use
- * the compatibility ceiling. Both paths remain bounded.
+ * Schema-2 archives negotiate their enforced record ceiling explicitly.
+ * Schema-1 archives include both old ZIP32 files and format-1 ZIP64 exports
+ * whose claimed 4 MiB ceiling was not enforced, so both use the bounded
+ * compatibility ceiling.
  */
 function ndjsonLineLimitForManifest(manifest: ArchiveManifest | null): number {
-  if ((manifest?.ndjsonFormatVersion ?? 0) >= NDJSON_FORMAT_VERSION) {
-    return MAX_NDJSON_LINE_BYTES;
+  if (
+    (manifest?.schemaVersion ?? 0) >= 2 &&
+    manifest?.ndjsonFormatVersion === NDJSON_FORMAT_VERSION &&
+    manifest?.ndjsonMaxRecordBytes !== undefined
+  ) {
+    return manifest.ndjsonMaxRecordBytes;
   }
   return LEGACY_MAX_NDJSON_LINE_BYTES;
 }
@@ -1529,7 +1530,7 @@ function ndjsonLineLimitForManifest(manifest: ArchiveManifest | null): number {
  */
 async function* readNdjson(
   path: string,
-  maxLineBytes: number = MAX_NDJSON_LINE_BYTES,
+  maxLineBytes: number = NDJSON_MAX_RECORD_BYTES,
 ): AsyncGenerator<Record<string, any>> {
   const decoder = new TextDecoder();
   const buffer = new Uint8Array(ARCHIVE_READ_BYTES);
@@ -1754,8 +1755,9 @@ async function applySettingsTable(
 /**
  * Apply one NDJSON table from staging into the live SQLite database using
  * INSERT OR IGNORE. Filters row columns to match the live schema (so an
- * imported row from a newer/older Lumiverse still applies cleanly) and
- * forces user_id to the importing user.
+ * imported row from a newer/older Lumiverse still applies cleanly), omits
+ * absent columns so the current schema can supply their defaults, and forces
+ * user_id to the importing user.
  *
  * The `settings` table is special-cased to `applySettingsTable` above so
  * container-style settings (`imageGeneration`, etc.) deep-merge instead of
@@ -1788,22 +1790,45 @@ async function applyTable(
 
   const db = getDb();
   let batch: Record<string, any>[] = [];
+  const inserts = new Map<string, { columns: string[]; statement: ReturnType<typeof db.prepare> }>();
 
-  const colList = columns.map(ident).join(", ");
-  const placeholders = columns.map(() => "?").join(", ");
-  const insert = db.prepare(`INSERT OR IGNORE INTO ${ident(table)} (${colList}) VALUES (${placeholders})`);
+  const getInsert = (row: Record<string, any>) => {
+    // Preserve live-column order so rows with the same shape share a prepared
+    // statement even when their JSON properties arrived in a different order.
+    const presentColumns = columns.filter((column) =>
+      Object.prototype.hasOwnProperty.call(row, column)
+    );
+    const key = presentColumns.join("\0");
+    const cached = inserts.get(key);
+    if (cached) return cached;
+    if (presentColumns.length === 0) return null;
+    const colList = presentColumns.map(ident).join(", ");
+    const placeholders = presentColumns.map(() => "?").join(", ");
+    const prepared = {
+      columns: presentColumns,
+      statement: db.prepare(
+        `INSERT OR IGNORE INTO ${ident(table)} (${colList}) VALUES (${placeholders})`,
+      ),
+    };
+    inserts.set(key, prepared);
+    return prepared;
+  };
 
   const commitBatch = () => {
     if (batch.length === 0) return;
     const txn = db.transaction((rows: Record<string, any>[]) => {
       for (const row of rows) {
-        const values = columns.map((c) => {
+        const insert = getInsert(row);
+        if (!insert) {
+          skipped++;
+          continue;
+        }
+        const values = insert.columns.map((c) => {
           const v = row[c];
-          if (v === undefined) return null;
           if (typeof v === "boolean") return v ? 1 : 0;
           return v;
         });
-        const res = insert.run(...values);
+        const res = insert.statement.run(...values);
         if (res.changes > 0) imported++;
         else skipped++;
       }
@@ -2248,7 +2273,7 @@ async function runImportJob(job: ImportJob): Promise<void> {
     userId: job.userId,
     signal: job.abort.signal,
     job,
-    ndjsonLineBytes: MAX_NDJSON_LINE_BYTES,
+    ndjsonLineBytes: NDJSON_MAX_RECORD_BYTES,
   };
   emit(job, EventType.USER_IMPORT_PROGRESS, { phase: "start" });
 

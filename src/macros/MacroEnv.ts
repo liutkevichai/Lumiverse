@@ -160,8 +160,11 @@ export function buildEnv(ctx: BuildEnvContext): MacroEnv {
       messages: messages.map((m) => ({ content: m.content, name: m.name, is_user: m.is_user })),
       chatCreatedAt: (chat as any).created_at as number | undefined,
       characterTags: Array.isArray((character as any).tags) ? (character as any).tags : [],
-      lastMessageTime: lastMsg && typeof lastMsg.send_date === "number"
-        ? lastMsg.send_date * 1000
+      // Idle duration is relative to the most recent character/assistant
+      // message. A newly sent user message must not reset it to zero before
+      // the preset is assembled.
+      lastMessageTime: lastCharMsg && typeof lastCharMsg.send_date === "number"
+        ? lastCharMsg.send_date * 1000
         : undefined,
       userInput: ctx.userInput ?? "",
       // Persona outlets are intentionally separate from Lorebook outlets.
@@ -229,9 +232,35 @@ export async function withPromptBlockContext<T>(
 ): Promise<T> {
   const previous = env.promptBlock;
   env.promptBlock = { ...block };
+
+  // Prompt-variable values are stored by block, but the legacy macro surface
+  // ({{var::name}}, {{getvar::name}}, and {{.name}}) reads the flat local map.
+  // Temporarily overlay this block's own resolved bucket so a later block with
+  // a same-named variable cannot shadow the value while this block renders.
+  // Writes made by {{setvar::...}} during the block still update the overlay
+  // normally; the previous assembly scope is restored afterward.
+  const byBlock = env.extra.promptVariablesByBlock as
+    | Record<string, Record<string, string | number>>
+    | undefined;
+  const blockValues = block.id ? byBlock?.[block.id] : undefined;
+  const saved = new Map<string, { existed: boolean; value?: string }>();
+  if (blockValues) {
+    for (const [name, value] of Object.entries(blockValues)) {
+      saved.set(name, {
+        existed: env.variables.local.has(name),
+        value: env.variables.local.get(name),
+      });
+      env.variables.local.set(name, String(value));
+    }
+  }
+
   try {
     return await work();
   } finally {
+    for (const [name, prior] of saved) {
+      if (prior.existed) env.variables.local.set(name, prior.value ?? "");
+      else env.variables.local.delete(name);
+    }
     env.promptBlock = previous;
   }
 }

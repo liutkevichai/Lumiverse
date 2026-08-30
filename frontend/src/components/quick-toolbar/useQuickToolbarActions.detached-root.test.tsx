@@ -40,6 +40,7 @@ const state = {
   user: null,
   drawerTabs: [],
   extensionCommands: [],
+  extensions: [{ id: 'lumiverse_suite', identifier: 'lumiverse_suite', enabled: true, has_frontend: true }],
   inputBarActions: [] as InputBarActionState[],
   drawerOpen: false,
   drawerTab: '',
@@ -91,6 +92,7 @@ let useQuickToolbarActions: typeof import('./useQuickToolbarActions').useQuickTo
 let isQuickToolbarInputAction: typeof import('./useQuickToolbarActions').isQuickToolbarInputAction
 let quickToolbarInputActionId: typeof import('./useQuickToolbarActions').quickToolbarInputActionId
 let quickToolbarInputActionIcon: typeof import('./useQuickToolbarActions').quickToolbarInputActionIcon
+let quickToolbarInputActionLabel: typeof import('./useQuickToolbarActions').quickToolbarInputActionLabel
 
 function Probe() {
   const { actions, toggleAction } = useQuickToolbarActions()
@@ -109,7 +111,7 @@ function Probe() {
 
 beforeAll(async () => {
   ;({ createRoot } = await import('react-dom/client'))
-  ;({ useQuickToolbarActions, isQuickToolbarInputAction, quickToolbarInputActionId, quickToolbarInputActionIcon } = await import('./useQuickToolbarActions'))
+  ;({ useQuickToolbarActions, isQuickToolbarInputAction, quickToolbarInputActionId, quickToolbarInputActionIcon, quickToolbarInputActionLabel } = await import('./useQuickToolbarActions'))
 })
 
 afterEach(() => document.body.replaceChildren())
@@ -187,6 +189,8 @@ describe('useQuickToolbarActions detached host root', () => {
     expect(quickToolbarInputActionIcon(half)).toBe(Columns2)
     expect(quickToolbarInputActionIcon(enhanced)).toBe(Maximize2)
     expect(quickToolbarInputActionIcon(connectionsPicker)).toBe(Waypoints)
+    expect(quickToolbarInputActionLabel({ ...half, label: 'Open half editor' })).toBe('Half-Screen Lorebook Editor')
+    expect(quickToolbarInputActionLabel({ ...enhanced, label: 'Open enhanced workspace' })).toBe('Full-Screen Lorebook Editor')
   })
 
   test('offers the Connections Picker action and invokes its extension handler', async () => {
@@ -224,13 +228,26 @@ describe('useQuickToolbarActions detached host root', () => {
     })
     expect(opens).toBe(1)
 
+    state.extensions[0].enabled = false
+    await act(async () => {
+      host.querySelector<HTMLButtonElement>('[data-testid="run-connections"]')?.click()
+      await Promise.resolve()
+    })
+    expect(opens).toBe(1)
+
     await act(async () => root.unmount())
+    state.extensions[0].enabled = true
     state.inputBarActions = []
     state.quickToolbarSettings = {
       ...state.quickToolbarSettings,
       visibleTabIds: ['settings', 'command:action-home'],
       iconOrder: ['settings', 'command:action-home'],
     }
+  })
+  test('catalog source gates Suite-owned composer actions when the extension is unavailable', async () => {
+    const source = await Bun.file(new URL('./useQuickToolbarActions.ts', import.meta.url)).text()
+    expect(source).toContain("hasEnabledFrontendExtension(extensions, 'lumiverse_suite')")
+    expect(source).toContain('catalog.filter((action) => !isExtensionComposerActionId(action.id))')
   })
 })
 

@@ -10,6 +10,7 @@ import {
   GOOGLE_SEARCH_HANDLED_PARAMS,
   GOOGLE_SEARCH_PARAMETERS,
 } from "./google-search";
+import { splitLeadingSystemMessagePrefix } from "../system-message-prefix";
 
 // ── Service account JWT → OAuth2 access token ──────────────────────────────
 
@@ -300,6 +301,10 @@ export class GoogleVertexProvider implements LlmProvider {
         content += p.text || "";
       }
     }
+    const thoughtSignature = this.getNonToolThoughtSignature(
+      parts,
+      request.parameters?._replay_thought_signatures === true,
+    );
 
     const toolCalls = fnCalls.length > 0 ? fnCalls : undefined;
     const groundingMetadata = candidate?.groundingMetadata ?? data.groundingMetadata;
@@ -309,6 +314,7 @@ export class GoogleVertexProvider implements LlmProvider {
       reasoning: reasoning || undefined,
       finish_reason: toolCalls ? "tool_calls" : (candidate?.finishReason || "STOP"),
       tool_calls: toolCalls,
+      ...(thoughtSignature ? { thought_signature: thoughtSignature } : {}),
       usage: data.usageMetadata
         ? {
             prompt_tokens: data.usageMetadata.promptTokenCount || 0,
@@ -381,6 +387,10 @@ export class GoogleVertexProvider implements LlmProvider {
                 text += p.text || "";
               }
             }
+            const thoughtSignature = this.getNonToolThoughtSignature(
+              parts,
+              request.parameters?._replay_thought_signatures === true,
+            );
 
             const usage = data.usageMetadata
               ? {
@@ -395,12 +405,13 @@ export class GoogleVertexProvider implements LlmProvider {
 
             const toolCalls = fnCalls.length > 0 ? fnCalls : undefined;
 
-            if (text || reasoning || toolCalls) {
+            if (text || reasoning || toolCalls || thoughtSignature) {
               yield {
                 token: text,
                 reasoning: reasoning || undefined,
                 finish_reason: toolCalls ? "tool_calls" : (finishReason === "STOP" ? "stop" : undefined),
                 tool_calls: toolCalls,
+                ...(thoughtSignature ? { thought_signature: thoughtSignature } : {}),
                 usage,
               };
             } else if (finishReason || usage) {
@@ -468,12 +479,39 @@ export class GoogleVertexProvider implements LlmProvider {
 
   // ── Body building (mirrors GoogleProvider.buildBody) ──────────────────
 
-  private formatParts(m: LlmMessage, toolNameById: Map<string, string>): any[] {
-    if (typeof m.content === "string") return [{ text: m.content }];
-    return m.content.map((part: LlmMessagePart) => {
+  private getNonToolThoughtSignature(parts: any[], enabled: boolean): string | undefined {
+    if (!enabled) return undefined;
+    for (let index = parts.length - 1; index >= 0; index--) {
+      const part = parts[index];
+      if (!part?.functionCall && typeof part?.thoughtSignature === "string") {
+        return part.thoughtSignature;
+      }
+    }
+    return undefined;
+  }
+
+  private formatParts(
+    m: LlmMessage,
+    toolNameById: Map<string, string>,
+    replayThoughtSignatures: boolean,
+  ): any[] {
+    if (typeof m.content === "string") {
+      return [{
+        text: m.content,
+        ...(m.role === "assistant" && replayThoughtSignatures && m.thought_signature
+          ? { thoughtSignature: m.thought_signature }
+          : {}),
+      }];
+    }
+    const formatted = m.content.map((part: LlmMessagePart) => {
       switch (part.type) {
         case "text":
-          return { text: part.text };
+          return {
+            text: part.text,
+            ...(m.role === "assistant" && replayThoughtSignatures && part.thought_signature
+              ? { thoughtSignature: part.thought_signature }
+              : {}),
+          };
         case "image":
         case "audio":
           return { inlineData: { mimeType: part.mime_type, data: part.data } };
@@ -491,6 +529,13 @@ export class GoogleVertexProvider implements LlmProvider {
           return { text: "" };
       }
     });
+    if (m.role === "assistant" && replayThoughtSignatures && m.thought_signature) {
+      const target = [...formatted].reverse().find((part) =>
+        Object.hasOwn(part, "text") || Object.hasOwn(part, "inlineData"),
+      );
+      if (target) target.thoughtSignature = m.thought_signature;
+    }
+    return formatted;
   }
 
   private buildToolNameMap(messages: readonly LlmMessage[]): Map<string, string> {
@@ -504,7 +549,7 @@ export class GoogleVertexProvider implements LlmProvider {
     return map;
   }
 
-  private static readonly INTERNAL_PARAMS = new Set(["max_context_length", "_include_usage", "_streaming"]);
+  private static readonly INTERNAL_PARAMS = new Set(["max_context_length", "_include_usage", "_streaming", "_replay_thought_signatures"]);
 
   private static readonly HANDLED_PARAMS = new Set([
     "temperature", "max_tokens", "top_p", "top_k", "stop", "thinkingConfig",
@@ -515,9 +560,13 @@ export class GoogleVertexProvider implements LlmProvider {
   private buildBody(request: GenerationRequest): any {
     const params = request.parameters || {};
 
-    const systemMessages = request.messages.filter((m) => m.role === "system");
-    const otherMessages = request.messages.filter((m) => m.role !== "system");
+    // Vertex exposes a single systemInstruction. Preserve any system message
+    // after the leading prefix in-place as user-role content so configured
+    // in-history/post-history depth remains meaningful.
+    const { prefix: systemMessages, remainder: otherMessages } =
+      splitLeadingSystemMessagePrefix(request.messages);
     const toolNameById = this.buildToolNameMap(request.messages);
+    const replayThoughtSignatures = params._replay_thought_signatures === true;
     const functionTools = request.tools ?? [];
     const hasFunctionDeclarations = functionTools.length > 0;
     const googleSearchTool = buildGoogleSearchTool(
@@ -530,7 +579,7 @@ export class GoogleVertexProvider implements LlmProvider {
     const body: any = {
       contents: otherMessages.map((m) => ({
         role: m.role === "assistant" ? "model" : "user",
-        parts: this.formatParts(m, toolNameById),
+        parts: this.formatParts(m, toolNameById, replayThoughtSignatures),
       })),
     };
 

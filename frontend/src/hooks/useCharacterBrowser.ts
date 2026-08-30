@@ -144,12 +144,28 @@ export function useCharacterBrowser() {
     const offCreated = wsClient.on(EventType.CHARACTER_CREATED, refresh)
     const offEdited = wsClient.on(EventType.CHARACTER_EDITED, refresh)
     const offDeleted = wsClient.on(EventType.CHARACTER_DELETED, refresh)
+    const offLibraryChanged = wsClient.on(EventType.CHARACTER_LIBRARY_CHANGED, refresh)
     return () => {
       offCreated()
       offEdited()
       offDeleted()
+      offLibraryChanged()
     }
   }, [])
+
+  // The sort key changes when a one-on-one chat is created or deleted. Group
+  // chats are ignored by this sort at the API layer, so their refreshes are
+  // harmless and keep the event handling straightforward.
+  useEffect(() => {
+    if (sortField !== 'most_chats') return
+    const refresh = () => setFetchVersion((v) => v + 1)
+    const offCreated = wsClient.on(EventType.CHAT_CREATED, refresh)
+    const offDeleted = wsClient.on(EventType.CHAT_DELETED, refresh)
+    return () => {
+      offCreated()
+      offDeleted()
+    }
+  }, [sortField])
 
   // ─── Server-side paginated summaries (the fast path) ────────────────────
   const [browserItems, setBrowserItems] = useState<CharacterSummary[]>([])
@@ -525,15 +541,17 @@ export function useCharacterBrowser() {
         setBrowserTotal((t) => Math.max(0, t - result.deleted.length))
       } catch {
         let done = 0
+        const deleted: string[] = []
         for (const id of ids) {
           try {
             await charactersApi.delete(id)
+            deleted.push(id)
             done++
           } catch { /* skip */ }
           setBatchDeleteProgress({ done, total: ids.length })
         }
-        removeCharacters(ids)
-        setBrowserTotal((t) => Math.max(0, t - ids.length))
+        removeCharacters(deleted)
+        setBrowserTotal((t) => Math.max(0, t - deleted.length))
       }
       setBatchMode(false)
       setBatchDeleteProgress(null)

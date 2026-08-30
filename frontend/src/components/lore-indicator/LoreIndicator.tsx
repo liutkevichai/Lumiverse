@@ -19,7 +19,7 @@ import {
 } from '@/lib/uiProductivityDefaults'
 import { layoutElementSize, layoutViewportSize, toLayoutDelta } from '@/lib/zoomLayerGeometry'
 import type { LoreIndicatorSettings } from '@/types/store'
-import LoreIndicatorPanel from './LoreIndicatorPanel'
+import LoreIndicatorPanel, { openLoreEntry } from './LoreIndicatorPanel'
 import {
   clampLoreFloatingPosition,
   clampLoreRect,
@@ -363,7 +363,13 @@ export default function LoreIndicator({ open: controlledOpen, onOpenChange }: Lo
           <div
             ref={paletteRef}
             className={styles.paletteDialog}
-            style={{ ...commonStyle, ...paletteRect }}
+            style={{
+              ...commonStyle,
+              left: paletteRect.x,
+              top: paletteRect.y,
+              width: paletteRect.width,
+              height: paletteRect.height,
+            }}
           >
             <div
               className={styles.paletteDragBar}
@@ -540,8 +546,12 @@ function V4Strip({
             activateOnClick
             groupBy={settings.v4GroupBy ?? 'lorebook'}
             previewCount={settings.v4BookPreviewCount ?? 4}
-            onOpenFullView={() => {
+            onOpenFullView={(entry) => {
               setOpen(false)
+              if (entry) {
+                openLoreEntry(entry)
+                return
+              }
               useStore.getState().openDrawer('lorebook')
             }}
           />
