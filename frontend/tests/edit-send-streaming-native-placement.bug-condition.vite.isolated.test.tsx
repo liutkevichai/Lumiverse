@@ -462,7 +462,7 @@ const hookStoreState = {
     find_regex: 'chunk',
     replace_string: 'resolved',
     flags: 'g',
-    placement: [],
+    placement: ['ai_output'],
     min_depth: null,
     max_depth: null,
     trim_strings: [],
@@ -478,7 +478,10 @@ const hookStoreState = {
 }
 mock.module('@/store', () => ({ useStore: (selector: (state: typeof hookStoreState) => unknown) => selector(hookStoreState) }))
 mock.module('@/lib/chatDisplaySettle', () => ({ trackInitialDisplayResolve: <T,>(promise: Promise<T>) => promise }))
-mock.module('@/lib/regex/pipeline', () => ({ applyDisplayRegexTiered }))
+mock.module('@/lib/regex/pipeline', () => ({
+  applyDisplayRegexTiered,
+  canApplyDisplayRegexInWorker: () => true,
+}))
 mock.module('@/api/macros', () => ({ resolveMacrosBatch: async ({ templates }: { templates: Record<string, string> }) => ({ resolved: templates }) }))
 mock.module('@/lib/spindle/display-resolver-registry', () => ({
   isDisplayChatOwned: () => true,
@@ -495,19 +498,9 @@ test('Property 1 streaming matrix: pending same-message resolutions never expose
   const { act, createElement } = await import('react')
   const { createRoot } = await import('react-dom/client')
   const {
-    resetDisplayCoalesceForTests,
-    setDisplayCoalesceDepsForTests,
+    resetDisplayRegexCachesForTests,
     useDisplayRegex,
   } = await import('../src/hooks/useDisplayRegex')
-  let now = 1_000
-  setDisplayCoalesceDepsForTests({
-    now: () => (now += 1_000),
-    scheduleTimer: (fn) => {
-      let active = true
-      queueMicrotask(() => { if (active) fn() })
-      return () => { active = false }
-    },
-  })
 
   const host = document.createElement('div')
   document.body.append(host)
@@ -575,7 +568,7 @@ test('Property 1 streaming matrix: pending same-message resolutions never expose
   } finally {
     await act(async () => root.unmount())
     host.remove()
-    resetDisplayCoalesceForTests()
+    resetDisplayRegexCachesForTests()
     pendingRegexResults.clear()
   }
 })

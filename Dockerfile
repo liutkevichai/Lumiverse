@@ -6,6 +6,8 @@
 # floating `canary-slim` tag here: its lockfile behavior changed between
 # scheduled builds and made `--frozen-lockfile` fail nondeterministically.
 # Supports: linux/amd64, linux/arm64
+# Keep COPY sources explicit: desktop/ is a native Tauri app and must not enter
+# any image stage. Docker workflows also exclude it from their checkout.
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -98,6 +100,9 @@ COPY src/ ./src/
 # migration).
 COPY scripts/ ./scripts/
 
+# User guide docs for built-in help
+COPY user-docs/ ./user-docs/
+
 # Create data directory with correct ownership
 RUN mkdir -p /app/data && chown -R bun:bun /app/data
 
@@ -127,7 +132,7 @@ EXPOSE 7860
 # as incoming activity, which resets the idle timer and prevents the container
 # from ever sleeping. Railway has its own proxy-level health detection.
 # HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-#   CMD bun -e "fetch('http://localhost:' + (Bun.env.PORT || '7860')).then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+#   CMD bun run src/healthcheck.ts
 
 # Run as non-root
 USER bun

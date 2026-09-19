@@ -17,7 +17,9 @@ import {
   stopServer,
   killServerSync,
   setIPCHandler,
+  setLogSessionStartHandler,
   setStateChangeHandler,
+  type ServerLogSession,
   type ServerState,
 } from "./runner/server-manager.js";
 import { handleIPCMessage, setDevMode, setLastUpdateState, getLastUpdateState } from "./runner/ipc-handler.js";
@@ -28,7 +30,7 @@ import { UPDATE_CHECK_INTERVAL_MS } from "./runner/lib/constants.js";
 import { goodbyeLines } from "./runner/goodbye-lines.js";
 import { attachHeadlessBridge, type HeadlessBridge } from "./runner/headless-bridge.js";
 
-function pickRandomGoodbyeLine(lines: string[]): string {
+function pickRandomGoodbyeLine(lines: readonly string[]): string {
   if (lines.length === 0) return "Goodbye.";
   const index = Math.floor(Math.random() * lines.length);
   return lines[index] ?? "Goodbye.";
@@ -113,6 +115,19 @@ function openBrowser(url: string): void {
   }
 }
 
+function openServerBrowser(): void {
+  const config = readEnvConfig();
+  if (!config.browserUrl) {
+    console.log(
+      `${C.dim}[runner]${C.reset} ${C.yellow}Direct TLS is enabled, but its SAN hostname cannot be inferred. `
+        + `Set AUTH_BASE_URL to the public HTTPS origin or open that origin manually.${C.reset}`,
+    );
+    return;
+  }
+  console.log(`${C.dim}[runner]${C.reset} Opening ${config.browserUrl}...`);
+  openBrowser(config.browserUrl);
+}
+
 // ─── Keyboard input ─────────────────────────────────────────────────────────
 
 function setupKeyboard(): void {
@@ -133,10 +148,7 @@ function setupKeyboard(): void {
 
     // 'o'/'O' — open browser
     if (key === "o" || key === "O") {
-      const config = readEnvConfig();
-      const url = `http://localhost:${config.port}`;
-      console.log(`${C.dim}[runner]${C.reset} Opening ${url}...`);
-      openBrowser(url);
+      openServerBrowser();
       return;
     }
   });
@@ -147,6 +159,10 @@ function setupKeyboard(): void {
 let shuttingDown = false;
 let openedAtStartup = false;
 let bridge: HeadlessBridge | null = null;
+
+setLogSessionStartHandler((session: ServerLogSession) => {
+  bridge?.startLogSession(session);
+});
 
 async function shutdown(): Promise<void> {
   if (shuttingDown) return;
@@ -179,10 +195,7 @@ setStateChangeHandler((state: ServerState) => {
       console.log(`${C.dim}[${ts}]${C.reset} ${C.green}Server is running.${C.reset}`);
       if (autoOpen && !openedAtStartup) {
         openedAtStartup = true;
-        const config = readEnvConfig();
-        const url = `http://localhost:${config.port}`;
-        console.log(`${C.dim}[runner]${C.reset} Opening ${url}...`);
-        openBrowser(url);
+        openServerBrowser();
       }
       break;
     case "crashed":

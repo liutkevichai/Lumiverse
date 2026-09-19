@@ -147,7 +147,7 @@ export function resolveEffectiveApiUrl(profile: { provider: string; api_url?: st
   if (profile.provider === "zai") {
     return resolveZaiApiUrl(url, profile.metadata?.use_coding_plan_endpoint === true);
   }
-  if (profile.provider === "google_vertex") {
+  if (profile.provider === "google_vertex" || profile.provider === "google_vertex_tts") {
     const region = profile.metadata?.vertex_region;
     // Per Google's @google/genai SDK: `global` routes through the
     // un-prefixed host, regional routes through `{region}-aiplatform`.
@@ -577,6 +577,7 @@ export async function deleteConnection(userId: string, id: string): Promise<bool
     // Cleanup the connection's secret
     secretsSvc.deleteSecret(userId, connectionSecretKey(id));
     settingsSvc.deleteSetting(userId, `presetProfile:connection:${id}`);
+    eventBus.emit(EventType.PRESET_PROFILE_CHANGED, { key: `presetProfile:connection:${id}`, binding: null }, userId);
   }
   return deleted;
 }

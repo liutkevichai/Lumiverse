@@ -7,8 +7,11 @@ import { charactersApi } from '@/api/characters'
 import { worldBooksApi } from '@/api/world-books'
 import { toast } from '@/lib/toast'
 import { formatTagLibraryImportToastMessage } from '@/lib/tagLibraryImportToast'
+import { filesFromDesktopDrop, isSupportedCharacterDropPath } from '@/lib/desktop-file-drop'
+import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { useStore } from '@/store'
 import CharacterToolbar from './character-browser/CharacterToolbar'
+import ChubExpressionBackfillBanner from './character-browser/ChubExpressionBackfillBanner'
 import TagFilter from './character-browser/TagFilter'
 import BatchBar from './character-browser/BatchBar'
 import FavoritesSlider from './character-browser/FavoritesSlider'
@@ -240,6 +243,51 @@ export default function CharacterBrowser() {
   const [dragging, setDragging] = useState(false)
   const [tagLibraryImporting, setTagLibraryImporting] = useState(false)
   const dragCounterRef = useRef(0)
+  const importDroppedFiles = browser.importFiles
+
+  // Tauri owns OS file-drop events and reports paths instead of populating the
+  // browser DataTransfer. Read only those one-use native drop grants, convert
+  // them to File objects, and reuse the browser/PWA importer unchanged.
+  useEffect(() => {
+    if (!('__TAURI_INTERNALS__' in window)) return
+    let disposed = false
+    let unlisten: (() => void) | undefined
+
+    void getCurrentWebview().onDragDropEvent(({ payload }) => {
+      if (payload.type === 'enter') {
+        setDragging(payload.paths.some(isSupportedCharacterDropPath))
+        return
+      }
+      if (payload.type === 'leave') {
+        setDragging(false)
+        return
+      }
+      if (payload.type !== 'drop') return
+
+      setDragging(false)
+      const supportedPaths = payload.paths.filter(isSupportedCharacterDropPath)
+      if (supportedPaths.length === 0) return
+      void filesFromDesktopDrop(supportedPaths)
+        .then((files) => {
+          if (!disposed && files.length > 0) void importDroppedFiles(files)
+        })
+        .catch((error) => {
+          if (disposed) return
+          console.error('[CharacterBrowser] Failed to read native dropped files:', error)
+          toast.error(t('characterBrowser.desktopDropReadFailed'))
+        })
+    }).then((stop) => {
+      if (disposed) stop()
+      else unlisten = stop
+    }).catch((error) => {
+      console.warn('[CharacterBrowser] Native file-drop listener unavailable:', error)
+    })
+
+    return () => {
+      disposed = true
+      unlisten?.()
+    }
+  }, [importDroppedFiles, t])
 
   // Drag and drop handlers
   const handleDragEnter = useCallback((e: React.DragEvent) => {
@@ -332,6 +380,7 @@ export default function CharacterBrowser() {
       onDragOver={handleDragOver}
       onDrop={handleDrop}
     >
+      <ChubExpressionBackfillBanner />
       <CharacterToolbar
         searchQuery={browser.searchQuery}
         onSearchChange={browser.setSearchQuery}

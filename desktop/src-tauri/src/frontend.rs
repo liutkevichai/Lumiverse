@@ -1,10 +1,26 @@
 //! Frontend window — a native WebView loading the local Lumiverse server.
 
-use std::{path::PathBuf, sync::Mutex};
-use tauri::{
-    AppHandle, Emitter, LogicalSize, Manager, State, WebviewUrl, WebviewWindow,
-    WebviewWindowBuilder, WindowEvent,
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
+    time::{Duration, Instant},
 };
+use tauri::{
+    ipc::Response, webview::DownloadEvent, AppHandle, Emitter, LogicalSize, Manager, State,
+    Webview, WebviewEvent, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
+};
+
+/// Emit a native marker after the hidden webview has created its tray icon.
+/// Besides being useful in terminal diagnostics, CI uses this to distinguish
+/// a working tray from a startup-error dialog that merely remains open.
+#[tauri::command]
+pub fn desktop_startup_ready() {
+    eprintln!("[desktop-startup] tray ready");
+}
 
 #[cfg(target_os = "macos")]
 fn high_refresh_webview_configuration(
@@ -90,17 +106,219 @@ fn enforce_frontend_content_corner_radius(window: &WebviewWindow) -> Result<(), 
 }
 
 const FRONTEND_LABEL: &str = "frontend";
-const WIDGET_POC_LABEL: &str = "widget-poc";
 const FRONTEND_TITLE: &str = "Lumiverse";
 const DEFAULT_WIDTH: u32 = 1200;
 const DEFAULT_HEIGHT: u32 = 800;
+const FRONTEND_TITLEBAR_HEIGHT: u32 = 36;
 const RESTORE_MARGIN: i32 = 24;
 const FRONTEND_STARTUP_APPEARANCE_FILE: &str = "frontend_startup_appearance.json";
+static NEXT_FRONTEND_POPUP_ID: AtomicU64 = AtomicU64::new(1);
+const FRONTEND_DROP_AUTHORIZATION_TTL: Duration = Duration::from_secs(120);
+
+#[derive(Default)]
+pub struct FrontendDropState {
+    /// Native drag events are the authority for filesystem access. The remote
+    /// frontend may read only supported files the user just dragged into its
+    /// own WebView, and each authorization is consumed on first read.
+    paths: Mutex<HashMap<PathBuf, Instant>>,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopDownloadEvent {
+    phase: &'static str,
+    id: String,
+    file_name: String,
+    success: Option<bool>,
+}
+
+fn supported_frontend_drop_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "json" | "png" | "charx" | "jpg" | "jpeg"
+            )
+        })
+}
+
+fn canonical_supported_drop_path(path: &std::path::Path) -> Option<PathBuf> {
+    if !supported_frontend_drop_path(path) {
+        return None;
+    }
+    let canonical = path.canonicalize().ok()?;
+    canonical.is_file().then_some(canonical)
+}
+
+/// Mirror Tauri's native drag lifecycle into a short-lived, one-use file-read
+/// grant. Tauri's drag event reaches this hook before its matching JavaScript
+/// event is delivered to the WebView.
+pub fn track_frontend_drop_event(webview: &Webview, event: &WebviewEvent) {
+    if webview.label() != FRONTEND_LABEL {
+        return;
+    }
+    let WebviewEvent::DragDrop(event) = event else {
+        return;
+    };
+    let state = webview.state::<FrontendDropState>();
+    let mut paths = state.paths.lock().unwrap();
+    let now = Instant::now();
+    paths
+        .retain(|_, granted_at| now.duration_since(*granted_at) <= FRONTEND_DROP_AUTHORIZATION_TTL);
+
+    match event {
+        tauri::DragDropEvent::Enter { paths: entered, .. }
+        | tauri::DragDropEvent::Drop { paths: entered, .. } => {
+            paths.clear();
+            paths.extend(
+                entered
+                    .iter()
+                    .filter_map(|path| canonical_supported_drop_path(path))
+                    .map(|path| (path, now)),
+            );
+        }
+        tauri::DragDropEvent::Leave => paths.clear(),
+        tauri::DragDropEvent::Over { .. } => {}
+        _ => {}
+    }
+}
+
+/// Read one file from the most recent native drop as a binary IPC response.
+/// The path must have been granted by `track_frontend_drop_event`, is limited
+/// to character-card formats, and is removed before any filesystem read.
+#[tauri::command]
+pub async fn read_frontend_drop_file(
+    window: WebviewWindow,
+    state: State<'_, FrontendDropState>,
+    path: PathBuf,
+) -> Result<Response, String> {
+    if window.label() != FRONTEND_LABEL {
+        return Err("Only the Lumiverse frontend can read dropped files".into());
+    }
+    let canonical = canonical_supported_drop_path(&path)
+        .ok_or_else(|| "Dropped file is missing or unsupported".to_string())?;
+    {
+        let mut authorized = state.paths.lock().unwrap();
+        let now = Instant::now();
+        authorized.retain(|_, granted_at| {
+            now.duration_since(*granted_at) <= FRONTEND_DROP_AUTHORIZATION_TTL
+        });
+        if authorized.remove(&canonical).is_none() {
+            return Err("Dropped file is no longer authorized".into());
+        }
+    }
+
+    let bytes = tauri::async_runtime::spawn_blocking(move || std::fs::read(canonical))
+        .await
+        .map_err(|error| format!("Could not schedule dropped-file read: {error}"))?
+        .map_err(|error| format!("Could not read dropped file: {error}"))?;
+    Ok(Response::new(bytes))
+}
+
+fn download_file_name(url: &tauri::Url, path: Option<&std::path::Path>) -> String {
+    path.and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .or_else(|| {
+            url.path_segments()
+                .and_then(|mut segments| segments.next_back())
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or("download")
+        .to_string()
+}
+
+fn report_frontend_download(webview: Webview, event: DownloadEvent<'_>) -> bool {
+    let payload = match event {
+        DownloadEvent::Requested { url, destination } => DesktopDownloadEvent {
+            phase: "started",
+            id: url.to_string(),
+            file_name: download_file_name(&url, Some(destination)),
+            success: None,
+        },
+        DownloadEvent::Finished { url, path, success } => DesktopDownloadEvent {
+            phase: "finished",
+            id: url.to_string(),
+            file_name: download_file_name(&url, path.as_deref()),
+            success: Some(success),
+        },
+        _ => return true,
+    };
+    let _ = webview.emit("desktop-download", payload);
+    true
+}
+
+fn is_frontend_popup_label(label: &str) -> bool {
+    label.strip_prefix("frontend-popup-").is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+/// Destroy the invoking SSO popup without granting remote content generic
+/// access to other native windows. Browser `window.close()` is not a reliable
+/// lifecycle signal for Rust-created WebviewWindows on every platform.
+#[tauri::command]
+pub fn close_current_sso_popup(window: WebviewWindow) -> Result<(), String> {
+    if !is_frontend_popup_label(window.label()) {
+        return Err("Only a Lumiverse sign-in popup may invoke this command".into());
+    }
+    window.destroy().map_err(|error| error.to_string())
+}
 
 #[derive(Default)]
 pub struct FrontendState {
     /// Persisted window bounds: (x, y, width, height) or None for defaults.
     bounds: Mutex<Option<(i32, i32, u32, u32)>>,
+}
+
+/// Native window-presence snapshot consumed by the remote frontend. Browser
+/// page visibility cannot distinguish a hidden-to-tray window from a window
+/// that is merely covered by another app, so the desktop host owns these
+/// signals and lets the frontend reduce them to its active/away status.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrontendPresence {
+    state: &'static str,
+    visible: bool,
+    minimized: bool,
+    focused: bool,
+    active: bool,
+}
+
+fn frontend_presence_for_window<R: tauri::Runtime>(
+    window: &tauri::WebviewWindow<R>,
+) -> FrontendPresence {
+    let visible = window.is_visible().unwrap_or(false);
+    let minimized = window.is_minimized().unwrap_or(false);
+    let focused = window.is_focused().unwrap_or(false);
+    let state = if !visible {
+        "hidden"
+    } else if minimized {
+        "minimized"
+    } else if focused {
+        "foreground"
+    } else {
+        "background"
+    };
+
+    FrontendPresence {
+        state,
+        visible,
+        minimized,
+        focused,
+        active: visible && !minimized && focused,
+    }
+}
+
+pub fn emit_frontend_presence<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    window: &tauri::WebviewWindow<R>,
+) {
+    let _ = app.emit_to(
+        FRONTEND_LABEL,
+        "desktop-presence-changed",
+        frontend_presence_for_window(window),
+    );
 }
 
 /// A small, local-only cache written by the trusted frontend after it has
@@ -117,6 +335,8 @@ pub struct FrontendStartupAppearance {
     dark: bool,
     blur_intensity: String,
     native_color: [u8; 3],
+    #[serde(default)]
+    high_refresh: bool,
 }
 
 impl Default for FrontendStartupAppearance {
@@ -130,16 +350,9 @@ impl Default for FrontendStartupAppearance {
             dark: true,
             blur_intensity: "balanced".into(),
             native_color: [10, 8, 18],
+            high_refresh: false,
         }
     }
-}
-
-/// State owned by the native host rather than the widget WebView. Once a
-/// window ignores cursor events it cannot receive the click that would turn
-/// them back on, so the tray restores input for this proof of concept.
-#[derive(Default)]
-pub struct WidgetPocState {
-    click_through: Mutex<bool>,
 }
 
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
@@ -171,15 +384,14 @@ fn emit_widget_popout_state(
     widget_id: String,
     popped_out: bool,
 ) -> Result<(), String> {
-    app.emit_to(
-        "main",
-        "desktop-widget-popout-state",
-        DesktopWidgetPopoutState {
-            id: widget_id,
-            popped_out,
-        },
-    )
-    .map_err(|error| error.to_string())
+    let state = DesktopWidgetPopoutState {
+        id: widget_id,
+        popped_out,
+    };
+    app.emit_to("main", "desktop-widget-popout-state", state.clone())
+        .map_err(|error| error.to_string())?;
+    app.emit_to(FRONTEND_LABEL, "desktop-widget-popout-state", state)
+        .map_err(|error| error.to_string())
 }
 
 fn extension_widget_label(widget: &DesktopWidgetDescriptor) -> String {
@@ -259,6 +471,7 @@ fn save_frontend_startup_appearance<R: tauri::Runtime>(
 
 fn frontend_startup_shell_script(appearance: &FrontendStartupAppearance) -> String {
     let snapshot = serde_json::to_string(appearance).unwrap_or_else(|_| "{}".into());
+    let titlebar_height = FRONTEND_TITLEBAR_HEIGHT;
     format!(
         r#"(() => {{
   const snapshot = {snapshot};
@@ -268,6 +481,7 @@ fn frontend_startup_shell_script(appearance: &FrontendStartupAppearance) -> Stri
   set('--lumiverse-startup-border', snapshot.border);
   set('--lumiverse-startup-text-muted', snapshot.textMuted);
   set('--lumiverse-startup-primary', snapshot.primary);
+  root.setAttribute('data-tauri-desktop', '');
   root.setAttribute('data-lumiverse-startup-shell', '');
 
   const mount = () => {{
@@ -275,18 +489,33 @@ fn frontend_startup_shell_script(appearance: &FrontendStartupAppearance) -> Stri
     const shell = document.createElement('div');
     shell.id = 'lumiverse-startup-shell';
     shell.setAttribute('aria-hidden', 'true');
-    shell.innerHTML = '<div class="lumiverse-startup-titlebar"><span class="lumiverse-startup-dot"></span><span>Lumiverse</span><span class="lumiverse-startup-controls"><i></i><i></i><i></i></span></div><div class="lumiverse-startup-pulse"></div>';
+    shell.innerHTML = '<div class="lumiverse-startup-titlebar"><div class="lumiverse-startup-drag" data-tauri-drag-region="deep"><span class="lumiverse-startup-dot"></span><span>Lumiverse</span></div><span class="lumiverse-startup-controls"><i></i><i></i><i></i></span></div><div class="lumiverse-startup-pulse"></div>';
     const style = document.createElement('style');
-    style.textContent = '#lumiverse-startup-shell{{position:fixed;inset:0;z-index:2147483647;pointer-events:none;background:var(--lumiverse-startup-background,#0a0812);color:var(--lumiverse-startup-text-muted,rgba(255,255,255,.64));font:600 12px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:.02em}}.lumiverse-startup-titlebar{{height:36px;box-sizing:border-box;display:flex;align-items:center;justify-content:center;gap:8px;border-bottom:1px solid var(--lumiverse-startup-border,rgba(255,255,255,.08));background:color-mix(in srgb,var(--lumiverse-startup-background,#0a0812) 86%,transparent)}}.lumiverse-startup-dot{{width:8px;height:8px;border-radius:999px;background:var(--lumiverse-startup-primary,#9370db);box-shadow:0 0 0 3px color-mix(in srgb,var(--lumiverse-startup-primary,#9370db) 12%,transparent)}}.lumiverse-startup-controls{{position:absolute;right:12px;display:flex;gap:7px}}.lumiverse-startup-controls i{{display:block;width:11px;height:11px;border-radius:999px;border:1px solid var(--lumiverse-startup-border,rgba(255,255,255,.12))}}.lumiverse-startup-pulse{{position:absolute;top:50%;left:50%;width:42px;height:42px;margin:-21px;border-radius:50%;border:2px solid var(--lumiverse-startup-primary,#9370db);border-left-color:transparent;opacity:.55;animation:lumiverse-startup-spin .9s linear infinite}}@keyframes lumiverse-startup-spin{{to{{transform:rotate(360deg)}}}}';
+    style.textContent = '#lumiverse-startup-shell{{position:fixed;inset:0;z-index:2147483647;pointer-events:none;background:var(--lumiverse-startup-background,#0a0812);color:var(--lumiverse-startup-text-muted,rgba(255,255,255,.64));font:600 12px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:.02em}}.lumiverse-startup-titlebar{{position:relative;height:{titlebar_height}px;box-sizing:border-box;border-bottom:1px solid var(--lumiverse-startup-border,rgba(255,255,255,.08));background:color-mix(in srgb,var(--lumiverse-startup-background,#0a0812) 86%,transparent)}}.lumiverse-startup-drag{{position:absolute;inset:1px 1px 0;display:flex;align-items:center;justify-content:center;gap:8px;pointer-events:auto;cursor:grab;user-select:none;-webkit-user-select:none}}.lumiverse-startup-dot{{width:8px;height:8px;border-radius:999px;background:var(--lumiverse-startup-primary,#9370db);box-shadow:0 0 0 3px color-mix(in srgb,var(--lumiverse-startup-primary,#9370db) 12%,transparent)}}.lumiverse-startup-controls{{position:absolute;top:50%;right:12px;display:flex;gap:7px;transform:translateY(-50%)}}.lumiverse-startup-controls i{{display:block;width:11px;height:11px;border-radius:999px;border:1px solid var(--lumiverse-startup-border,rgba(255,255,255,.12))}}.lumiverse-startup-pulse{{position:absolute;top:50%;left:50%;width:42px;height:42px;margin:-21px;border-radius:50%;border:2px solid var(--lumiverse-startup-primary,#9370db);border-left-color:transparent;opacity:.55;animation:lumiverse-startup-spin .9s linear infinite}}@keyframes lumiverse-startup-spin{{to{{transform:rotate(360deg)}}}}';
     document.head.appendChild(style);
     document.body.appendChild(shell);
+    // The shell must lift on every route the frontend can land on, not just
+    // the authenticated one. /login, /sso-complete and the Stream Deck
+    // handoff render as siblings of <App> in the router, so they never
+    // produce [data-app-root] — waiting on it alone leaves an opaque overlay
+    // over a working login form forever. Any mounted React root means the
+    // page is up: the app commits its first render in one pass, so this
+    // cannot uncover a half-drawn tree. Keep a wall-clock failsafe as well,
+    // so no future route can trap the window again.
+    const mounted = () =>
+      !!document.querySelector('[data-app-root]') ||
+      (document.getElementById('root')?.childElementCount ?? 0) > 0;
+    const dismiss = () => {{
+      shell.remove(); style.remove(); root.removeAttribute('data-lumiverse-startup-shell'); observer.disconnect();
+    }};
     const remove = () => {{
-      if (!document.querySelector('[data-app-root]')) return false;
-      shell.remove(); style.remove(); root.removeAttribute('data-lumiverse-startup-shell'); observer.disconnect(); return true;
+      if (!mounted()) return false;
+      dismiss(); return true;
     }};
     const observer = new MutationObserver(remove);
     observer.observe(document.documentElement, {{ childList: true, subtree: true }});
     requestAnimationFrame(remove);
+    setTimeout(dismiss, 15000);
   }};
   if (document.body) mount(); else document.addEventListener('DOMContentLoaded', mount, {{ once: true }});
 }})();"#
@@ -411,6 +640,8 @@ pub fn set_frontend_task_switcher_visible<R: tauri::Runtime>(
     #[cfg(target_os = "macos")]
     app.set_dock_visibility(visible)
         .map_err(|error| error.to_string())?;
+    #[cfg(not(target_os = "macos"))]
+    let _ = app;
 
     window
         .set_skip_taskbar(!visible)
@@ -423,17 +654,25 @@ pub fn hide_frontend_window<R: tauri::Runtime>(app: &AppHandle<R>) {
         persist_bounds(app, &state, &window);
         let _ = window.hide();
         let _ = set_frontend_task_switcher_visible(app, &window, false);
+        emit_frontend_presence(app, &window);
     }
 }
 
-#[tauri::command]
+// WebView2 creation deadlocks inside a synchronous Windows IPC callback.
+// Dispatch on Tauri's worker pool there; macOS's WebKit configuration below
+// requires the main thread. Use the same dispatch for every window creator.
+#[cfg_attr(windows, tauri::command(async))]
+#[cfg_attr(not(windows), tauri::command)]
 pub fn show_frontend(
     app: AppHandle,
     port: u16,
     custom_url: Option<String>,
     state: State<'_, FrontendState>,
 ) -> Result<(), String> {
-    let target = custom_url.unwrap_or_else(|| format!("http://127.0.0.1:{port}"));
+    // BetterAuth's default callback origin is localhost. Keep the embedded
+    // frontend on that exact host so its host-scoped SSO cookie survives the
+    // provider callback (127.0.0.1 is a distinct cookie origin).
+    let target = custom_url.unwrap_or_else(|| format!("http://localhost:{port}"));
     let url: tauri::Url = target
         .parse()
         .map_err(|e| format!("Invalid Lumiverse frontend URL: {e}"))?;
@@ -467,6 +706,7 @@ pub fn show_frontend(
         app.show().map_err(|e| e.to_string())?;
         window.show().map_err(|e| e.to_string())?;
         window.set_focus().map_err(|e| e.to_string())?;
+        emit_frontend_presence(&app, &window);
         return Ok(());
     }
 
@@ -477,6 +717,7 @@ pub fn show_frontend(
         let [red, green, blue] = startup_appearance.native_color;
         tauri::webview::Color(red, green, blue, 255)
     };
+    let popup_app = app.clone();
     let mut builder = WebviewWindowBuilder::new(&app, FRONTEND_LABEL, WebviewUrl::External(url))
         .title(FRONTEND_TITLE)
         .inner_size(DEFAULT_WIDTH as f64, DEFAULT_HEIGHT as f64)
@@ -484,6 +725,10 @@ pub fn show_frontend(
         // The frontend renders the title bar and window controls so it can
         // inherit the active Lumiverse theme on every desktop platform.
         .decorations(false)
+        // The titlebar is rendered inside the WebView. On macOS an inactive
+        // WebView otherwise consumes the first click only to activate the
+        // window, so its drag region does not see that gesture.
+        .accept_first_mouse(true)
         // The frontend owns its rounded document edge. A native shadow creates
         // a square-ish outline around that curve on transparent windows.
         .shadow(false)
@@ -499,14 +744,48 @@ pub fn show_frontend(
         // Install a lightweight titlebar/surface before the remote frontend's
         // bundle executes. It removes itself as soon as the app root mounts.
         .initialization_script(frontend_startup_shell_script(&startup_appearance))
+        // Embedded WebViews do not provide a browser download shelf. Publish
+        // the native lifecycle so the frontend can show immediate feedback.
+        .on_download(report_frontend_download)
+        // Wry denies window.open by default. SSO relies on a user-initiated
+        // about:blank popup so the provider does not replace the companion's
+        // main frontend. Reuse the opener's WebView configuration/environment;
+        // that keeps cookies and window.opener available for the completion
+        // page's authenticated handoff on macOS, Windows, and Linux.
+        .on_new_window(move |popup_url, features| {
+            if !matches!(popup_url.scheme(), "about" | "http" | "https") {
+                return tauri::webview::NewWindowResponse::Deny;
+            }
+
+            let popup_id = NEXT_FRONTEND_POPUP_ID.fetch_add(1, Ordering::Relaxed);
+            let label = format!("frontend-popup-{popup_id}");
+            let popup =
+                WebviewWindowBuilder::new(&popup_app, &label, WebviewUrl::External(popup_url))
+                    .title("Lumiverse Sign-In")
+                    .window_features(features)
+                    .on_document_title_changed(|window, title| {
+                        let _ = window.set_title(&title);
+                    })
+                    .build();
+
+            match popup {
+                Ok(window) => tauri::webview::NewWindowResponse::Create { window },
+                Err(error) => {
+                    eprintln!("[desktop-window] could not create frontend popup: {error}");
+                    tauri::webview::NewWindowResponse::Deny
+                }
+            }
+        })
         .visible(false);
 
-    // Use the high-refresh WebView configuration where macOS supports it. The
-    // frontend supplies dragging and window controls for this frameless shell.
+    // Quality mode opts into the high-refresh WebView configuration where
+    // macOS supports it. Balanced and efficiency retain WebKit's stock policy.
     #[cfg(target_os = "macos")]
     {
-        if let Some(configuration) = high_refresh_webview_configuration() {
-            builder = builder.with_webview_configuration(configuration);
+        if startup_appearance.high_refresh {
+            if let Some(configuration) = high_refresh_webview_configuration() {
+                builder = builder.with_webview_configuration(configuration);
+            }
         }
     }
 
@@ -535,6 +814,10 @@ pub fn show_frontend(
     window.set_shadow(false).map_err(|e| e.to_string())?;
     #[cfg(target_os = "macos")]
     enforce_frontend_content_corner_radius(&window)?;
+    // A newly-created hidden GTK window does not have a wl_surface yet. Apply
+    // the Wayland effect after `show` below; the other platforms can install
+    // their native material before the first visible frame.
+    #[cfg(not(target_os = "linux"))]
     apply_frontend_native_appearance(
         &window,
         startup_appearance.blur,
@@ -546,12 +829,39 @@ pub fn show_frontend(
     let close_window = window.clone();
     let close_app = app.clone();
     window.on_window_event(move |event| {
-        if let WindowEvent::CloseRequested { api, .. } = event {
-            api.prevent_close();
-            let state = close_app.state::<FrontendState>();
-            persist_bounds(&close_app, &state, &close_window);
-            let _ = close_window.hide();
-            let _ = set_frontend_task_switcher_visible(&close_app, &close_window, false);
+        match event {
+            WindowEvent::CloseRequested { api, .. } => {
+                api.prevent_close();
+                hide_frontend_window(&close_app);
+            }
+            // Tauri exposes focus directly. Minimize/restore is represented by
+            // a resize event on the desktop runtimes, so re-query all native
+            // flags after either transition instead of guessing from web APIs.
+            WindowEvent::Focused(_) => {
+                emit_frontend_presence(&close_app, &close_window);
+            }
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                emit_frontend_presence(&close_app, &close_window);
+                #[cfg(target_os = "linux")]
+                if let Err(error) =
+                    crate::wayland_background_effect::refresh_background_effect(&close_window)
+                {
+                    eprintln!(
+                        "[desktop-appearance] failed to resize Wayland background effect: {error}"
+                    );
+                }
+            }
+            WindowEvent::Destroyed => {
+                #[cfg(target_os = "linux")]
+                if let Err(error) =
+                    crate::wayland_background_effect::clear_background_effects(&close_window)
+                {
+                    eprintln!(
+                        "[desktop-appearance] failed to clear Wayland background effect: {error}"
+                    );
+                }
+            }
+            _ => {}
         }
     });
     // `tauri dev` runs a debug build, where the inspector is available.
@@ -563,18 +873,66 @@ pub fn show_frontend(
     #[cfg(target_os = "macos")]
     app.show().map_err(|e| e.to_string())?;
     window.show().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "linux")]
+    apply_frontend_native_appearance(
+        &window,
+        startup_appearance.blur,
+        startup_appearance.dark,
+        &startup_appearance.blur_intensity,
+    )?;
     window.set_focus().map_err(|e| e.to_string())?;
+    emit_frontend_presence(&app, &window);
     Ok(())
 }
 
+/// Destroy the integrated browser and every extension widget hosted by it.
+/// The catalog belongs to the browser's live page, so discard it as part of
+/// the same operation; a newly opened browser will publish a fresh catalog.
 #[tauri::command]
-pub fn hide_frontend(app: AppHandle, state: State<'_, FrontendState>) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window(FRONTEND_LABEL) {
-        persist_bounds(&app, &state, &window);
-        let _ = window.hide();
-        let _ = set_frontend_task_switcher_visible(&app, &window, false);
+pub fn close_frontend(
+    app: AppHandle,
+    widget_state: State<'_, DesktopWidgetCatalogState>,
+) -> Result<(), String> {
+    let widgets = std::mem::take(&mut *widget_state.widgets.lock().unwrap());
+    let mut failures = Vec::new();
+
+    for widget in &widgets {
+        if let Some(window) = app.get_webview_window(&extension_widget_label(widget)) {
+            if let Err(error) = window.destroy() {
+                failures.push(format!("{}: {error}", widget.title));
+            }
+        }
     }
-    Ok(())
+
+    if let Some(window) = app.get_webview_window(FRONTEND_LABEL) {
+        let state = app.state::<FrontendState>();
+        persist_bounds(&app, &state, &window);
+        let _ = set_frontend_task_switcher_visible(&app, &window, false);
+        // Queue protocol-object cleanup before GTK destroys the wl_surface.
+        // The Destroyed handler remains as a defensive fallback for native
+        // destruction paths that do not pass through this command.
+        #[cfg(target_os = "linux")]
+        let _ = crate::wayland_background_effect::clear_background_effects(&window);
+        if let Err(error) = window.destroy() {
+            failures.push(format!("integrated browser: {error}"));
+        }
+    }
+
+    app.emit_to(
+        "main",
+        "desktop-widget-catalog",
+        Vec::<DesktopWidgetDescriptor>::new(),
+    )
+    .map_err(|error| error.to_string())?;
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Unable to close every desktop window: {}",
+            failures.join(", ")
+        ))
+    }
 }
 
 /// Reload the current frontend URL, bringing a hidden frontend back first.
@@ -590,6 +948,7 @@ pub fn reload_frontend(app: AppHandle) -> Result<(), String> {
     app.show().map_err(|e| e.to_string())?;
     window.show().map_err(|e| e.to_string())?;
     window.set_focus().map_err(|e| e.to_string())?;
+    emit_frontend_presence(&app, &window);
     window.reload().map_err(|e| e.to_string())
 }
 
@@ -611,6 +970,15 @@ pub fn frontend_visible(app: AppHandle) -> bool {
     app.get_webview_window(FRONTEND_LABEL)
         .map(|w| w.is_visible().unwrap_or(false))
         .unwrap_or(false)
+}
+
+/// Return a point-in-time native presence snapshot. The frontend calls this
+/// after registering its event listener so reconnects and WebView reloads do
+/// not depend on having observed every earlier window event.
+#[tauri::command]
+pub fn frontend_presence(app: AppHandle) -> Option<FrontendPresence> {
+    app.get_webview_window(FRONTEND_LABEL)
+        .map(|window| frontend_presence_for_window(&window))
 }
 
 #[tauri::command]
@@ -752,7 +1120,8 @@ pub fn resize_extension_widget(
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(windows, tauri::command(async))]
+#[cfg_attr(not(windows), tauri::command)]
 pub fn show_extension_widget(
     app: AppHandle,
     state: State<'_, DesktopWidgetCatalogState>,
@@ -768,12 +1137,12 @@ pub fn show_extension_widget(
         .ok_or("That floating widget is no longer registered")?;
     let frontend = app
         .get_webview_window(FRONTEND_LABEL)
-        .ok_or("Open Lumiverse before popping out an extension widget")?;
+        .ok_or("Open the integrated browser before popping out an extension widget")?;
     let mut url = frontend.url().map_err(|error| error.to_string())?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err("The current Lumiverse frontend cannot host extension widgets".into());
     }
-    url.set_path("/");
+    url.set_path("/widget.html");
     url.set_fragment(None);
     {
         let mut query = url.query_pairs_mut();
@@ -825,6 +1194,9 @@ pub fn show_extension_widget(
             .always_on_top(true)
             .skip_taskbar(true)
             .focused(false)
+            // Keep creation non-activating while still delivering the user's
+            // first deliberate click to the WebView's controls/drag regions.
+            .accept_first_mouse(true)
             // Do not take focus when it opens, but accept focus from a click
             // so the operating system does not redirect that activation to
             // the minimized main frontend window.
@@ -835,13 +1207,10 @@ pub fn show_extension_widget(
         window
             .set_shadow(false)
             .map_err(|error| error.to_string())?;
-        let close_window = window.clone();
         let close_app = app.clone();
         let close_widget_id = widget.id.clone();
         window.on_window_event(move |event| {
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = close_window.hide();
+            if let WindowEvent::CloseRequested { .. } = event {
                 let _ = emit_widget_popout_state(&close_app, close_widget_id.clone(), false);
             }
         });
@@ -851,12 +1220,11 @@ pub fn show_extension_widget(
     Ok(())
 }
 
-/// Hide a native widget and mount its registered root back in the main
+/// Close a native widget and mount its registered root back in the main
 /// frontend. The calling child is checked so a pop-out cannot return some
 /// other extension's widget.
 #[tauri::command]
 pub fn return_extension_widget(
-    app: AppHandle,
     window: WebviewWindow,
     state: State<'_, DesktopWidgetCatalogState>,
     widget_id: String,
@@ -872,8 +1240,7 @@ pub fn return_extension_widget(
     if window.label() != extension_widget_label(&widget) {
         return Err("A widget window may only return itself to the page".into());
     }
-    window.hide().map_err(|error| error.to_string())?;
-    emit_widget_popout_state(&app, widget.id, false)
+    window.close().map_err(|error| error.to_string())
 }
 
 /// Tray equivalent of `return_extension_widget`. The tray is part of the
@@ -894,105 +1261,23 @@ pub fn return_extension_widget_from_tray(
         .cloned()
         .ok_or("That floating widget is no longer registered")?;
     if let Some(window) = app.get_webview_window(&extension_widget_label(&widget)) {
-        window.hide().map_err(|error| error.to_string())?;
-    }
-    emit_widget_popout_state(&app, widget.id, false)
-}
-
-/// Create a small local WebView window that demonstrates the primitives an
-/// extension-provided floating widget will need. The actual extension bridge
-/// comes later; keeping this page app-local avoids giving a remote frontend
-/// permission to create arbitrary native windows.
-#[tauri::command]
-pub fn show_widget_poc(app: AppHandle, state: State<'_, WidgetPocState>) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window(WIDGET_POC_LABEL) {
-        window
-            .set_ignore_cursor_events(false)
-            .map_err(|e| e.to_string())?;
-        *state.click_through.lock().unwrap() = false;
-        window.set_shadow(false).map_err(|e| e.to_string())?;
-        window.show().map_err(|e| e.to_string())?;
+        window.close().map_err(|error| error.to_string())?;
         return Ok(());
     }
-
-    let builder = WebviewWindowBuilder::new(
-        &app,
-        WIDGET_POC_LABEL,
-        WebviewUrl::App("widget.html".into()),
-    )
-    .title("Lumiverse widget")
-    .inner_size(330.0, 220.0)
-    .min_inner_size(250.0, 160.0)
-    .decorations(false)
-    .shadow(false)
-    .transparent(true)
-    .background_color(tauri::webview::Color(0, 0, 0, 0))
-    .always_on_top(true)
-    .skip_taskbar(true)
-    .focused(false)
-    .focusable(false)
-    .resizable(true)
-    .visible(false);
-
-    let window = builder.build().map_err(|e| e.to_string())?;
-    let close_window = window.clone();
-    window.on_window_event(move |event| {
-        if let WindowEvent::CloseRequested { api, .. } = event {
-            api.prevent_close();
-            let _ = close_window.hide();
-        }
-    });
-    window.show().map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-#[tauri::command]
-pub fn hide_widget_poc(app: AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window(WIDGET_POC_LABEL) {
-        window.hide().map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
-#[tauri::command]
-pub fn set_widget_poc_click_through(
-    app: AppHandle,
-    state: State<'_, WidgetPocState>,
-    enabled: bool,
-) -> Result<(), String> {
-    let window = app
-        .get_webview_window(WIDGET_POC_LABEL)
-        .ok_or("Floating widget POC is not open")?;
-    window
-        .set_ignore_cursor_events(enabled)
-        .map_err(|e| e.to_string())?;
-    *state.click_through.lock().unwrap() = enabled;
-    Ok(())
-}
-
-#[tauri::command]
-pub fn toggle_widget_poc_click_through(
-    app: AppHandle,
-    state: State<'_, WidgetPocState>,
-) -> Result<(), String> {
-    let window = app
-        .get_webview_window(WIDGET_POC_LABEL)
-        .ok_or("Floating widget POC is not open")?;
-    let enabled = {
-        let click_through = state.click_through.lock().unwrap();
-        !*click_through
-    };
-    window
-        .set_ignore_cursor_events(enabled)
-        .map_err(|e| e.to_string())?;
-    *state.click_through.lock().unwrap() = enabled;
-    Ok(())
+    emit_widget_popout_state(&app, widget.id, false)
 }
 
 /// Apply the native material behind an opt-in translucent frontend theme.
 /// The document provides the color/tint itself, while the native effect
 /// supplies the platform blur. This is shared by the launch snapshot and the
 /// live frontend command, so their first and steady-state frames agree.
+#[cfg(any(target_os = "windows", test))]
+fn supports_windows_system_backdrop(build: u32) -> bool {
+    // This is the same cutoff used by window-vibrancy 0.6 before it selects
+    // DWMWA_SYSTEMBACKDROP_TYPE instead of SetWindowCompositionAttribute.
+    build >= 22_523
+}
+
 fn apply_frontend_native_appearance(
     window: &WebviewWindow,
     blur: bool,
@@ -1041,14 +1326,24 @@ fn apply_frontend_native_appearance(
     {
         use tauri::window::{Effect, EffectsBuilder};
 
+        // Windows system backdrops do not expose a blur-radius selection.
+        let _ = (dark, blur_intensity);
         if blur {
-            // Mica is a wallpaper-tint material, not a blur effect, and the
-            // content beneath it remains visually crisp. The desktop theme's
-            // "Blur" switch promises an actual frosted surface, so use DWM
-            // blur here. The document still supplies the theme tint above it.
-            let _ = dark;
+            let windows_build = windows_version::OsVersion::current().build;
+            let effect = if supports_windows_system_backdrop(windows_build) {
+                // On current Windows 11, Acrylic maps to the supported
+                // DWMSBT_TRANSIENTWINDOW backdrop. The previous Blur effect
+                // uses the legacy ACCENT_ENABLE_BLURBEHIND path, which flickers
+                // badly while a window is dragged or resized on build 22621+.
+                Effect::Acrylic
+            } else {
+                // Older Windows releases do not have the system-backdrop API.
+                // Keep the existing frosted blur there; Acrylic would also use
+                // a legacy accent policy and performs worse on Windows 10.
+                Effect::Blur
+            };
             window
-                .set_effects(EffectsBuilder::new().effect(Effect::Blur).build())
+                .set_effects(EffectsBuilder::new().effect(effect).build())
                 .map_err(|error| error.to_string())?;
         } else {
             window
@@ -1057,7 +1352,15 @@ fn apply_frontend_native_appearance(
         }
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    {
+        // The protocol deliberately leaves the blur algorithm/intensity to the
+        // compositor. The page continues to provide Lumiverse's tint.
+        let _ = (dark, blur_intensity);
+        crate::wayland_background_effect::set_background_effect(window, blur)?;
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         let _ = (window, blur, dark, blur_intensity);
     }
@@ -1107,8 +1410,64 @@ pub fn cache_frontend_startup_appearance(
     save_frontend_startup_appearance(&app, &appearance)
 }
 
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{
+        download_file_name, is_frontend_popup_label, supported_frontend_drop_path,
+        supports_windows_system_backdrop,
+    };
+
+    #[test]
+    fn selects_system_backdrops_at_window_vibrancy_cutoff() {
+        assert!(!supports_windows_system_backdrop(22_522));
+        assert!(supports_windows_system_backdrop(22_523));
+        assert!(supports_windows_system_backdrop(26_200));
+    }
+
+    #[test]
+    fn recognizes_only_generated_frontend_popup_labels() {
+        assert!(is_frontend_popup_label("frontend-popup-1"));
+        assert!(is_frontend_popup_label("frontend-popup-2048"));
+        assert!(!is_frontend_popup_label("frontend"));
+        assert!(!is_frontend_popup_label("frontend-popup-"));
+        assert!(!is_frontend_popup_label("frontend-popup-settings"));
+        assert!(!is_frontend_popup_label("frontend-popup-1-other"));
+    }
+
+    #[test]
+    fn native_drop_scope_matches_the_character_import_formats() {
+        for path in [
+            "card.json",
+            "card.PNG",
+            "card.charx",
+            "card.jpg",
+            "card.JPEG",
+        ] {
+            assert!(supported_frontend_drop_path(Path::new(path)), "{path}");
+        }
+        for path in ["card.zip", "card.txt", "card"] {
+            assert!(!supported_frontend_drop_path(Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn download_name_prefers_the_native_destination() {
+        let url = "http://localhost:3000/characters/123/export"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            download_file_name(&url, Some(Path::new("/tmp/Alice.charx"))),
+            "Alice.charx"
+        );
+        assert_eq!(download_file_name(&url, None), "export");
+    }
+}
+
 /// Show the small native settings window used to configure a cloud frontend.
-#[tauri::command]
+#[cfg_attr(windows, tauri::command(async))]
+#[cfg_attr(not(windows), tauri::command)]
 pub fn show_frontend_url_settings(app: AppHandle) -> Result<(), String> {
     const LABEL: &str = "frontend-url-settings";
     if let Some(window) = app.get_webview_window(LABEL) {
@@ -1117,10 +1476,10 @@ pub fn show_frontend_url_settings(app: AppHandle) -> Result<(), String> {
     }
 
     let window = WebviewWindowBuilder::new(&app, LABEL, WebviewUrl::App("custom-url.html".into()))
-        .title("Frontend URL")
-        .inner_size(480.0, 260.0)
-        .min_inner_size(480.0, 260.0)
-        .max_inner_size(480.0, 260.0)
+        .title("Instance Connection")
+        .inner_size(560.0, 480.0)
+        .min_inner_size(560.0, 480.0)
+        .max_inner_size(560.0, 480.0)
         .resizable(false)
         .center()
         .build()

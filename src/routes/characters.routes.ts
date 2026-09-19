@@ -9,7 +9,16 @@ import * as tagLibrarySvc from "../services/tag-library-import.service";
 import * as wbSvc from "../services/world-books.service";
 import * as regexSvc from "../services/regex-scripts.service";
 import * as gallerySvc from "../services/character-gallery.service";
-import { fetchChubGalleryUrls, fetchChubJson } from "../services/chub-api.service";
+import {
+  extractChubExpressionAssets,
+  fetchChubGalleryUrls,
+  fetchChubJson,
+  readChubFullPath,
+  type ChubExpressionAsset,
+} from "../services/chub-api.service";
+import * as exprSvc from "../services/expressions.service";
+import { markChubExpressionsChecked, queueChubExpressionImport } from "../services/chub-expression-import.service";
+import * as settingsSvc from "../services/settings.service";
 import { fetchBotBooruGalleryUrls } from "../services/botbooru-api.service";
 import { parsePagination } from "../services/pagination";
 import { safeFetch, SSRFError, validateHost } from "../utils/safe-fetch";
@@ -85,6 +94,7 @@ const LOCAL_CHARACTER_EXTENSION_KEYS = new Set([
   "original_image_id",
   "risu_asset_map",
   "gallery_reference_sequence",
+  "gallery_reference_names",
   "landing_perspective_layers",
   "ttsVoice",
 ]);
@@ -253,6 +263,41 @@ async function importGalleryFromUrls(userId: string, characterId: string, urls: 
   }
 }
 
+/**
+ * Opt out of pulling expression packs during a Chub import.
+ *
+ * Defaults to on: a pack is part of what the card advertises, and gallery
+ * images already import unconditionally, so this matches existing behaviour
+ * rather than introducing a new prompt. The key is read here so the preference
+ * is honoured the moment a UI toggle exists.
+ */
+const CHUB_IMPORT_EXPRESSIONS_KEY = "importChubExpressions";
+
+function chubExpressionImportEnabled(userId: string): boolean {
+  try {
+    const setting = settingsSvc.getSetting(userId, CHUB_IMPORT_EXPRESSIONS_KEY);
+    return setting?.value === false ? false : true;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Download a Chub expression pack and register it as the character's
+ * expressions, keyed by the pack's own labels.
+ *
+ * Mirrors importGalleryFromUrls, but the label is the whole point: these
+ * images previously had no route into the expressions surface at all, and any
+ * that reached the gallery arrived as unidentifiable files.
+ */
+async function importChubExpressions(
+  userId: string,
+  characterId: string,
+  assets: ChubExpressionAsset[],
+): Promise<void> {
+  await queueChubExpressionImport(userId, characterId, assets);
+}
+
 async function fetchChubCharacter(chubPath: string, userId: string, libraryScope: CharacterLibraryScope) {
   const data = await fetchChubJson(`characters/${chubPath}?full=true`);
   const node = data?.node;
@@ -342,6 +387,19 @@ async function fetchChubCharacter(chubPath: string, userId: string, libraryScope
   const galleryUrls = await fetchChubGalleryUrls(node.id);
   if (galleryUrls.length > 0) {
     await importGalleryFromUrls(userId, character.id, galleryUrls);
+  }
+
+  // Best-effort, like the gallery above: a card that imported successfully
+  // must not be rolled back because its expression images were unreachable.
+  if (chubExpressionImportEnabled(userId)) {
+    const expressionAssets = extractChubExpressionAssets(node);
+    if (expressionAssets.length > 0) {
+      try {
+        await importChubExpressions(userId, character.id, expressionAssets);
+      } catch (err) {
+        console.warn("[character import] Chub expression import failed:", err);
+      }
+    }
   }
 
   return svc.getCharacter(userId, character.id)!;
@@ -687,6 +745,99 @@ app.post("/:id/replace-card", async (c) => {
     return c.json(updated);
   } catch (err: any) {
     return respondImportError(c, err, "Failed to replace character card data");
+  }
+});
+
+// ─── Chub expression backfill ─────────────────────────────────────────────
+// Registered above `/:id`: Hono matches in order, and `/:id` would otherwise
+// capture "chub-expression-candidates" as a character id.
+
+/** Labels already mapped for this character, so a backfill can skip them. */
+function existingExpressionLabels(userId: string, characterId: string): Set<string> {
+  const config = exprSvc.getExpressionConfig(userId, characterId);
+  return new Set(Object.keys(config?.mappings ?? {}));
+}
+
+async function chubExpressionAssetsFor(slug: string): Promise<ChubExpressionAsset[]> {
+  const data = await fetchChubJson(`characters/${slug}?full=true`);
+  const node = data?.node;
+  if (!node) throw new Error("Invalid Chub API response: missing node");
+  return extractChubExpressionAssets(node);
+}
+
+/**
+ * Which cards could gain expressions, without downloading anything.
+ *
+ * Only reports cards that trace back to Chub and have no expressions yet, so
+ * the count is what a backfill would actually change rather than how many
+ * Chub cards exist.
+ */
+app.get("/chub-expression-candidates", (c) => {
+  const userId = c.get("userId");
+  const candidates = svc
+    .listCharacterExtensions(userId)
+    .filter((row) => readChubFullPath(row.extensions) !== null)
+    .filter((row) => !row.extensions?._lumiverse_chub_expressions_checked)
+    .filter((row) => existingExpressionLabels(userId, row.id).size === 0)
+    .map((row) => ({ id: row.id, name: row.name }));
+  return c.json({ candidates, count: candidates.length });
+});
+
+/**
+ * Pull this character's expression pack from the source it was imported from.
+ *
+ * Expressions only: the card's own fields are never re-read, so local edits
+ * survive a backfill. Labels already mapped are skipped rather than replaced,
+ * so hand-assigned expressions are never clobbered.
+ */
+app.post("/:id/chub-expressions", async (c) => {
+  const userId = c.get("userId");
+  const characterId = c.req.param("id");
+  const character = svc.getCharacter(userId, characterId);
+  if (!character) return c.json({ error: "Not found" }, 404);
+
+  const slug = readChubFullPath(character.extensions);
+  if (!slug) return c.json({ error: "This character was not imported from Chub" }, 400);
+
+  try {
+    let available: ChubExpressionAsset[];
+    try {
+      available = await chubExpressionAssetsFor(slug);
+    } catch (err: any) {
+      // A card whose source has been removed or renamed is a normal outcome,
+      // not a failure to report as an error. Treat it as "nothing to fetch" so
+      // the caller can say so plainly, and stamp it so it stops being offered.
+      if (typeof err?.message === "string" && err.message.includes("404")) {
+        markChubExpressionsChecked(userId, characterId);
+        return c.json({ imported: 0, skipped: 0, available: 0, sourceMissing: true });
+      }
+      throw err;
+    }
+
+    if (available.length === 0) {
+      markChubExpressionsChecked(userId, characterId);
+      return c.json({ imported: 0, skipped: 0, available: 0 });
+    }
+
+    const existing = existingExpressionLabels(userId, characterId);
+    const missing = available.filter((asset) => !existing.has(asset.label));
+    if (missing.length === 0) {
+      markChubExpressionsChecked(userId, characterId);
+      return c.json({ imported: 0, skipped: available.length, available: available.length });
+    }
+
+    await importChubExpressions(userId, characterId, missing);
+    const after = existingExpressionLabels(userId, characterId);
+    const imported = missing.filter((asset) => after.has(asset.label)).length;
+    markChubExpressionsChecked(userId, characterId);
+    return c.json({
+      imported,
+      skipped: available.length - missing.length,
+      available: available.length,
+    });
+  } catch (err: any) {
+    if (err instanceof SSRFError) return c.json({ error: err.message }, 400);
+    return c.json({ error: err.message || "Failed to fetch expressions from Chub" }, 502);
   }
 });
 

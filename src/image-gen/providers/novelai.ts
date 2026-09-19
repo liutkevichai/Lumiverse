@@ -1,3 +1,4 @@
+import { unzipSync } from "fflate";
 import { decodeMulti } from "@msgpack/msgpack";
 import sharp from "../../utils/sharp-config";
 import type { ImageProvider } from "../provider";
@@ -6,6 +7,15 @@ import type { ImageGenRequest, ImageGenResponse } from "../types";
 import { ProviderRequestError, throwProviderResponseError } from "../../utils/provider-errors";
 import { cancelStreamAndCloseConnection, fetchWithPreflightAbort, readWithAbort } from "../../llm/stream-utils";
 import { applyRawOverride } from "../types";
+
+// NovelAI expects an unsigned 64-bit seed, so -1 (the "random" sentinel used by other
+// providers and by saved connection defaults) must never reach the wire. Connection
+// defaults are merged into the request after extension-side normalization, so resolve
+// the seed once more at the final request boundary.
+function resolveNovelAISeed(value: unknown): number {
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return value;
+  return Math.floor(Math.random() * 2147483647);
+}
 
 const DIRECTOR_REF_CANVASES: Array<[number, number]> = [
   [1024, 1536],
@@ -87,6 +97,16 @@ export class NovelAIImageProvider implements ImageProvider {
         description: "Random seed for reproducibility (leave empty for random)",
         group: "advanced",
       },
+      v5Mode: {
+        type: "select",
+        default: "anime",
+        description: "V5 dataset mode. Furry mode adds NovelAI's fur dataset tag to the base prompt.",
+        options: [
+          { id: "anime", label: "Anime" },
+          { id: "furry", label: "Furry" },
+        ],
+        modelPrefixes: ["nai-diffusion-5"],
+      },
     },
     apiKeyRequired: true,
     modelListStyle: "static",
@@ -104,17 +124,20 @@ export class NovelAIImageProvider implements ImageProvider {
   };
 
   async generate(apiKey: string, apiUrl: string, request: ImageGenRequest): Promise<ImageGenResponse> {
+    const nonStreaming = request.connectionOptions?.novelai?.nonStreaming === true;
     const params = request.parameters;
     const model = request.model || "nai-diffusion-4-5-full";
     const [width, height] = String(params.resolution || "1216x832").split("x").map(Number);
     const negativePrompt =
       params.negativePrompt ||
       "lowres, artistic error, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, blurry, bad anatomy, bad hands, missing fingers, extra digits, fewer digits, text, watermark, username, logo, signature, dithering, halftone, screentone, scan artifacts, multiple views, blank page";
-    const seed = params.seed ?? Math.floor(Math.random() * 2147483647);
+    const seed = resolveNovelAISeed(params.seed);
+    const isV5 = isNovelAIV5Model(model);
+    const prompt = applyNovelAIV5Mode(request.prompt, isV5 ? params.v5Mode : undefined);
     const usesStructuredPrompts = isNovelAIV4OrLaterModel(model);
 
     const naiParams: any = {
-      params_version: 3,
+      params_version: isV5 ? 4 : 3,
       width,
       height,
       scale: params.guidance ?? 5,
@@ -140,7 +163,6 @@ export class NovelAIImageProvider implements ImageProvider {
       deliberate_euler_ancestral_bug: false,
       prefer_brownian: true,
       image_format: "png",
-      stream: "msgpack",
     };
 
     // Character tags from scene analysis (passed through parameters)
@@ -148,6 +170,12 @@ export class NovelAIImageProvider implements ImageProvider {
 
     if (usesStructuredPrompts) {
       naiParams.autoSmea = params.smea ?? false;
+      if (isV5) {
+        // V5 still uses v4_prompt, but the current client mirrors its base
+        // prompt into the flat prompt field as well.
+        naiParams.prompt = prompt;
+        naiParams.extra_noise_seed = seed;
+      }
       naiParams.characterPrompts = charTags.map((char) => ({
         prompt: char.tags,
         uc: negativePrompt,
@@ -156,7 +184,7 @@ export class NovelAIImageProvider implements ImageProvider {
       }));
       naiParams.v4_prompt = {
         caption: {
-          base_caption: request.prompt,
+          base_caption: prompt,
           char_captions: charTags.map((char) => ({
             char_caption: char.tags,
             centers: [{ x: 0, y: 0 }],
@@ -180,7 +208,9 @@ export class NovelAIImageProvider implements ImageProvider {
       naiParams.sm_dyn = params.smeaDyn ?? false;
     }
 
-    // Director reference images (pre-resolved by orchestrator)
+    // Precise Reference is a V4.5 feature. NovelAI V5 does not support either
+    // Precise Reference or Vibe Transfer yet, so never leak V4.5's padded
+    // director_reference_* shape into a V5 request.
     const directorImages: Array<{
       data: string;
       strength: number;
@@ -188,7 +218,7 @@ export class NovelAIImageProvider implements ImageProvider {
       refType: string;
     }> = params.resolvedReferenceImages || [];
 
-    if (directorImages.length > 0) {
+    if (directorImages.length > 0 && !isV5) {
       const fidelity = params.referenceFidelity ?? 1;
       const paddedImages: string[] = [];
       for (const ref of directorImages) {
@@ -210,10 +240,19 @@ export class NovelAIImageProvider implements ImageProvider {
 
     // Apply raw request override (power-user escape hatch) — merges at outer body level,
     // so users can override both the envelope (input, model, action) and inner parameters
-    const outerBody = { input: request.prompt, model, action: "generate", parameters: naiParams };
+    const outerBody = { input: prompt, model, action: "generate", parameters: naiParams };
     const finalBody = applyRawOverride(outerBody, params.rawRequestOverride);
 
-    const res = await fetchWithPreflightAbort(`${this.baseUrl(apiUrl)}/ai/generate-image-stream`, {
+    // The saved connection controls transport, including when raw parameters are supplied.
+    if (finalBody.parameters && typeof finalBody.parameters === "object") {
+      // Raw overrides and merged connection defaults can reintroduce an invalid seed.
+      finalBody.parameters.seed = resolveNovelAISeed(finalBody.parameters.seed);
+      if (nonStreaming) delete finalBody.parameters.stream;
+      else finalBody.parameters.stream = "msgpack";
+    }
+    const route = nonStreaming ? "/ai/generate-image" : "/ai/generate-image-stream";
+    const endpoint = `${this.baseUrl(apiUrl)}${route}`;
+    const res = await fetchWithPreflightAbort(endpoint, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -259,6 +298,25 @@ function isNovelAIV4OrLaterModel(model: string): boolean {
   return model.startsWith("nai-diffusion-4") || model.startsWith("nai-diffusion-5");
 }
 
+function isNovelAIV5Model(model: string): boolean {
+  return model.startsWith("nai-diffusion-5");
+}
+
+/**
+ * NovelAI's Anime/Furry switch is a prompt transform, not an Image API field.
+ * Match the first-party client by leaving Anime prompts alone and adding the
+ * dataset tag only when Furry mode is selected and no dataset tag leads the
+ * prompt already.
+ */
+function applyNovelAIV5Mode(prompt: string, mode: unknown): string {
+  if (mode !== "furry") return prompt;
+  const leadingPrompt = prompt.trimStart().toLowerCase();
+  if (leadingPrompt.startsWith("fur dataset") || leadingPrompt.startsWith("background dataset")) {
+    return prompt;
+  }
+  return prompt ? `fur dataset, ${prompt}` : "fur dataset";
+}
+
 // Sanity ceiling on the streamed image payload so a misbehaving upstream can't
 // grow the buffer without bound. NovelAI images are a few MB; 64 MB is generous.
 const NOVELAI_MAX_IMAGE_BYTES = 64 * 1024 * 1024;
@@ -300,28 +358,34 @@ async function extractImageFromResponse(res: Response, signal?: AbortSignal): Pr
     fullBuffer = new Uint8Array(await res.arrayBuffer());
   }
 
+  // Decode archives before scanning for PNG signatures: DEFLATE stored blocks
+  // can contain PNG bytes interrupted by block headers that are not image data.
+  if (fullBuffer[0] === 0x50 && fullBuffer[1] === 0x4b && fullBuffer[2] === 0x03 && fullBuffer[3] === 0x04) {
+    let selectedImage = false;
+    const images = unzipSync(fullBuffer, {
+      filter: (file) => {
+        if (selectedImage || !/\.png$/i.test(file.name) || file.originalSize > NOVELAI_MAX_IMAGE_BYTES) return false;
+        selectedImage = true;
+        return true;
+      },
+    });
+    for (const bytes of Object.values(images)) {
+      const imageBytes = extractPngFromBuffer(bytes.buffer.slice(
+        bytes.byteOffset, bytes.byteOffset + bytes.byteLength,
+      ) as ArrayBuffer);
+      if (imageBytes) return `data:image/png;base64,${uint8ToBase64(imageBytes)}`;
+    }
+    throw new Error("NovelAI ZIP response did not contain a supported PNG image");
+  }
+
   const primaryBuffer = fullBuffer.buffer.slice(
     fullBuffer.byteOffset,
     fullBuffer.byteOffset + fullBuffer.byteLength
   ) as ArrayBuffer;
-
-  // Strategy 1: Direct PNG scan
-  let imageBytes = extractPngFromBuffer(primaryBuffer);
+  const imageBytes = extractPngFromBuffer(primaryBuffer);
   if (imageBytes) return `data:image/png;base64,${uint8ToBase64(imageBytes)}`;
 
-  // Strategy 2: ZIP archive scan
-  const pkIndex = findBytes(fullBuffer, [0x50, 0x4b, 0x03, 0x04]);
-  if (pkIndex !== -1) {
-    const zipSlice = fullBuffer.slice(pkIndex);
-    const zipBuffer = zipSlice.buffer.slice(
-      zipSlice.byteOffset,
-      zipSlice.byteOffset + zipSlice.byteLength
-    ) as ArrayBuffer;
-    imageBytes = extractPngFromBuffer(zipBuffer);
-    if (imageBytes) return `data:image/png;base64,${uint8ToBase64(imageBytes)}`;
-  }
-
-  // Strategy 3: MessagePack decode
+  // Streaming endpoints can return a sequence of MessagePack events.
   let largestBinary: Uint8Array | null = null;
   let largestSize = 0;
   let streamError: string | null = null;
@@ -430,13 +494,6 @@ function extractPngFromBuffer(buffer: ArrayBuffer): Uint8Array | null {
   }
   if (end === -1) return null;
   return bytes.slice(start, end);
-}
-
-function findBytes(haystack: Uint8Array, needle: number[]): number {
-  for (let i = 0; i <= haystack.length - needle.length; i++) {
-    if (needle.every((b, j) => haystack[i + j] === b)) return i;
-  }
-  return -1;
 }
 
 async function padDirectorRefImage(base64Data: string): Promise<string> {

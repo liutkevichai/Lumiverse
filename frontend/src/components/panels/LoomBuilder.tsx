@@ -101,6 +101,7 @@ import { Button } from '@/components/shared/FormComponents'
 import { toast } from '@/lib/toast'
 import { useLongPress } from '@/hooks/useLongPress'
 import { markLoomRuntimeProfileContext } from '@/lib/loom/runtimeProfile'
+import { importPresetFiles } from '@/lib/loom/preset-import-batch'
 import SpindlePresetEditorTabContent from '@/components/spindle/SpindlePresetEditorTabContent'
 import SpindlePresetEditorToolbarItem from '@/components/spindle/SpindlePresetEditorToolbarItem'
 import { applyPresetEditorDraft, toPresetEditorDraft } from '@/lib/spindle/preset-editor-adapter'
@@ -553,6 +554,7 @@ interface BlockEditorProps {
   promptVariables: PromptVariableValues
   onSave: (updates: Partial<PromptBlock>) => boolean | void
   onBack: () => void
+  onDraftChange?: (updates: Partial<PromptBlock>) => void
   validationError?: string | null
   availableMacros: MacroGroup[]
   refreshMacros?: () => void
@@ -598,6 +600,7 @@ export function BlockEditor({
   promptVariables,
   onSave,
   onBack,
+  onDraftChange,
   validationError,
   availableMacros,
   refreshMacros,
@@ -639,7 +642,7 @@ export function BlockEditor({
     else if (pos === 'pre_history' && role === 'assistant') setRole('system')
   }
 
-  const handleSave = () => {
+  const buildDraftUpdates = useCallback((): Partial<PromptBlock> => {
     const isAppend = role === 'user_append' || role === 'assistant_append'
     const cleanedVariables = variables.filter((variable) => variable && variable.name?.trim().length > 0)
     const cleanedCharacterTagTrigger = sanitizeCharacterTagTrigger(characterTagTrigger)
@@ -659,7 +662,7 @@ export function BlockEditor({
       trustedUpdates.sealedOriginVersion = isInstalledLumiHubSealed ? block.sealedOriginVersion : undefined
       trustedUpdates.sealedSha256 = isInstalledLumiHubSealed ? block.sealedSha256 : undefined
     }
-    onSave({
+    return {
       name,
       role,
       content,
@@ -672,7 +675,48 @@ export function BlockEditor({
       categoryMode: block.marker === 'category' ? categoryMode : null,
       variables: cleanedVariables.length ? cleanedVariables : undefined,
       placementBinding: cleanPlacementBinding(placementBinding, cleanedVariables, fallbackPlacement),
-    })
+    }
+  }, [
+    block.id,
+    block.marker,
+    block.sealedKey,
+    block.sealedOriginPresetId,
+    block.sealedOriginVersion,
+    block.sealedSha256,
+    block.sealedSource,
+    categoryMode,
+    characterTagTrigger,
+    content,
+    depth,
+    injectionTrigger,
+    isInstalledLumiHubSealed,
+    isLocked,
+    name,
+    placementBinding,
+    position,
+    role,
+    sealed,
+    sealedKey,
+    trustedHostFeatures,
+    variables,
+  ])
+  const onDraftChangeRef = useRef(onDraftChange)
+  const draftEffectPrimedRef = useRef(false)
+
+  useEffect(() => {
+    onDraftChangeRef.current = onDraftChange
+  }, [onDraftChange])
+
+  useEffect(() => {
+    if (!draftEffectPrimedRef.current) {
+      draftEffectPrimedRef.current = true
+      return
+    }
+    onDraftChangeRef.current?.(buildDraftUpdates())
+  }, [buildDraftUpdates])
+
+  const handleSave = () => {
+    onSave(buildDraftUpdates())
   }
 
   const toggleTrigger = (value: string) => {
@@ -1015,6 +1059,9 @@ export interface ControlledLoomBlockEditorProps {
   blocks: PromptBlock[]
   promptVariables: PromptVariableValues
   onChange: (blocks: PromptBlock[]) => boolean | void | Promise<unknown>
+  onDraftChange?: (blockId: string, updates: Partial<PromptBlock> | null) => void
+  selectedBlockId?: string | null
+  onSelectedBlockChange?: (blockId: string | null) => void
   availableMacros: MacroGroup[]
   refreshMacros?: () => void
   readOnly?: boolean
@@ -1031,6 +1078,9 @@ export function ControlledLoomBlockEditor({
   blocks,
   promptVariables,
   onChange,
+  onDraftChange,
+  selectedBlockId,
+  onSelectedBlockChange,
   availableMacros,
   refreshMacros,
   readOnly = false,
@@ -1039,21 +1089,47 @@ export function ControlledLoomBlockEditor({
 }: ControlledLoomBlockEditorProps) {
   const { t } = useLb()
   const { t: tc } = useTranslation('common')
-  const [editingBlockId, setEditingBlockId] = useState<string | null>(null)
+  const [internalEditingBlockId, setInternalEditingBlockId] = useState<string | null>(null)
   const [validationError, setValidationError] = useState<string | null>(null)
+  const selectionControlled = selectedBlockId !== undefined
+  const editingBlockId = selectionControlled ? selectedBlockId ?? null : internalEditingBlockId
   const editingBlock = editingBlockId
     ? blocks.find((block) => block.id === editingBlockId) ?? null
     : null
+  const selectBlock = useCallback((blockId: string | null) => {
+    if (!selectionControlled) setInternalEditingBlockId(blockId)
+    onSelectedBlockChange?.(blockId)
+  }, [onSelectedBlockChange, selectionControlled])
+  const previousEditingBlockIdRef = useRef(editingBlockId)
+  const explicitlyClearedDraftBlockIdRef = useRef<string | null>(null)
   const effectiveRoles = useMemo(() => new Map(
     resolvePromptBlockPlacements(blocks, promptVariables)
       .map((block) => [block.id, block.role] as const),
   ), [blocks, promptVariables])
 
   useEffect(() => {
-    if (editingBlockId && !blocks.some((block) => block.id === editingBlockId)) {
-      setEditingBlockId(null)
+    const previousEditingBlockId = previousEditingBlockIdRef.current
+    if (previousEditingBlockId !== editingBlockId) {
+      if (previousEditingBlockId !== null) {
+        if (explicitlyClearedDraftBlockIdRef.current === previousEditingBlockId) {
+          explicitlyClearedDraftBlockIdRef.current = null
+        } else {
+          onDraftChange?.(previousEditingBlockId, null)
+        }
+      }
+      previousEditingBlockIdRef.current = editingBlockId
     }
-  }, [blocks, editingBlockId])
+  }, [editingBlockId, onDraftChange])
+
+  useEffect(() => {
+    if (!editingBlockId || blocks.some((block) => block.id === editingBlockId)) return
+    setValidationError(null)
+    if (explicitlyClearedDraftBlockIdRef.current !== editingBlockId) {
+      explicitlyClearedDraftBlockIdRef.current = editingBlockId
+      onDraftChange?.(editingBlockId, null)
+    }
+    selectBlock(null)
+  }, [blocks, editingBlockId, onDraftChange, selectBlock])
 
   if (editingBlock && !readOnly) {
     return (
@@ -1080,11 +1156,17 @@ export function ControlledLoomBlockEditor({
             return
           }
           setValidationError(null)
-          setEditingBlockId(null)
+          explicitlyClearedDraftBlockIdRef.current = editingBlock.id
+          onDraftChange?.(editingBlock.id, null)
+          selectBlock(null)
         }}
         onBack={() => {
           setValidationError(null)
-          setEditingBlockId(null)
+          selectBlock(null)
+        }}
+        onDraftChange={(updates) => {
+          explicitlyClearedDraftBlockIdRef.current = null
+          onDraftChange?.(editingBlock.id, updates)
         }}
         availableMacros={availableMacros}
         refreshMacros={refreshMacros}
@@ -1126,7 +1208,7 @@ export function ControlledLoomBlockEditor({
                   variant="ghost"
                   onClick={() => {
                     setValidationError(null)
-                    setEditingBlockId(block.id)
+                    selectBlock(block.id)
                   }}
                   title={tc('actions.edit')}
                 >
@@ -2487,6 +2569,7 @@ useEffect(() => {
   }, [activePreset?.blocks])
   const fileInputRef = useRef<HTMLInputElement>(null)
   const importTypeRef = useRef<string>('json')
+  const presetImportInProgressRef = useRef(false)
   const lastCollapsedPresetRef = useRef<string | null>(null)
   const scrollAreaRef = useRef<HTMLDivElement>(null)
   const scrollTopRef = useRef(0)
@@ -2881,21 +2964,35 @@ useEffect(() => {
   }, [])
 
   const handleFileSelect = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
-    try {
-      const text = await file.text()
-      const json = JSON.parse(text)
-      if (importTypeRef.current === 'st') {
-        await importFromST(json, file.name)
-      } else {
-        await importFromFile(json, file.name)
-      }
-    } catch (err) {
-      console.error('[LoomBuilder] Import failed:', err)
-    }
+    // Snapshot before resetting: clearing a file input also empties its live
+    // FileList in Chromium.
+    const files = Array.from(e.target.files ?? [])
     e.target.value = ''
-  }, [importFromFile, importFromST])
+    if (files.length === 0 || presetImportInProgressRef.current) return
+
+    const importType = importTypeRef.current
+    presetImportInProgressRef.current = true
+    try {
+      const result = await importPresetFiles(
+        files,
+        importType === 'st' ? importFromST : importFromFile,
+        {
+          invalidJson: lb('toast.invalidPresetJson'),
+          importFailed: lb('toast.presetImportFailed'),
+        },
+      )
+
+      if (files.length > 1 && result.imported > 0) {
+        toast.success(lb('toast.presetsImported', { count: result.imported }))
+      }
+      if (result.errors.length > 0) {
+        console.error('[LoomBuilder] Preset import failures:', result.errors)
+        toast.error(lb('toast.presetImportErrors', { count: result.errors.length }))
+      }
+    } finally {
+      presetImportInProgressRef.current = false
+    }
+  }, [importFromFile, importFromST, lb])
 
   const presetEditorToolbar = presetEditorToolbarItems.some((item) => item.visible) ? (
     <div className={s.extensionToolbar}>
@@ -3497,7 +3594,7 @@ useEffect(() => {
       </div>
 
       {/* Hidden file input for import */}
-      <input ref={fileInputRef} type="file" accept=".json" style={{ display: 'none' }} onChange={handleFileSelect} />
+      <input ref={fileInputRef} type="file" accept=".json" multiple style={{ display: 'none' }} onChange={handleFileSelect} />
 
       {/* Confirm legacy export */}
         <ConfirmationModal

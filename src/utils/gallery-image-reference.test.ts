@@ -6,8 +6,10 @@ import {
   findGalleryImageReference,
   galleryArchiveStem,
   galleryReferenceFromArchivePath,
+  normalizeGalleryImageReferenceName,
   parseGalleryImageReference,
   parseCanonicalGalleryImageReference,
+  remapGreetingBackgrounds,
 } from "./gallery-image-reference";
 
 describe("portable gallery image references", () => {
@@ -44,5 +46,44 @@ describe("portable gallery image references", () => {
   test("rejects paths that cannot be safe archive names", () => {
     expect(parseGalleryImageReference("gallery://../escape")).toBeNull();
     expect(galleryReferenceFromArchivePath("assets/other/image/not_gallery.png")).toBeNull();
+  });
+
+  test("normalizes friendly custom names into portable tokens", () => {
+    expect(normalizeGalleryImageReferenceName("  Gallery://Hero's R\u00e9sum\u00e9  ")).toBe("heros-resume");
+    expect(normalizeGalleryImageReferenceName("Beach___Scene.png")).toBe("beach___scene.png");
+    expect(() => normalizeGalleryImageReferenceName("--- \ud83c\udf0a ---")).toThrow(
+      "Reference name must contain at least one letter or number",
+    );
+  });
+
+  test("round-trips greeting backgrounds through portable gallery references", () => {
+    const localBackgrounds = {
+      0: "old-main-image-id",
+      2: "old-alternate-image-id",
+      future: { preserved: true },
+    };
+    const portable = remapGreetingBackgrounds(localBackgrounds, new Map([
+      ["old-main-image-id", "gallery://image-1"],
+      ["old-alternate-image-id", "gallery://image-4"],
+    ]));
+
+    expect(portable).toEqual({
+      0: "gallery://image-1",
+      2: "gallery://image-4",
+      future: { preserved: true },
+    });
+    expect(remapGreetingBackgrounds(portable, new Map([
+      ["gallery://image-1", "new-main-image-id"],
+      ["gallery://image-4", "new-alternate-image-id"],
+    ]))).toEqual({
+      0: "new-main-image-id",
+      2: "new-alternate-image-id",
+      future: { preserved: true },
+    });
+    expect(localBackgrounds).toEqual({
+      0: "old-main-image-id",
+      2: "old-alternate-image-id",
+      future: { preserved: true },
+    });
   });
 });

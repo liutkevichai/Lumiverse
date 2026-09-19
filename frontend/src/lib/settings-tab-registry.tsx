@@ -63,7 +63,11 @@ export const SETTINGS_TABS: SettingsTabEntry[] = [
     tabName: 'Account Settings',
     tabDescription: 'Manage your account details and password',
     tabIcon: UserRound,
-    keywords: ['account', 'profile', 'password', 'credentials', 'security', 'me'],
+    keywords: ['account', 'profile', 'password', 'credentials', 'security', 'me', 'request', 'history', 'raw', 'json', 'generation'],
+    sections: [
+      { key: 'general', titleKey: 'account.title', titleFallback: 'Account', keywords: ['account', 'password', 'profile'] },
+      { key: 'requestHistory', titleKey: 'requestHistory.title', titleFallback: 'Recent generation requests', keywords: ['request history', 'raw body', 'json', 'provider', 'tracking', 'copy'] },
+    ],
     component: INLINE_SENTINEL,
   },
   {
@@ -94,7 +98,7 @@ export const SETTINGS_TABS: SettingsTabEntry[] = [
       { key: 'general', titleKey: 'chat.title', titleFallback: 'Chat', keywords: ['message display', 'display mode', 'bubble', 'minimal', 'immersive', 'enter to send', 'streaming', 'markdown'] },
       { key: 'width', titleKey: 'chat.widthTitle', titleFallback: 'Chat Width', keywords: ['chat width', 'content width', 'message width'] },
       { key: 'messagesPerPage', titleKey: 'chat.messagesPerPageTitle', titleFallback: 'Messages Per Page', keywords: ['messages per page', 'pagination', 'page size', 'load more'] },
-      { key: 'input', titleKey: 'chat.inputTitle', titleFallback: 'Input', keywords: ['input', 'composer', 'textarea', 'send', 'enter key'] },
+      { key: 'input', titleKey: 'chat.inputTitle', titleFallback: 'Input', keywords: ['input', 'composer', 'textarea', 'send', 'enter key', 'impersonate', 'impersonation mode', 'default'] },
       { key: 'regen', titleKey: 'chat.regenTitle', titleFallback: 'Regeneration Feedback', keywords: ['regeneration', 'regen', 'feedback', 'swipe regenerate'] },
       { key: 'messageInfo', titleKey: 'chat.messageInfoTitle', titleFallback: 'Message Info', keywords: ['message info', 'timestamp', 'token count', 'metadata'] },
       { key: 'swipe', titleKey: 'chat.swipeTitle', titleFallback: 'Swipe Navigation', keywords: ['swipe', 'swipe navigation', 'alternate responses', 'variations'] },

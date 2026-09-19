@@ -177,13 +177,14 @@ export function captureDefaults(
 }
 
 export function deleteDefaults(userId: string, presetId: string): boolean {
-  const deleted = settingsSvc.deleteSetting(userId, defaultsKey(presetId));
+  let deleted = settingsSvc.deleteSetting(userId, defaultsKey(presetId));
   settingsSvc.deleteSetting(userId, defaultsVariablesKey(presetId));
   const legacy = settingsSvc.getSetting(userId, LEGACY_DEFAULTS_KEY);
   if (legacy && (legacy.value as PresetProfileBinding)?.preset_id === presetId) {
     settingsSvc.deleteSetting(userId, LEGACY_DEFAULTS_KEY);
-    return true;
+    deleted = true;
   }
+  if (deleted) eventBus.emit(EventType.PRESET_PROFILE_CHANGED, { key: defaultsKey(presetId), binding: null }, userId);
   return deleted;
 }
 
@@ -223,6 +224,7 @@ export function deleteCharacterBinding(
 ): boolean {
   const deleted = settingsSvc.deleteSetting(userId, characterKey(characterId));
   settingsSvc.deleteSetting(userId, variablesKey("character", characterId));
+  if (deleted) eventBus.emit(EventType.PRESET_PROFILE_CHANGED, { key: characterKey(characterId), binding: null }, userId);
   return deleted;
 }
 
@@ -257,6 +259,7 @@ export function setPersonaBinding(
 export function deletePersonaBinding(userId: string, personaId: string): boolean {
   const deleted = settingsSvc.deleteSetting(userId, personaKey(personaId));
   settingsSvc.deleteSetting(userId, variablesKey("persona", personaId));
+  if (deleted) eventBus.emit(EventType.PRESET_PROFILE_CHANGED, { key: personaKey(personaId), binding: null }, userId);
   return deleted;
 }
 
@@ -297,6 +300,7 @@ export function deleteChatBinding(
 ): boolean {
   const deleted = settingsSvc.deleteSetting(userId, chatKey(chatId));
   settingsSvc.deleteSetting(userId, variablesKey("chat", chatId));
+  if (deleted) eventBus.emit(EventType.PRESET_PROFILE_CHANGED, { key: chatKey(chatId), binding: null }, userId);
   return deleted;
 }
 
@@ -384,6 +388,7 @@ export function deleteConnectionBinding(
 ): boolean {
   const deleted = settingsSvc.deleteSetting(userId, connectionKey(connectionId));
   settingsSvc.deleteSetting(userId, variablesKey("connection", connectionId));
+  if (deleted) eventBus.emit(EventType.PRESET_PROFILE_CHANGED, { key: connectionKey(connectionId), binding: null }, userId);
   return deleted;
 }
 
@@ -448,6 +453,34 @@ export function resolveProfile(
 // ---------------------------------------------------------------------------
 // Block state application — mutates block enabled states in place
 // ---------------------------------------------------------------------------
+
+/** Read-only projection for regex previews; unlike normal resolution, never cleans up settings. */
+export function readActivationProfileVariables(userId: string, presetId: string, context: {
+  chatId?: string; personaId?: string; characterId?: string; connectionId?: string; isGroup?: boolean;
+}): PromptVariableValues | undefined {
+  const read = (key: string) => {
+    const binding = settingsSvc.getSetting(userId, key)?.value as PresetProfileBinding | undefined;
+    return binding?.preset_id && presetsSvc.getPreset(userId, binding.preset_id) ? binding : undefined;
+  };
+  const defaults = () => {
+    const current = read(defaultsKey(presetId));
+    const binding = current?.preset_id === presetId ? current : read(LEGACY_DEFAULTS_KEY);
+    return binding?.preset_id === presetId ? getProfilePromptVariables(userId, defaultsVariablesKey(presetId), binding) : undefined;
+  };
+  const candidates: Array<["chat" | "persona" | "character" | "connection", string | undefined]> = [
+    ["chat", context.chatId], ["persona", context.personaId],
+    ["character", context.isGroup ? undefined : context.characterId], ["connection", context.connectionId],
+  ];
+  for (const [scope, id] of candidates) {
+    if (!id) continue;
+    const binding = read(`presetProfile:${scope}:${id}`);
+    if (!binding) continue;
+    // A preview stays in the explicitly linked preset; never borrow another preset's values.
+    if (binding.preset_id !== presetId || binding.linked_to_defaults) return defaults();
+    return getProfilePromptVariables(userId, variablesKey(scope, id), binding);
+  }
+  return defaults();
+}
 
 export function applyProfileToBlocks(
   blocks: PromptBlock[],

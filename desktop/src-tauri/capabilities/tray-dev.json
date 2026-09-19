@@ -23,11 +23,13 @@
     "core:window:allow-is-visible",
     "core:window:allow-set-focus",
     "core:webview:default",
+    "notification:allow-is-permission-granted",
     "tray-commands",
     "store:default",
     "autostart:allow-enable",
     "autostart:allow-disable",
     "autostart:allow-is-enabled",
+    "opener:allow-reveal-item-in-dir",
     {
       "identifier": "opener:allow-open-url",
       "allow": [{ "url": "http://*" }, { "url": "https://*" }]

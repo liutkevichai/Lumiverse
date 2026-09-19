@@ -1,5 +1,6 @@
 import type { Message, Character, Persona, Preset, ConnectionProfile, ProviderInfo, RecentChat, GroupedRecentChat, PaginatedResult, Pack, PackWithItems, LumiaItem, LoomItem, ImageGenConnectionProfile, ImageGenProviderInfo } from './api'
 import type { WeaverSession, WeaverStage, WeaverExtraction, WeaverSpineSlot, WeaverSynthesisGroup, WeaverBookRole, WeaverBuildType, WeaverNarrationMode, WeaverPersonaRegister, WeaverPersonaPlan, PersonaDraft, CreateWeaverSessionInput, WeaverCommittedFact, WeaverGap, WeaverInterviewQuestion, WeaverInterviewState, WeaverResponseKind, WeaverCandidate, WeaverBible, UpdateWeaverBibleInput, WeaverFieldDef, WeaverField, WeaverFinalizeResult, WeaverFinalizeInput, WeaverStartChatResult } from '@/api/weaver'
+import type { ImpersonationPreference } from '@/lib/impersonationPreset'
 
 // ---- Chat Slice ----
 export interface ChatSlice {
@@ -91,7 +92,7 @@ export interface ChatSlice {
   /** Current raw (unflushed) streaming buffers — used to request pool deltas. */
   getStreamBuffers: () => { content: string; reasoning: string }
   setStreamingReasoningStartedAt: (ts: number | null) => void
-  /** Set the swipe index the active generation streams into (null when unknown). */
+  /** Set the confirmed streaming swipe index and recover its slot if a staging event was missed. */
   setStreamingSwipeId: (swipeId: number | null) => void
   /** Flag a freshly-generated swipe as unseen (drives the "new swipe ready" badge). */
   setUnseenSwipe: (messageId: string, swipeId: number) => void
@@ -132,6 +133,7 @@ export interface StartupSettings {
   viewMode?: CharacterViewMode
   charactersPerPage?: number
   favoritesBarCollapsed?: boolean
+  importChubExpressions?: boolean
   theme?: ThemeConfig | null
   landingPageChatsDisplayed?: number
   landingPageLayoutMode?: 'cards' | 'compact'
@@ -141,6 +143,8 @@ export interface StartupSettings {
   spindleSettings?: Partial<SpindleSettings>
   connectionsOrder?: Partial<Record<'llm' | 'imageGen' | 'stt' | 'tts', string[]>>
   activeProfileId?: string | null
+  toastPosition?: ToastPosition
+  defaultImpersonationMode?: ImpersonationPreference
 }
 
 export interface CharactersSlice {
@@ -452,6 +456,11 @@ export interface GuidedGeneration {
   mode: 'persistent' | 'oneshot'
   enabled: boolean
   color?: string | null
+  /** Optional context rule that activates this guide in addition to the manual switch. */
+  autoEnable?: {
+    scope: 'connection' | 'chat' | 'character'
+    id: string
+  } | null
 }
 
 export interface QuickReply {
@@ -727,6 +736,11 @@ export interface LorebookEditorSettings {
 // ---- Settings Slice ----
 export type LongMessageCollapsePreset = 'compact' | 'comfortable' | 'tall' | 'custom'
 
+export interface EnterToSendSettings {
+  desktop: boolean
+  mobile: boolean
+}
+
 export interface SettingsSlice {
   settingsLoaded: boolean
   /** Full persisted settings loaded; startup settings intentionally set only `settingsLoaded`. */
@@ -751,8 +765,9 @@ export interface SettingsSlice {
   bubbleUseFullAvatar: boolean
   /** Bubble background opacity, 0–1. 1 = the theme's natural bubble fill (default). */
   bubbleOpacity: number
-  inputBarEnterToSend: boolean
+  inputBarEnterToSend: EnterToSendSettings
   saveDraftInput: boolean
+  defaultImpersonationMode: ImpersonationPreference
   chatWidthMode: 'full' | 'comfortable' | 'compact' | 'custom'
   chatContentMaxWidth: number
   modalWidthMode: 'full' | 'comfortable' | 'compact' | 'custom'
@@ -784,6 +799,8 @@ export interface SettingsSlice {
   /** Suppress toasts when older chat messages are omitted from generation context. */
   suppressContextDropWarnings: boolean
   favoritesBarCollapsed: boolean
+  /** Pull a Chub card's expression pack during URL import. Defaults to on. */
+  importChubExpressions: boolean
   guidedGenerations: GuidedGeneration[]
   quickReplySets: QuickReplySet[]
   wallpaper: WallpaperSettings
@@ -822,7 +839,7 @@ export interface SettingsSlice {
   hydrateStartupSettings: (settings: StartupSettings) => void
   setVoiceSettings: (partial: Partial<VoiceSettings>) => void
   setWallpaper: (settings: Partial<WallpaperSettings>) => void
-  setInputBarEnterToSend: (enabled: boolean) => void
+  setInputBarEnterToSend: (settings: EnterToSendSettings) => void
   setSetting: <K extends keyof SettingsSlice>(key: K, value: SettingsSlice[K], source?: SettingsWriteSource) => void
   setTheme: (theme: ThemeConfig | null) => void
   setCharacterThemeOverlay: (overlay: CharacterThemeOverlay | null) => void
@@ -875,7 +892,7 @@ export interface DrawerSettings {
 export interface SpindleSettings {
   interceptorTimeoutMs: number
   dockPanelDesktopSide: 'left' | 'right'
-  /** Show routine Spindle lifecycle and WebSocket events in the browser console. */
+  /** Show routine WebSocket and Spindle lifecycle events in the browser console. */
   infoLoggingEnabled: boolean
   /** Per-extension opt-out for update notification toasts. */
   extensionUpdateToastDisabled: Record<string, boolean>
@@ -1052,6 +1069,8 @@ export interface ImageGenSettings {
   promptMode?: 'scene' | 'custom' | 'parsed_custom'
   customPrompt?: string
   customNegativePrompt?: string
+  /** Last prompt entered in the Image Captioner modal. */
+  captionPrompt?: string
   activePromptPresetId?: string | null
   promptPresets?: ImageGenPromptPreset[]
   loraPresets?: LoraPreset[]
@@ -1659,12 +1678,16 @@ export interface ExpressionSlice {
   expressionDisplay: ExpressionDisplaySettings
   /** Per-character expression state for group chats (characterId → label+imageId) */
   groupExpressions: Record<string, GroupExpressionEntry>
+  /** Per-group sprite state for a single card containing multiple characters. */
+  multiCharacterExpressions: Record<string, GroupExpressionEntry>
   /** Character currently generating a response (set via GENERATION_STARTED, cleared on GENERATION_ENDED) */
   respondingCharacterId: string | null
   setActiveExpression: (label: string | null, imageId: string | null, characterId: string | null) => void
   setGroupExpression: (characterId: string, label: string, imageId: string) => void
   setGroupExpressions: (map: Record<string, GroupExpressionEntry>) => void
   clearGroupExpressions: () => void
+  setMultiCharacterExpressions: (map: Record<string, GroupExpressionEntry>) => void
+  clearMultiCharacterExpressions: () => void
   setRespondingCharacterId: (characterId: string | null) => void
   setExpressionDisplay: (partial: Partial<ExpressionDisplaySettings>) => void
   toggleExpressionMinimized: () => void

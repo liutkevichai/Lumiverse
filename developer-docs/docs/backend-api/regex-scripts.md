@@ -4,7 +4,9 @@
 
 Read access to the user's regex scripts, CRUD access to scripts created by the calling extension, plus a context-aware active-rule resolver. Use this for extensions that manage their own find/replace rules, analyze existing rules, or mirror the resolution Lumiverse uses internally during prompt assembly, response baking, and display rendering.
 
-Extension-created scripts are attributed by the host. An extension cannot update or delete legacy/unattributed scripts, another extension's scripts, or preset-bound scripts. Those scripts remain visible through `list`, `get`, and `getActive` and continue to execute normally.
+Extension-created scripts are attributed by the host. Ownership, not the preset link, decides what an extension may change: it cannot update or delete legacy/unattributed scripts, another extension's scripts, or rows it does not own. A script it created stays writable after it is bound to a preset, and deleting that preset deletes the script with it. Protected scripts remain visible through `list`, `get`, and `getActive` and continue to execute normally.
+
+A refused mutation rejects with `Regex script is not an unbound script owned by this extension`. The wording predates the preset-link change and is kept verbatim because callers match on it; the rule it enforces is ownership only.
 
 Extensions whose purpose is to edit the user's complete regex library may also request the privileged `regex_scripts_unrestricted` permission. It is additive: both permissions must be granted. With it, `update` and `delete` may target legacy, card-bound, preset-bound, and other-extension-owned scripts. The host still protects ownership, binding, and trusted folder-version attribution from reassignment.
 
@@ -96,8 +98,8 @@ const active = await spindle.regex_scripts.getActive({
 | `list(options?)` | `Promise<{ data: RegexScriptDTO[], total: number }>` | List scripts with strict scope filtering. Options: `{ scope?, scopeId?, target?, limit?, offset?, userId? }`. Defaults: limit 50, max 200. |
 | `get(scriptId)` | `Promise<RegexScriptDTO \| null>` | Get a script by ID. Returns `null` if not found. |
 | `create(input)` | `Promise<RegexScriptDTO>` | Create a new regex script. `name` and `find_regex` are required. |
-| `update(scriptId, input)` | `Promise<RegexScriptDTO>` | Update an unbound script created by this extension, or any script when `regex_scripts_unrestricted` is also granted. All fields are optional. Throws for protected scripts. |
-| `delete(scriptId)` | `Promise<boolean>` | Delete an unbound script created by this extension, or any script when `regex_scripts_unrestricted` is also granted. Throws for protected scripts; returns `true` if deleted. |
+| `update(scriptId, input)` | `Promise<RegexScriptDTO>` | Update a script created by this extension, preset-bound or not, or any script when `regex_scripts_unrestricted` is also granted. All fields are optional. Throws for protected scripts. |
+| `delete(scriptId)` | `Promise<boolean>` | Delete a script created by this extension, preset-bound or not, or any script when `regex_scripts_unrestricted` is also granted. Throws for protected scripts; returns `true` if deleted. |
 | `getActive(options)` | `Promise<RegexScriptDTO[]>` | Resolve enabled scripts that would fire for a given target plus character/chat context. Merges global + character + chat scopes and orders them by scope tier then `sort_order`. |
 
 ## RegexScriptListOptionsDTO
@@ -147,10 +149,11 @@ const active = await spindle.regex_scripts.getActive({
 | `folder_version` | `string \| null` | No | Optional version label for an extension-installed folder. Requires a non-empty `folder`; maximum 100 characters. Omit it for the normal folder display with no version chip. |
 | `metadata` | `Record<string, unknown>` | No | Host behavior fields described below, plus namespaced extension metadata. |
 | `script_id` | `string` | No | Stable identifier (normalized to lowercase + underscores) for cross-instance references. |
+| `preset_id` | `string \| null` | No | Bind the created script to one of the calling user's presets. Create-only: `update` never re-points or clears the link. An unknown or foreign preset ID is rejected with `Linked preset not found`; a non-string value is rejected with `preset_id must be a string or null`; `null` and `""` leave the script unbound. The link is a lifecycle binding — the host deletes the script when that preset is deleted, and preset activation does not change the script's `disabled` state, so the extension keeps control of its own rule's enablement. |
 
 ## RegexScriptUpdateDTO
 
-Same fields as `RegexScriptCreateDTO`, all optional.
+Same fields as `RegexScriptCreateDTO`, all optional, except that `preset_id` is create-only: `update` strips it from extension input, so an owner re-points a script by deleting and recreating it. The field stays in the published `RegexScriptUpdateDTO` type as excluded, so passing it is a type error instead of a silent no-op.
 
 `folder_version` is script-level, host-managed attribution used by the regex panel. When creating a versioned bundle, provide the same `folder` and `folder_version` on every script in that folder. Lumiverse renders the unique attributed versions as Spindle-colored chips beside the folder name.
 
@@ -188,7 +191,7 @@ Multi-select options toggle in a provisional client-side pool. They can be remov
 ```ts
 {
   id: string
-  can_mutate: boolean          // calling extension may update/delete this row
+  can_mutate: boolean          // calling extension may update/delete this row, preset-bound or not
   name: string
   script_id: string             // stable, normalized identifier (lowercase, _-only)
   find_regex: string
@@ -208,6 +211,7 @@ Multi-select options toggle in a provisional client-side pool. They can be remov
   sort_order: number            // lower runs earlier within the same scope tier
   description: string
   folder: string
+  preset_id: string | null      // preset this row is bound to for the delete cascade; null when unbound
   folder_version?: string | null // host-validated Spindle folder version; older hosts may omit it
   metadata: Record<string, unknown>
   created_at: number            // unix epoch seconds
@@ -228,6 +232,37 @@ Every mode except `"none"` resolves macros in `find_regex`. The selected mode al
 **Prefer `"after"` whenever your `replace_string` contains macros.** It collapses N evaluation calls to one (matching `"escaped"` performance) while keeping capture support (matching `"raw"` capability). It also matches how single-pass parsers in upstream regex pipelines already work, so ported rules behave the same.
 
 The one observable difference from `"raw"`: stateful macros (`{{counter::*}}`, `{{addvar::*::1}}{{getvar::*}}` patterns, etc.) accumulate left-to-right across matches in `"after"` mode rather than running in isolation per match. A counter that emitted `1, 1, 1, 1` under `"raw"` emits `1, 2, 3, 4` under `"after"`. The `"after"` behavior is almost always what you actually want; stay on `"raw"` only if you specifically need per-match isolation.
+
+### Preset prompt activation metadata (native API)
+
+Preset-bound scripts can store `metadata.prompt_activation`:
+
+```ts
+{
+  source: "user_input" | "ai_output",
+  lifetime: "latest" | "chat",
+  mappings: [{
+    capture: "mode",        // "0" = full match, "1"–"99" = numbered group, or a named group
+    value: ["combat", "fight"], // any exact trimmed match; also accepts a single literal string
+    block_ids: ["rules", "format"], // IDs in this script's linked preset
+    enabled: true
+  }]
+}
+```
+
+Creation and update validate the preset's ownership and each target ID. Activation is unavailable on unbound scripts, including ordinary extension-owned scripts. Unlinking and standalone duplication remove this configuration. Preset exports preserve it and preset imports bind it to the imported preset; block IDs must be preserved or remapped by the importer.
+
+Mapping `value` accepts a literal string or an array of 1–64 nonblank strings, each at most 1,000 characters. Alternatives use OR semantics with trimming and the script's `i` flag; duplicates apply the row only once per capture. Legacy strings remain literal, including commas and newlines. The editor parses comma/newline-separated input (with CSV-style quoting) into this string-or-array representation; API clients should submit arrays for alternatives, not a comma-separated string. The same representation is used by preview, generation, and preset import/export. Captured text is still compared exactly; neither capture contents nor value entries are interpreted as regex patterns or split into words.
+
+Activation runs before prompt variables/rendering, independent of replacement Placement/Target. All mapped targets start disabled, regardless of profile defaults, and valid captures apply ordered runtime overrides. Category IDs expand to their category and children; radio exclusivity remains enforced. There are at most 64 mappings, 128 target IDs per row, 1000 matches per source, and 500,000 characters per source; regex execution uses the existing worker timeout.
+
+Find patterns accept only these bounded substitutions: `{{char}}`, `{{user}}`, `{{getchatvar::key}}`, and `{{presetvar::block-id::variable-id}}`. Arguments must be explicit, static IDs/keys. Preset references are checked against the linked preset on save. The latter uses typed, profile-over-preset-over-default values from the identified schema, even when its block is disabled. It does not read local/global runtime variables, render blocks, call extension interceptors, or recursively evaluate returned text. Every substituted value becomes a noncapturing literal atom, preserving capture numbering and preventing regex injection. Templates are forbidden inside character classes or immediately after an escape. Limits: 10,000 source-pattern characters, 32 inputs, 1,024 characters per value, 100,000 resolved-pattern characters. Missing, blank, non-scalar, and oversized inputs fail the entire rule closed with a diagnostic; numeric zero and boolean false remain valid.
+
+Assembly takes one pre-render input snapshot, resolving each rule once before history replay. Response processing reuses that snapshot. Display replacements use an owned server-side persisted snapshot, bypassing unrestricted find-macro evaluation and display caches for these templates; ordinary replacement macro behavior is unchanged. This bounded find behavior is independent of `substitute_macros` and available only on preset-linked activation scripts. Current inputs reinterpret old matches on each assembly; no event-time activation state is persisted.
+
+`latest` evaluates only the most recent visible message of the configured source; `chat` replays selected visible history. Message order, scoped script order, match order, then mapping order resolve conflicts. Existing min/max depth bounds apply. Assistant matches must finish at the true end of a successfully completed message, allowing trailing whitespace. Their effects become available to subsequent generations. The combined message is checked after Continue. Stopped output is ineligible; source text removed by response replacements is preserved per swipe and invalidated when the saved message is edited.
+
+`POST /api/v1/regex-scripts/test-activation` accepts `{ preset_id, find_regex, flags, content, prompt_activation, chat_id?, character_id?, persona_id?, connection_id? }` and returns `{ matches: [{ mapping_index, value, index }], resolved_find_regex?: string, error?: string }`. Context IDs must belong to the authenticated user. Preview reads saved state using the same resolver and coercion as assembly, applies matching profile values (otherwise the linked preset's defaults), and performs no writes, including no cleanup of stale profile bindings. Unsaved preset edits are excluded. Without a chat, chat keys are unavailable. Activation diagnostics are also available internally as `AssemblyResult.macroEnv.extra.promptActivation` with `states` and `errors`.
 
 ### Match behavior metadata
 

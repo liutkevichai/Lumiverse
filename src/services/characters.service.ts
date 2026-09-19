@@ -783,6 +783,27 @@ export function listCharactersForManifest(userId: string): Array<{ name: string;
   }));
 }
 
+/**
+ * Every character's id and extensions, for scans that only need to inspect
+ * install provenance. Deliberately narrow: a library-wide sweep should not
+ * deserialize full card bodies to answer "which of these came from Chub".
+ */
+export function listCharacterExtensions(userId: string): Array<{ id: string; name: string; extensions: Record<string, any> }> {
+  const db = getDb();
+  const rows = db
+    .query("SELECT id, name, extensions FROM characters WHERE user_id = ? AND deleting = 0")
+    .all(userId) as any[];
+  return rows.map((row) => {
+    let extensions: Record<string, any> = {};
+    try {
+      extensions = JSON.parse(row.extensions) ?? {};
+    } catch {
+      // A card with unreadable extensions simply has no provenance to find.
+    }
+    return { id: row.id, name: row.name, extensions };
+  });
+}
+
 export function listCharacters(userId: string, pagination: PaginationParams): PaginatedResult<Character> {
   return paginatedQuery(
     "SELECT * FROM characters WHERE user_id = ? AND deleting = 0 ORDER BY updated_at DESC",
@@ -966,7 +987,19 @@ export function createCharacter(
   return character;
 }
 
-export function updateCharacter(userId: string, id: string, input: UpdateCharacterInput): Character | null {
+export interface UpdateCharacterOptions {
+  /** Background enrichment must not reorder the character library. */
+  preserveUpdatedAt?: boolean;
+  /** Batched workflows publish one update after saving their changes. */
+  emitEvent?: boolean;
+}
+
+export function updateCharacter(
+  userId: string,
+  id: string,
+  input: UpdateCharacterInput,
+  options: UpdateCharacterOptions = {},
+): Character | null {
   const existing = getCharacter(userId, id);
   if (!existing) return null;
   const oldImageIds = collectCharacterImageIds(existing);
@@ -1008,8 +1041,10 @@ export function updateCharacter(userId: string, id: string, input: UpdateCharact
 
   if (fields.length === 0) return existing;
 
-  fields.push("updated_at = ?");
-  values.push(now);
+  if (!options.preserveUpdatedAt) {
+    fields.push("updated_at = ?");
+    values.push(now);
+  }
   values.push(id);
   values.push(userId);
 
@@ -1021,7 +1056,9 @@ export function updateCharacter(userId: string, id: string, input: UpdateCharact
     clearRemovedChatAvatarReferences(userId, removedImageIds);
     cleanupUnreferencedImageIds(userId, removedImageIds);
   }
-  eventBus.emit(EventType.CHARACTER_EDITED, { id, character: updated }, userId);
+  if (options.emitEvent !== false) {
+    eventBus.emit(EventType.CHARACTER_EDITED, { id, character: updated }, userId);
+  }
   return updated;
 }
 

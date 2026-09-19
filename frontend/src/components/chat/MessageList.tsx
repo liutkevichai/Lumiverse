@@ -1,4 +1,4 @@
-import { useRef, useEffect, useLayoutEffect, useCallback, useMemo, useState, useSyncExternalStore, startTransition, memo, type PointerEvent, type ReactNode, type TouchEvent, type WheelEvent } from 'react'
+import { useRef, useEffect, useLayoutEffect, useCallback, useMemo, useState, useSyncExternalStore, startTransition, memo, type CSSProperties, type PointerEvent, type ReactNode, type TouchEvent, type WheelEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useVirtualizer, defaultRangeExtractor, type Range, type VirtualItem, type Virtualizer } from '@tanstack/react-virtual'
 import {
@@ -60,6 +60,12 @@ const MOBILE_RANGE_WARM_MS = 1200
 // frame to paint on slow devices, short enough that early scrolling still
 // finds rows mounted.
 const INITIAL_RANGE_WARM_DELAY_MS = 300
+// A zero pending count is only a point-in-time observation: resolving
+// preprocessing can enqueue regex work, and tag delivery can enqueue a widget
+// mount in the following React commit. Require a short quiet window after the
+// warm range has mounted, then verify once more after layout has painted.
+const CHAT_REVEAL_SETTLE_QUIET_MS = 100
+const CHAT_REVEAL_SETTLE_POLL_MS = 50
 const USER_CONTROLLED_ROW_RESIZE_SETTLE_MS = 450
 const PROGRAMMATIC_CONTENT_REFLOW_SETTLE_MS = 1500
 const SWIPE_VARIANT_REFLOW_SETTLE_MS = 1500
@@ -210,6 +216,8 @@ function estimateOOCContribution(blocks: OOCBlock[], mode: OOCStyleType, bubbleW
 }
 
 export default function MessageList({ messages, chatId, isStreaming, findTarget = null, findQuery = '' }: MessageListProps) {
+  'use memo'
+
   const { t } = useTranslation('chat')
   const scrollRef = useRef<HTMLDivElement>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -1047,7 +1055,6 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
   // The core virtualizer exposes this as a mutable instance hook even though
   // the React wrapper's options type does not currently declare it.
   useLayoutEffect(() => {
-    // eslint-disable-next-line react-compiler/react-compiler
     rowVirtualizer.shouldAdjustScrollPositionOnItemSizeChange = shouldAdjustScrollPositionOnItemSizeChange
   }, [rowVirtualizer, shouldAdjustScrollPositionOnItemSizeChange])
 
@@ -1271,56 +1278,92 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
   const virtualItems = rowVirtualizer.getVirtualItems()
 
   // Trigger the chat-load fade-in once the virtualizer has real rows AND the
-  // display pipeline has settled: tag-interceptor registrations and first
-  // display-regex resolves land asynchronously after mount, and revealing
-  // before they drain paints raw tags/JSON that visibly flash away. Poll the
-  // settle tracker (bounded by CHAT_REVEAL_SETTLE_CAP_MS) before dispatching,
-  // so the parent ChatView animates in final content instead of intermediates.
+  // display pipeline has settled. The delayed warm-range commit is part of
+  // that pipeline: it mounts the neighboring rows whose regex/interceptor
+  // work otherwise used to begin just after the cold range had revealed.
+  // Require one quiet interval and re-check after the final two layout frames
+  // so a preprocess -> regex or tag -> widget handoff cannot reveal in the
+  // transient zero-work gap between stages.
   const hasPopulated = virtualItems.some((item) => virtualListItems[item.index]?.type === 'message')
+  const canSettleInitialDisplay = hasPopulated && initialRangeWarm
   useEffect(() => {
-    if (hasFadedInRef.current || !hasPopulated) return
+    if (hasFadedInRef.current || !canSettleInitialDisplay) return
     let cancelled = false
     let pollTimer: number | null = null
+    let firstFrame: number | null = null
+    let secondFrame: number | null = null
+    let settledSince: number | null = null
     const startedAt = Date.now()
-    const dispatchPopulated = () => {
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          if (!cancelled) {
-            // Commit the delivered flag with the event. Chat hydration can
-            // temporarily clear the virtual rows during these two frames;
-            // its effect cleanup cancels this dispatch, and the next populated
-            // render must still be allowed to try again.
-            hasFadedInRef.current = true
-            window.dispatchEvent(new CustomEvent('lumiverse:chat-items-populated', { detail: { chatId } }))
+    const schedulePoll = (delay = CHAT_REVEAL_SETTLE_POLL_MS) => {
+      pollTimer = window.setTimeout(poll, delay)
+    }
+    const dispatchPopulated = (force: boolean) => {
+      firstFrame = requestAnimationFrame(() => {
+        firstFrame = null
+        secondFrame = requestAnimationFrame(() => {
+          secondFrame = null
+          if (cancelled) return
+
+          // Work may have registered while React committed the final rows.
+          // Drop back into the quiet-period check instead of revealing an
+          // intermediate frame. The hard-cap path remains deliberately bound.
+          if (!force && !isChatDisplaySettled(chatId)) {
+            settledSince = null
+            schedulePoll(0)
+            return
           }
+
+          // Commit the delivered flag with the event. Chat hydration can
+          // temporarily clear the virtual rows during these two frames; its
+          // effect cleanup cancels this dispatch, and the next populated render
+          // must still be allowed to try again.
+          hasFadedInRef.current = true
+          window.dispatchEvent(new CustomEvent('lumiverse:chat-items-populated', { detail: { chatId } }))
         })
       })
     }
-    const poll = () => {
+    function poll() {
       if (cancelled) return
       const settled = isChatDisplaySettled(chatId)
-      const elapsedMs = Date.now() - startedAt
+      const now = Date.now()
+      const elapsedMs = now - startedAt
       const timedOut = elapsedMs >= CHAT_REVEAL_SETTLE_CAP_MS
-      if (settled || timedOut) {
-        if (timedOut && !settled) {
-          const detail = {
-            elapsedMs,
-            ...getChatDisplaySettleDiagnostics(chatId),
-          }
+      if (timedOut) {
+        if (!settled) {
+          const detail = { elapsedMs, ...getChatDisplaySettleDiagnostics(chatId) }
           console.warn('[ChatDisplaySettle] Reveal reached settle cap', detail)
           window.dispatchEvent(new CustomEvent('lumiverse:chat-display-settle-timeout', { detail }))
         }
-        dispatchPopulated()
+        dispatchPopulated(true)
         return
       }
-      pollTimer = window.setTimeout(poll, 100)
+
+      if (!settled) {
+        settledSince = null
+        schedulePoll()
+        return
+      }
+
+      settledSince ??= now
+      const quietForMs = now - settledSince
+      if (quietForMs < CHAT_REVEAL_SETTLE_QUIET_MS) {
+        schedulePoll(Math.min(
+          CHAT_REVEAL_SETTLE_POLL_MS,
+          CHAT_REVEAL_SETTLE_QUIET_MS - quietForMs,
+        ))
+        return
+      }
+
+      dispatchPopulated(false)
     }
     poll()
     return () => {
       cancelled = true
       if (pollTimer !== null) window.clearTimeout(pollTimer)
+      if (firstFrame !== null) cancelAnimationFrame(firstFrame)
+      if (secondFrame !== null) cancelAnimationFrame(secondFrame)
     }
-  }, [chatId, hasPopulated])
+  }, [canSettleInitialDisplay, chatId, interceptorRegistryVersion])
 
   // Gate that keeps the keyboard/safe-zone repin from fighting the unified
   // scroll guard while streaming is active.
@@ -1864,6 +1907,7 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
             <VirtualRow
               key={virtualRow.key}
               virtualIndex={virtualRow.index}
+              estimatedHeight={virtualRow.size}
               itemType={item.type}
               messageIndex={messageIndex}
               messageId={messageId}
@@ -1883,6 +1927,7 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
 
 interface VirtualRowProps {
   virtualIndex: number
+  estimatedHeight: number
   itemType: VirtualListItem['type']
   messageIndex?: number
   messageId?: string
@@ -1892,7 +1937,7 @@ interface VirtualRowProps {
   children: ReactNode
 }
 
-const VirtualRow = memo(function VirtualRow({ virtualIndex, itemType, messageIndex, messageId, measureKey, styleMode, measureElement, children }: VirtualRowProps) {
+const VirtualRow = memo(function VirtualRow({ virtualIndex, estimatedHeight, itemType, messageIndex, messageId, measureKey, styleMode, measureElement, children }: VirtualRowProps) {
   const elRef = useRef<HTMLDivElement>(null)
 
   useLayoutEffect(() => {
@@ -1942,6 +1987,7 @@ const VirtualRow = memo(function VirtualRow({ virtualIndex, itemType, messageInd
       data-measure-key={measureKey}
       data-style-mode={relaxed ? 'extension-relaxed' : undefined}
       className={styles.virtualRow}
+      style={{ '--message-row-estimated-height': `${estimatedHeight}px` } as CSSProperties}
     >
       {messageId && (
         <span

@@ -7,18 +7,20 @@ const originalDocument = (globalThis as any).document
 const originalWebSocket = (globalThis as any).WebSocket
 const originalWorker = (globalThis as any).Worker
 
-type Listener = EventListenerOrEventListenerObject
-
 function makeEventTarget() {
+  const target = new EventTarget()
   return {
-    addEventListener(_type: string, _listener: Listener) {},
-    removeEventListener(_type: string, _listener: Listener) {},
+    addEventListener: target.addEventListener.bind(target),
+    removeEventListener: target.removeEventListener.bind(target),
+    dispatchEvent: target.dispatchEvent.bind(target),
   }
 }
 
+let documentFocused = true
+
 const documentMock = {
   visibilityState: 'visible' as DocumentVisibilityState,
-  hasFocus: () => true,
+  hasFocus: () => documentFocused,
   ...makeEventTarget(),
 }
 
@@ -36,7 +38,7 @@ class MockWebSocket {
   static readonly CLOSED = 3
   static instances: MockWebSocket[] = []
 
-  readyState = MockWebSocket.OPEN
+  readyState = MockWebSocket.CONNECTING
   sent: string[] = []
   closeCalls = 0
 
@@ -44,7 +46,17 @@ class MockWebSocket {
     MockWebSocket.instances.push(this)
   }
 
+  open() {
+    this.readyState = MockWebSocket.OPEN
+    ;(this as any).onopen?.({} as Event)
+  }
+
+  receive(data: unknown) {
+    ;(this as any).onmessage?.({ data: JSON.stringify(data) })
+  }
+
   send(payload: string) {
+    if (this.readyState !== MockWebSocket.OPEN) throw new Error('Socket is not open')
     this.sent.push(payload)
   }
 
@@ -98,8 +110,167 @@ afterAll(() => {
 function makeClient() {
   const client = new WebSocketClient('ws://localhost:3000/api/ws') as any
   client.ws = new MockWebSocket('ws://localhost:3000/api/ws')
+  client.ws.open()
   return client
 }
+
+describe('WebSocketClient push presence', () => {
+  test('reports current presence and stream focus after opening and after authentication', () => {
+    const client = new WebSocketClient('ws://localhost:3000/api/ws')
+    try {
+      client.setFocusedChat('chat-1')
+      client.connect()
+      const socket = MockWebSocket.instances.at(-1)!
+      expect(socket.sent).toEqual([])
+
+      socket.open()
+      expect(socket.sent.map((frame) => JSON.parse(frame))).toEqual([
+        { type: 'visibility', visible: true },
+        { type: 'stream_focus', chatId: 'chat-1' },
+      ])
+
+      // The server authenticates asynchronously after the transport opens.
+      // Replay presence before application CONNECTED handlers can send work.
+      socket.sent = []
+      let framesAtConnected: unknown[] = []
+      client.on('CONNECTED', () => { framesAtConnected = socket.sent.map((frame) => JSON.parse(frame)) })
+      socket.receive({ event: 'CONNECTED', payload: { role: 'user' } })
+      expect(framesAtConnected).toEqual([
+        { type: 'visibility', visible: true },
+        { type: 'stream_focus', chatId: 'chat-1' },
+      ])
+    } finally {
+      client.disconnect()
+    }
+  })
+
+  test('reports hidden if the app backgrounds during connection or authentication', () => {
+    const client = new WebSocketClient('ws://localhost:3000/api/ws')
+    try {
+      client.connect()
+      const socket = MockWebSocket.instances.at(-1)!
+      documentMock.visibilityState = 'hidden'
+      documentMock.dispatchEvent(new Event('visibilitychange'))
+      socket.open()
+      socket.receive({ event: 'CONNECTED', payload: { role: 'user' } })
+      expect(socket.sent.map((frame) => JSON.parse(frame))).toEqual([
+        { type: 'visibility', visible: false },
+        { type: 'stream_focus', chatId: null },
+        { type: 'visibility', visible: false },
+        { type: 'stream_focus', chatId: null },
+      ])
+    } finally {
+      client.disconnect()
+      documentMock.visibilityState = 'visible'
+    }
+  })
+
+  test('reports a visible but non-frontmost browser window as inactive', () => {
+    const client = new WebSocketClient('ws://localhost:3000/api/ws') as any
+    try {
+      client.connect()
+      const socket = MockWebSocket.instances.at(-1)!
+      socket.open()
+      socket.sent = []
+
+      documentFocused = false
+      windowMock.dispatchEvent(new Event('blur'))
+      expect(socket.sent.map((frame) => JSON.parse(frame))).toContainEqual({
+        type: 'visibility',
+        visible: false,
+      })
+
+      documentFocused = true
+      windowMock.dispatchEvent(new Event('focus'))
+      expect(socket.sent.map((frame) => JSON.parse(frame))).toContainEqual({
+        type: 'visibility',
+        visible: true,
+      })
+    } finally {
+      client.disconnect()
+      documentFocused = true
+    }
+  })
+
+  test('reduces native hidden, minimized, and background states to inactive presence', () => {
+    const client = makeClient()
+    try {
+      const socket = client.ws as MockWebSocket
+      socket.sent = []
+      const states = [
+        { state: 'hidden', visible: false, minimized: false, focused: false },
+        { state: 'minimized', visible: true, minimized: true, focused: false },
+        { state: 'background', visible: true, minimized: false, focused: false },
+      ] as const
+
+      for (const presence of states) {
+        client.desktopPresence = { ...presence, active: false }
+        client.sendVisibility()
+      }
+
+      expect(socket.sent.map((frame) => JSON.parse(frame)).filter((frame) => frame.type === 'visibility'))
+        .toEqual(states.map((presence) => ({
+          type: 'visibility',
+          visible: false,
+          source: 'tauri',
+          state: presence.state,
+          windowVisible: presence.visible,
+          minimized: presence.minimized,
+          focused: presence.focused,
+        })))
+    } finally {
+      client.disconnect()
+    }
+  })
+
+  test('restores foreground presence after repeated PWA suspension and reconnection', () => {
+    jest.useFakeTimers()
+    const client = new WebSocketClient('ws://localhost:3000/api/ws')
+    try {
+      client.connect()
+      MockWebSocket.instances.at(-1)!.open()
+      for (let cycle = 0; cycle < 3; cycle++) {
+        documentMock.visibilityState = 'hidden'
+        windowMock.dispatchEvent(new Event('pagehide'))
+        documentMock.visibilityState = 'visible'
+        windowMock.dispatchEvent(new Event('pageshow'))
+        jest.advanceTimersByTime(250)
+        const socket = MockWebSocket.instances.at(-1)!
+        expect(socket.readyState).toBe(MockWebSocket.CONNECTING)
+        expect(socket.sent).toEqual([])
+        socket.open()
+        socket.receive({ event: 'CONNECTED', payload: { role: 'user' } })
+        expect(socket.sent.map((frame) => JSON.parse(frame))).toContainEqual({ type: 'visibility', visible: true })
+      }
+    } finally {
+      client.disconnect()
+      documentMock.visibilityState = 'visible'
+      jest.useRealTimers()
+    }
+  })
+
+  test('repairs hidden presence when a PWA resumes without a visibility event', () => {
+    jest.useFakeTimers()
+    const client = new WebSocketClient('ws://localhost:3000/api/ws') as any
+    try {
+      client.connect()
+      const socket = MockWebSocket.instances.at(-1)!
+      socket.open()
+      documentMock.visibilityState = 'hidden'
+      documentMock.dispatchEvent(new Event('visibilitychange'))
+      socket.sent = []
+      documentMock.visibilityState = 'visible'
+      client.lastLifecycleTick = Date.now() - 20_000
+      client.checkForWakeGap()
+      expect(socket.sent.map((frame) => JSON.parse(frame))).toContainEqual({ type: 'visibility', visible: true })
+      expect(client.lifecyclePaused).toBe(false)
+    } finally {
+      client.disconnect()
+      documentMock.visibilityState = 'visible'
+      jest.useRealTimers()
+    }
+  })
+})
 
 describe('WebSocketClient resume watchdog guard', () => {
   test('does not use a heartbeat worker on iOS or iPadOS', () => {
@@ -213,7 +384,7 @@ describe('WebSocketClient resume watchdog guard', () => {
     const client = new WebSocketClient('ws://localhost:3000/api/ws') as any
     client.connect()
     const socket = MockWebSocket.instances.at(-1)!
-    ;(socket as any).onopen?.({} as Event)
+    socket.open()
     const events: string[] = []
     client.on('__ws_resume_recovery_start', () => events.push('start'))
     client.on('__ws_resume_recovery_complete', () => events.push('complete'))
@@ -328,13 +499,16 @@ describe('WebSocketClient resume watchdog guard', () => {
 })
 
 describe('WebSocketClient Spindle console logging', () => {
-  test('can suppress routine Spindle events without suppressing other WebSocket diagnostics', () => {
+  test('suppresses routine incoming WebSocket traces without suppressing event dispatch', () => {
     const client = new WebSocketClient('ws://localhost:3000/api/ws')
     const originalDebug = console.debug
     const logged: unknown[][] = []
+    const received: string[] = []
     console.debug = (...args: unknown[]) => { logged.push(args) }
 
     try {
+      client.on('SPINDLE_RUNTIME_STATS', () => received.push('spindle'))
+      client.on('MESSAGE_SENT', () => received.push('message'))
       client.setSpindleInfoLogging(false)
       client.connect()
       const socket = MockWebSocket.instances.at(-1)!
@@ -342,7 +516,14 @@ describe('WebSocketClient Spindle console logging', () => {
       ;(socket as any).onmessage({ data: JSON.stringify({ event: 'SPINDLE_RUNTIME_STATS', payload: {} }) })
       ;(socket as any).onmessage({ data: JSON.stringify({ event: 'MESSAGE_SENT', payload: {} }) })
 
+      expect(logged).toEqual([])
+      expect(received).toEqual(['spindle', 'message'])
+
+      client.setSpindleInfoLogging(true)
+      ;(socket as any).onmessage({ data: JSON.stringify({ event: 'MESSAGE_SENT', payload: {} }) })
+
       expect(logged).toEqual([['[WS] ←', 'MESSAGE_SENT', {}]])
+      expect(received).toEqual(['spindle', 'message', 'message'])
     } finally {
       console.debug = originalDebug
       client.disconnect()

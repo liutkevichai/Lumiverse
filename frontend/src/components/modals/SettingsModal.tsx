@@ -33,6 +33,8 @@ import { useStore } from '@/store'
 import { readProductivityFeature } from '@/lib/spindle/productivity-feature-toggles'
 import { spindleApi } from '@/api/spindle'
 import { connectionsApi } from '@/api/connections'
+import { chatsApi } from '@/api/chats'
+import { charactersApi } from '@/api/characters'
 import {
   embeddingsApi,
   EMBEDDING_ERROR_CODES,
@@ -49,7 +51,8 @@ import { notificationSoundsApi } from '@/api/notification-sounds'
 import { unlockNotificationAudio } from '@/lib/notificationAudio'
 import { webSearchApi, type WebSearchProviderProfile, type WebSearchSettingsInput, type WebSearchTestResponse } from '@/api/web-search'
 import type { DrawerSettings, GuidedGeneration, LongMessageCollapsePreset, QuickReplySet } from '@/types/store'
-import type { EmbeddingConfig, ChatMemorySettings } from '@/types/api'
+import type { EmbeddingConfig, ChatMemorySettings, ChatSummary, Character, CharacterSummary } from '@/types/api'
+import type { ImpersonationPreference } from '@/lib/impersonationPreset'
 import type { WorldBookVectorPresetMode, WorldBookVectorSettings } from '@/types/world-book-vector-settings'
 import AccountSettings from '@/components/settings/AccountSettings'
 import UserManagement from '@/components/settings/UserManagement'
@@ -66,11 +69,17 @@ import DataPortability from '@/components/settings/DataPortability'
 import StreamDeckSettings from '@/components/settings/StreamDeckSettings'
 import CollapsibleSection from '@/components/shared/CollapsibleSection'
 import EmbeddingConnectionPicker from '@/components/shared/EmbeddingConnectionPicker'
+import ConnectionSelect from '@/components/shared/ConnectionSelect'
+import SearchableSelect, { type SearchableSelectOption } from '@/components/shared/SearchableSelect'
 import pickerStyles from '@/components/shared/SidecarConnectionPicker.module.css'
 import ModelCombobox from '@/components/panels/connection-manager/ModelCombobox'
 import { getVisibleSettingsTabs, sectionAnchorId, SETTINGS_TABS } from '@/lib/settings-tab-registry'
 import { activateExtensionSettingsTab } from '@/lib/spindle/settings-tab-bridge'
-import { getSafeHttpsUrl } from '@/lib/navigationSafety'
+import {
+  closeAuthorizationPopup,
+  navigateAuthorizationPopup,
+  reserveAuthorizationPopup,
+} from '@/lib/authorizationPopup'
 import type { SettingsTabState } from '@/store/slices/spindle-placement'
 import SettingsSearch from './SettingsSearch'
 import styles from './SettingsModal.module.css'
@@ -914,6 +923,7 @@ function CompletionSoundUploader({ disabled, current, onChange, onError, onSucce
 function ChatSettings() {
   const { t } = useTranslation('settings')
   const { t: tc } = useTranslation('common')
+  const { t: tChat } = useTranslation('chat', { keyPrefix: 'quickMenu' })
   const displayMode = useStore((s) => s.chatDisplayMode)
   const minimalUseFullAvatar = useStore((s) => s.minimalUseFullAvatar ?? false)
   const bubbleUserAlign = useStore((s) => s.bubbleUserAlign)
@@ -923,6 +933,7 @@ function ChatSettings() {
   const bubbleOpacity = useStore((s) => s.bubbleOpacity ?? 1)
   const enterToSend = useStore((s) => s.inputBarEnterToSend)
   const saveDraftInput = useStore((s) => s.saveDraftInput)
+  const defaultImpersonationMode = useStore((s) => s.defaultImpersonationMode)
   const portraitPanelSide = useStore((s) => s.portraitPanelSide)
   const chatWidthMode = useStore((s) => s.chatWidthMode)
   const chatContentMaxWidth = useStore((s) => s.chatContentMaxWidth)
@@ -1179,9 +1190,15 @@ function ChatSettings() {
       <h3 id={sectionAnchorId('chat', 'input')} className={styles.sectionTitle} style={{ marginTop: 12 }}>{t('chat.inputTitle')}</h3>
 
       <Toggle.Checkbox
-        checked={enterToSend}
-        onChange={setInputBarEnterToSend}
-        label={t('chat.enterToSend')}
+        checked={enterToSend.desktop}
+        onChange={(desktop) => setInputBarEnterToSend({ ...enterToSend, desktop })}
+        label={t('chat.enterToSendDesktop')}
+      />
+
+      <Toggle.Checkbox
+        checked={enterToSend.mobile}
+        onChange={(mobile) => setInputBarEnterToSend({ ...enterToSend, mobile })}
+        label={t('chat.enterToSendMobile')}
       />
 
       <Toggle.Checkbox
@@ -1190,6 +1207,20 @@ function ChatSettings() {
         label={t('chat.saveDraft')}
         hint={t('chat.saveDraftHint')}
       />
+
+      <div className={styles.field}>
+        <label className={styles.fieldLabel}>{t('chat.defaultImpersonationMode')}</label>
+        <select
+          className={styles.select}
+          value={defaultImpersonationMode}
+          onChange={(e) => setSetting('defaultImpersonationMode', e.target.value as ImpersonationPreference)}
+        >
+          <option value="prompts">{tChat('presetPrompts')}</option>
+          <option value="preset">{tChat('impersonationPreset')}</option>
+          <option value="oneliner">{tChat('oneLiner')}</option>
+        </select>
+        <span className={styles.helperText}>{t('chat.defaultImpersonationModeHint')}</span>
+      </div>
 
       <div className={styles.field}>
         <label className={styles.fieldLabel}>{t('chat.portraitSide')}</label>
@@ -1320,13 +1351,151 @@ function ExtensionSettingsView() {
 interface SortableGuideRowProps {
   guide: GuidedGeneration
   editing: boolean
+  chats: ChatSummary[]
+  characters: Character[]
+  activeChatId: string | null
+  activeCharacterId: string | null
   onToggleEnabled: (id: string, value: boolean) => void
   onToggleEdit: (id: string) => void
   onUpdate: (id: string, patch: Partial<GuidedGeneration>) => void
   onRemove: (id: string) => void
 }
 
-function SortableGuideRow({ guide, editing, onToggleEnabled, onToggleEdit, onUpdate, onRemove }: SortableGuideRowProps) {
+const GUIDED_CHARACTER_PAGE_SIZE = 20
+
+function GuidedCharacterTargetPicker({
+  value,
+  onChange,
+}: {
+  value: string
+  onChange: (id: string) => void
+}) {
+  const { t } = useTranslation('settings')
+  const [search, setSearch] = useState('')
+  const [debouncedSearch, setDebouncedSearch] = useState('')
+  const [items, setItems] = useState<CharacterSummary[]>([])
+  const [total, setTotal] = useState(0)
+  const [received, setReceived] = useState(0)
+  const [loading, setLoading] = useState(false)
+  const [selectedFallback, setSelectedFallback] = useState<SearchableSelectOption | null>(null)
+  const requestGenerationRef = useRef(0)
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedSearch(search.trim()), 250)
+    return () => window.clearTimeout(timer)
+  }, [search])
+
+  const handleSearchChange = useCallback((value: string) => {
+    setSearch(value)
+    setItems([])
+    setTotal(0)
+    setReceived(0)
+  }, [])
+
+  useEffect(() => {
+    const generation = ++requestGenerationRef.current
+    const controller = new AbortController()
+    setItems([])
+    setTotal(0)
+    setReceived(0)
+    setLoading(true)
+    charactersApi.listSummaries({
+      limit: GUIDED_CHARACTER_PAGE_SIZE,
+      offset: 0,
+      search: debouncedSearch || undefined,
+      sort: 'name',
+      direction: 'asc',
+    }, controller.signal).then((result) => {
+      if (generation !== requestGenerationRef.current) return
+      setItems(result.data)
+      setTotal(result.total)
+      setReceived(result.data.length)
+    }).catch((error: unknown) => {
+      if (generation !== requestGenerationRef.current) return
+      if (!(error instanceof DOMException && error.name === 'AbortError')) {
+        setItems([])
+        setTotal(0)
+        setReceived(0)
+      }
+    }).finally(() => {
+      if (generation === requestGenerationRef.current) setLoading(false)
+    })
+    return () => controller.abort()
+  }, [debouncedSearch])
+
+  const loadMore = useCallback(() => {
+    if (loading || received >= total) return
+    const generation = requestGenerationRef.current
+    setLoading(true)
+    charactersApi.listSummaries({
+      limit: GUIDED_CHARACTER_PAGE_SIZE,
+      offset: received,
+      search: debouncedSearch || undefined,
+      sort: 'name',
+      direction: 'asc',
+    }).then((result) => {
+      if (generation !== requestGenerationRef.current) return
+      setItems((current) => {
+        const seen = new Set(current.map((item) => item.id))
+        return [...current, ...result.data.filter((item) => !seen.has(item.id))]
+      })
+      setTotal(result.total)
+      setReceived((current) => current + result.data.length)
+    }).catch(() => {}).finally(() => {
+      if (generation === requestGenerationRef.current) setLoading(false)
+    })
+  }, [debouncedSearch, loading, received, total])
+
+  useEffect(() => {
+    if (!value || items.some((item) => item.id === value)) {
+      setSelectedFallback(null)
+      return
+    }
+    let cancelled = false
+    charactersApi.get(value).then((character) => {
+      if (cancelled) return
+      setSelectedFallback({
+        value: character.id,
+        label: character.name,
+        sublabel: character.creator || undefined,
+      })
+    }).catch(() => { if (!cancelled) setSelectedFallback(null) })
+    return () => { cancelled = true }
+  }, [items, value])
+
+  const options = useMemo(() => {
+    const pageOptions = items.map((character) => ({
+      value: character.id,
+      label: character.name,
+      sublabel: character.creator || undefined,
+    }))
+    return !search && selectedFallback && !items.some((item) => item.id === selectedFallback.value)
+      ? [selectedFallback, ...pageOptions]
+      : pageOptions
+  }, [items, search, selectedFallback])
+  return (
+    <SearchableSelect
+      value={value}
+      onChange={onChange}
+      options={options}
+      forceSearch
+      remoteSearch
+      onSearchChange={handleSearchChange}
+      searchPlaceholder={t('guided.searchCharacters')}
+      placeholder={t('guided.noTargets')}
+      emptyMessage={t('guided.noTargets')}
+      ariaLabel={t('guided.autoEnableTarget')}
+      loading={loading}
+      hasMore={received < total}
+      onLoadMore={loadMore}
+      loadingMessage={t('guided.loadingCharacters')}
+      loadMoreLabel={t('guided.loadMoreCharacters')}
+      portal
+    />
+  )
+}
+
+function SortableGuideRow({ guide, editing, chats, characters, activeChatId, activeCharacterId, onToggleEnabled, onToggleEdit, onUpdate, onRemove }: SortableGuideRowProps) {
   const { t } = useTranslation('settings')
   const { t: tc } = useTranslation('common')
   const { attributes, listeners, setNodeRef: setSortableRef, transform, transition, isDragging } = useSortable({ id: guide.id })
@@ -1337,6 +1506,21 @@ function SortableGuideRow({ guide, editing, onToggleEnabled, onToggleEdit, onUpd
     user_suffix: t('guided.positionAfter'),
   }[guide.position] ?? guide.position
   const modeLabel = guide.mode === 'oneshot' ? t('guided.oneshot') : t('guided.persistent')
+  const profiles = useStore((s) => s.profiles)
+  const autoTargetLabel = guide.autoEnable?.scope === 'connection'
+    ? profiles.find((profile) => profile.id === guide.autoEnable?.id)?.name
+    : guide.autoEnable?.scope === 'chat'
+      ? chats.find((chat) => chat.id === guide.autoEnable?.id)?.name
+      : guide.autoEnable?.scope === 'character'
+        ? characters.find((character) => character.id === guide.autoEnable?.id)?.name
+        : null
+  const autoLabel = guide.autoEnable
+    ? t('guided.autoSummary', { target: autoTargetLabel || t('guided.missingTarget') })
+    : null
+  const chatOptions = useMemo(() => chats.map((chat) => ({
+    value: chat.id,
+    label: chat.name || t('guided.unnamedChat'),
+  })), [chats, t])
   return (
     <div
       ref={setNodeRef}
@@ -1356,7 +1540,7 @@ function SortableGuideRow({ guide, editing, onToggleEnabled, onToggleEdit, onUpd
         <Toggle.Switch checked={guide.enabled} onChange={(v) => onToggleEnabled(guide.id, v)} size="sm" />
         <div className={styles.cardTitleWrap}>
           <div className={styles.cardTitle}>{guide.name || t('guided.untitled')}</div>
-          <div className={styles.cardMeta}>{modeLabel} · {positionLabel}</div>
+          <div className={styles.cardMeta}>{modeLabel} · {positionLabel}{autoLabel ? ` · ${autoLabel}` : ''}</div>
         </div>
         <Button variant="ghost" size="sm" onClick={() => onToggleEdit(guide.id)}>{editing ? tc('actions.done') : tc('actions.edit')}</Button>
         <Button variant="danger-ghost" size="sm" onClick={() => onRemove(guide.id)}>{tc('actions.delete')}</Button>
@@ -1380,6 +1564,62 @@ function SortableGuideRow({ guide, editing, onToggleEnabled, onToggleEdit, onUpd
               <option value="oneshot">{t('guided.oneshot')}</option>
             </select>
           </div>
+          <div className={styles.drawerRow}>
+            <select
+              className={styles.select}
+              value={guide.autoEnable?.scope || ''}
+              aria-label={t('guided.autoEnableScope')}
+              onChange={(event) => {
+                const scope = event.target.value as NonNullable<GuidedGeneration['autoEnable']>['scope'] | ''
+                if (!scope) {
+                  onUpdate(guide.id, { autoEnable: null })
+                  return
+                }
+                const firstId = scope === 'connection'
+                  ? profiles[0]?.id
+                  : scope === 'chat'
+                    ? (activeChatId && chats.some((chat) => chat.id === activeChatId) ? activeChatId : chats[0]?.id)
+                    : (activeCharacterId || characters[0]?.id)
+                onUpdate(guide.id, { autoEnable: { scope, id: firstId || '' } })
+              }}
+            >
+              <option value="">{t('guided.autoEnableNone')}</option>
+              <option value="connection">{t('guided.autoEnableConnection')}</option>
+              <option value="chat">{t('guided.autoEnableChat')}</option>
+              <option value="character">{t('guided.autoEnableCharacter')}</option>
+            </select>
+            {guide.autoEnable?.scope === 'connection' && (
+              <ConnectionSelect
+                kind="llm"
+                value={guide.autoEnable.id}
+                onChange={(id) => onUpdate(guide.id, { autoEnable: { scope: 'connection', id } })}
+                placeholder={t('guided.noTargets')}
+                searchPlaceholder={t('guided.searchConnections')}
+                emptyMessage={t('guided.noTargets')}
+                ariaLabel={t('guided.autoEnableTarget')}
+                portal
+              />
+            )}
+            {guide.autoEnable?.scope === 'chat' && (
+              <SearchableSelect
+                value={guide.autoEnable.id}
+                onChange={(id) => onUpdate(guide.id, { autoEnable: { scope: 'chat', id } })}
+                options={chatOptions}
+                placeholder={t('guided.noChatsForCharacter')}
+                searchPlaceholder={t('guided.searchChats')}
+                emptyMessage={t('guided.noChatsForCharacter')}
+                ariaLabel={t('guided.autoEnableTarget')}
+                portal
+              />
+            )}
+            {guide.autoEnable?.scope === 'character' && (
+              <GuidedCharacterTargetPicker
+                value={guide.autoEnable.id}
+                onChange={(id) => onUpdate(guide.id, { autoEnable: { scope: 'character', id } })}
+              />
+            )}
+          </div>
+          <p className={styles.placeholder}>{t('guided.autoEnableHint')}</p>
           <ExpandableTextarea
             className={formStyles.textarea}
             value={guide.content}
@@ -1400,7 +1640,24 @@ function GuidedGenerationSettings() {
   const guides = useStore((s) => s.guidedGenerations)
   const setSetting = useStore((s) => s.setSetting)
   const openModal = useStore((s) => s.openModal)
+  const activeChatId = useStore((s) => s.activeChatId)
+  const activeCharacterId = useStore((s) => s.activeCharacterId)
+  const characters = useStore((s) => s.characters)
   const [editingId, setEditingId] = useState<string | null>(null)
+  const [chats, setChats] = useState<ChatSummary[]>([])
+
+  useEffect(() => {
+    if (!activeCharacterId) {
+      setChats([])
+      return
+    }
+    let cancelled = false
+    setChats([])
+    chatsApi.listCharacterChats(activeCharacterId)
+      .then((result) => { if (!cancelled) setChats(result) })
+      .catch(() => { if (!cancelled) setChats([]) })
+    return () => { cancelled = true }
+  }, [activeCharacterId])
 
   const sensors = useSensors(
     useSensor(MouseSensor, { activationConstraint: { distance: 4 } }),
@@ -1468,6 +1725,10 @@ function GuidedGenerationSettings() {
               key={g.id}
               guide={g}
               editing={editingId === g.id}
+              chats={chats}
+              characters={characters}
+              activeChatId={activeChatId}
+              activeCharacterId={activeCharacterId}
               onToggleEnabled={(id, value) => updateGuide(id, { enabled: value })}
               onToggleEdit={(id) => setEditingId((prev) => (prev === id ? null : id))}
               onUpdate={updateGuide}
@@ -3721,6 +3982,7 @@ function LumiHubSettings() {
       setError(t('lumihub.errUrl'))
       return
     }
+    const authorizationTab = reserveAuthorizationPopup({ name: 'lumiverse_lumihub_link' })
     setError(null)
     setLinking(true)
     try {
@@ -3732,11 +3994,20 @@ function LumiHubSettings() {
       })
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
+        closeAuthorizationPopup(authorizationTab)
         setError((body as any).error || t('lumihub.errLinkFailed'))
+        setLinking(false)
         return
       }
       const data = await res.json() as { authorize_url: string }
-      window.open(data.authorize_url, '_blank')
+      const navigation = navigateAuthorizationPopup(authorizationTab, data.authorize_url, { allowHttp: true })
+      if (navigation.status === 'invalid') {
+        closeAuthorizationPopup(authorizationTab)
+        setError(t('lumihub.errLinkFailed'))
+        setLinking(false)
+        return
+      }
+      if (navigation.status === 'blocked') window.location.assign(navigation.url)
       // Poll for status change
       const poll = setInterval(async () => {
         const checkRes = await fetch('/api/v1/lumihub/status', { credentials: 'include' })
@@ -3752,6 +4023,7 @@ function LumiHubSettings() {
       // Stop polling after 5 minutes
       setTimeout(() => { clearInterval(poll); setLinking(false) }, 5 * 60 * 1000)
     } catch (err: any) {
+      closeAuthorizationPopup(authorizationTab)
       setError(err.message || t('lumihub.errConnectFailed'))
       setLinking(false)
     }
@@ -3912,7 +4184,7 @@ function IllarinSettings() {
   const { t } = useTranslation('settings')
   const user = useStore((s) => s.user)
   const defaultInstanceName = user?.name ? `${user.name}'s Lumiverse` : t('illarin.defaultInstance')
-  const [illarinUrl, setIllarinUrl] = useState('https://illarin.xyz')
+  const [illarinUrl, setIllarinUrl] = useState('https://illarin.com')
   const [instanceName, setInstanceName] = useState(defaultInstanceName)
   const [status, setStatus] = useState<{
     linked: boolean
@@ -3972,34 +4244,53 @@ function IllarinSettings() {
     fetchStatus()
   }
 
-  const startDeviceFlow = async () => {
-    const res = await fetch('/api/v1/illarin/link/device', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-      body: JSON.stringify({ illarin_url: illarinUrl.trim(), instance_name: instanceName.trim() || defaultInstanceName }),
-    })
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({}))
-      setError((body as any).error || t('illarin.errLinkFailed'))
+  const startDeviceFlow = async (authorizationTab: Window | null) => {
+    try {
+      const res = await fetch('/api/v1/illarin/link/device', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ illarin_url: illarinUrl.trim(), instance_name: instanceName.trim() || defaultInstanceName }),
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        closeAuthorizationPopup(authorizationTab)
+        setError((body as any).error || t('illarin.errLinkFailed'))
+        setLinking(false)
+        return false
+      }
+      const data = await res.json() as { user_code: string; verification_url: string; expires_at: string }
+      const navigation = navigateAuthorizationPopup(authorizationTab, data.verification_url)
+      if (navigation.status === 'invalid') {
+        closeAuthorizationPopup(authorizationTab)
+        setError(t('illarin.errLinkFailed'))
+        setLinking(false)
+        return false
+      }
+      setDeviceCode({ user_code: data.user_code, verification_url: navigation.url })
+      // Poll respecting the server-enforced interval; give up at expiry.
+      pollRef.current.timer = setInterval(async () => {
+        try {
+          const check = await fetch('/api/v1/illarin/link/device/status', { credentials: 'include' })
+          if (!check.ok) return
+          const checkData = await check.json() as { status: string }
+          if (checkData.status === 'linked') finishLinking()
+          else if (checkData.status !== 'pending') {
+            setError(t('illarin.errLinkFailed'))
+            finishLinking()
+          }
+        } catch {
+          // A transient status failure should not cancel the device session.
+        }
+      }, 3000)
+      pollRef.current.timeout = setTimeout(finishLinking, 10 * 60 * 1000)
+      return true
+    } catch (err: any) {
+      closeAuthorizationPopup(authorizationTab)
+      setError(err.message || t('illarin.errConnectFailed'))
       setLinking(false)
       return false
     }
-    const data = await res.json() as { user_code: string; verification_url: string; expires_at: string }
-    setDeviceCode({ user_code: data.user_code, verification_url: data.verification_url })
-    // Poll respecting the server-enforced interval; give up at expiry.
-    pollRef.current.timer = setInterval(async () => {
-      const check = await fetch('/api/v1/illarin/link/device/status', { credentials: 'include' })
-      if (!check.ok) return
-      const checkData = await check.json() as { status: string }
-      if (checkData.status === 'linked') finishLinking()
-      else if (checkData.status !== 'pending') {
-        setError(t('illarin.errLinkFailed'))
-        finishLinking()
-      }
-    }, 3000)
-    pollRef.current.timeout = setTimeout(finishLinking, 10 * 60 * 1000)
-    return true
   }
 
   const handleLink = async () => {
@@ -4009,15 +4300,13 @@ function IllarinSettings() {
     }
 
     // Reserve the tab while this click still has browser user activation.
-    // Calling window.open only after the API request is blocked by mobile
-    // browsers, even though the request originated from this button click.
-    const authorizationTab = isLocalOrigin ? window.open('', '_blank') : null
-    if (authorizationTab) authorizationTab.opener = null
+    // The same window carries either local PKCE or remote device verification.
+    const authorizationTab = reserveAuthorizationPopup({ name: 'lumiverse_illarin_link' })
 
     setError(null)
     setLinking(true)
     if (!isLocalOrigin) {
-      await startDeviceFlow()
+      await startDeviceFlow(authorizationTab)
       return
     }
     try {
@@ -4029,24 +4318,23 @@ function IllarinSettings() {
       })
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
-        authorizationTab?.close()
+        closeAuthorizationPopup(authorizationTab)
         setError((body as any).error || t('illarin.errLinkFailed'))
         setLinking(false)
         return
       }
       const data = await res.json() as { authorize_url?: string }
-      const authorizeUrl = getSafeHttpsUrl(data.authorize_url)
-      if (!authorizeUrl) {
-        authorizationTab?.close()
+      const navigation = navigateAuthorizationPopup(authorizationTab, data.authorize_url)
+      if (navigation.status === 'invalid') {
+        closeAuthorizationPopup(authorizationTab)
         setError(t('illarin.errLinkFailed'))
         setLinking(false)
         return
       }
 
-      // Prefer the tab reserved synchronously above. If popups are disabled,
-      // same-tab navigation still lets the user complete the loopback flow.
-      if (authorizationTab) authorizationTab.location.replace(authorizeUrl)
-      else window.location.assign(authorizeUrl)
+      // Same-tab navigation still completes local loopback authorization when
+      // a browser blocks the reserved popup.
+      if (navigation.status === 'blocked') window.location.assign(navigation.url)
 
       // Backend listens on loopback while the authorization page is open.
       pollRef.current.timer = setInterval(async () => {
@@ -4063,10 +4351,21 @@ function IllarinSettings() {
       }, 2000)
       pollRef.current.timeout = setTimeout(finishLinking, 5 * 60 * 1000)
     } catch (err: any) {
-      authorizationTab?.close()
+      closeAuthorizationPopup(authorizationTab)
       setError(err.message || t('illarin.errConnectFailed'))
       setLinking(false)
     }
+  }
+
+  const handleDeviceLink = () => {
+    if (!illarinUrl.trim()) {
+      setError(t('illarin.errUrl'))
+      return
+    }
+    const authorizationTab = reserveAuthorizationPopup({ name: 'lumiverse_illarin_device_link' })
+    setError(null)
+    setLinking(true)
+    void startDeviceFlow(authorizationTab)
   }
 
   const handleUnlink = async () => {
@@ -4161,6 +4460,15 @@ function IllarinSettings() {
               <span className={styles.lumihubDisclosureText}>
                 {t('illarin.deviceStep1', { url: deviceCode.verification_url })}
                 <br />
+                <a
+                  className={styles.illarinVerificationLink}
+                  href={deviceCode.verification_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  {t('illarin.openVerification')}
+                </a>
+                <br />
                 {t('illarin.deviceStep2')}
               </span>
               <span className={styles.lumihubInput} style={{ fontSize: '1.4em', textAlign: 'center', letterSpacing: '0.2em' }}>
@@ -4182,8 +4490,8 @@ function IllarinSettings() {
             {linking ? t('illarin.linking') : t('illarin.link')}
           </Button>
 
-          {!isLocalOrigin && !deviceCode && (
-            <Button variant="ghost" size="sm" onClick={() => { setLinking(true); void startDeviceFlow() }}>
+          {isLocalOrigin && !deviceCode && (
+            <Button variant="ghost" size="sm" onClick={handleDeviceLink} disabled={linking}>
               {t('illarin.deviceFallback')}
             </Button>
           )}

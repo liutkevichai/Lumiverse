@@ -86,11 +86,18 @@ export interface SsoLinksResponse {
 }
 
 async function authPost<T>(path: string, body: any): Promise<T> {
+  const query = new URLSearchParams(window.location.search)
+  const oauthQuery = query.has('client_id') && query.has('sig')
+    ? window.location.search.slice(1)
+    : null
   const res = await fetch(`/api/auth${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
     credentials: 'include',
-    body: JSON.stringify(body),
+    // This request bypasses Better Auth's generated client, so preserve the
+    // OAuth Provider's signed continuation explicitly when an external native
+    // authorization is in progress.
+    body: JSON.stringify(oauthQuery ? { ...body, oauth_query: oauthQuery } : body),
   })
   if (!res.ok) {
     let parsed: any = null
@@ -126,9 +133,9 @@ export const ssoProvidersApi = {
     return del<{ success: boolean; recovery: SsoRecoveryStatus }>(`/sso-providers/links/${encodeURIComponent(providerId)}`)
   },
   getLoginUrl(providerId: string, callbackURL = '/') {
-    return authPost<{ url: string; redirect: boolean }>('/sign-in/oauth2', { providerId, callbackURL, disableRedirect: true })
+    return authPost<{ url: string; redirect: boolean }>('/sign-in/social', { provider: providerId, callbackURL, disableRedirect: true })
   },
   getLinkUrl(providerId: string, callbackURL = '/sso-complete') {
-    return authPost<{ url: string; redirect: boolean }>('/oauth2/link', { providerId, callbackURL })
+    return authPost<{ url: string; redirect: boolean }>('/link-social', { provider: providerId, callbackURL, disableRedirect: true })
   },
 }

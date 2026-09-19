@@ -8,7 +8,7 @@ const LONG: RequestOptions = { timeout: 120_000 }
 
 export type GenerationType = 'normal' | 'continue' | 'regenerate' | 'swipe' | 'impersonate' | 'quiet'
 
-export type ImpersonateMode = 'prompts' | 'oneliner' | 'sovereign_hand'
+export type ImpersonateMode = 'prompts' | 'preset' | 'oneliner' | 'sovereign_hand'
 
 export interface GenerateRequest {
   chat_id: string
@@ -90,6 +90,8 @@ export interface QuietGenerateResponse {
   content: string
   reasoning?: string
   finish_reason: string
+  stop_details?: { type: string; category?: string | null; explanation?: string | null } | null
+  stop_sequence?: string | null
   usage?: {
     prompt_tokens: number
     completion_tokens: number
@@ -292,6 +294,9 @@ export interface GenerationStatusResponse {
   completedMessageId?: string
   completedAt?: number
   error?: string
+  errorCode?: string
+  errorMessage?: string
+  connectionName?: string
 }
 
 export interface ActiveGenerationEntry {

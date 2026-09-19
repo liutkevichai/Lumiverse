@@ -27,20 +27,7 @@ import {
   runRegexJobInWorker,
 } from './worker-client'
 import { shouldPermanentlyQuarantineRegex } from './quarantine-policy'
-
-export interface TieredSlowRegexReport {
-  script: RegexScript
-  elapsedMs: number
-  timedOut: boolean
-  thresholdMs: number
-}
-
-export interface TieredApplyCallbacks {
-  onSlowRegex?: (report: TieredSlowRegexReport) => void
-  onRecoveredRegex?: (report: TieredSlowRegexReport) => void
-}
-
-type ResolveRawTemplates = (templates: Record<string, string>) => Promise<Record<string, string>>
+import { canSkipDisplayRegex } from './match-gate'
 
 // The once-per-script bookkeeping lives in evidence.ts so that clearing a
 // quarantine can reset it without evidence.ts importing this module (which
@@ -90,6 +77,8 @@ function canTreatMacroSensitiveModesAsNativeReplace(
 }
 
 function isWorkerCapable(script: RegexScript, macroSensitiveModesAreSafe = false): boolean {
+  // Bounded preset inputs must be resolved against owned server-side snapshots.
+  if (script.preset_id && script.metadata?.prompt_activation && script.find_regex.includes('{{')) return false
   if (script.actions.length > 0) return false
   if (Array.isArray(script.metadata?.match_actions) && script.metadata.match_actions.length > 0) return false
   if (
@@ -97,20 +86,6 @@ function isWorkerCapable(script: RegexScript, macroSensitiveModesAreSafe = false
     && !macroSensitiveModesAreSafe
   ) return false
   return true
-}
-
-/**
- * True when a streaming display pass can stay entirely in the browser worker.
- * These passes can follow the existing 32ms stream cadence without restoring
- * the per-token backend load that the display coalescer was added to prevent.
- */
-export function canApplyDisplayRegexInWorker(
-  content: string,
-  scripts: readonly RegexScript[],
-): boolean {
-  const macroSensitiveModesAreSafe = canTreatMacroSensitiveModesAsNativeReplace(content, scripts)
-  return workerSupported()
-    && scripts.every((script) => isWorkerCapable(script, macroSensitiveModesAreSafe))
 }
 
 function resolveWorkerScript(
@@ -290,8 +265,6 @@ export async function applyDisplayRegexTiered(
   content: string,
   scripts: RegexScript[],
   context: ApplyDisplayRegexContext,
-  _resolveRawTemplates: ResolveRawTemplates,
-  _callbacks?: TieredApplyCallbacks,
 ): Promise<DisplayRegexBackendResult> {
   const owned = await applyDisplayRegexViaOwnedResolver(content, scripts, context)
   if (owned) return owned
@@ -321,6 +294,12 @@ export async function applyDisplayRegexTiered(
     : null
 
   while (index < eligible.length) {
+    // Recheck against the output of earlier batches. Filtering the whole
+    // original list would lose matches introduced by an earlier replacement.
+    if (canSkipDisplayRegex(result, eligible[index]!, context.resolvedFindPatterns)) {
+      index += 1
+      continue
+    }
     if (!isWorkerCapable(eligible[index]!, macroSensitiveModesAreSafe)) {
       let end = index + 1
       while (end < eligible.length && !isWorkerCapable(eligible[end]!, macroSensitiveModesAreSafe)) end += 1

@@ -7,7 +7,8 @@ import type {
 import type { LlmMessage } from "../../llm/types";
 import { eventBus } from "../../ws/bus";
 import { EventType } from "../../ws/events";
-import { rawGenerate } from "../generate.service";
+import { rawGenerate } from "../generation/direct-generation";
+import type { GenerationCallOptions } from "../../llm/request-observer";
 import * as chatsSvc from "../chats.service";
 import * as charactersSvc from "../characters.service";
 import * as personasSvc from "../personas.service";
@@ -52,6 +53,7 @@ export interface CouncilEnrichment {
 const GOOGLE_PLANNING_PROVIDERS = new Set(["google", "google_vertex"]);
 
 interface ExecuteInput {
+  generationId?: string;
   userId: string;
   chatId: string;
   personaId?: string;
@@ -264,6 +266,10 @@ async function executeMemberTools(
   const identityMsg = buildMemberIdentity(member, lumiaItem);
 
   for (const toolName of member.tools) {
+    const requestContext: GenerationCallOptions = {
+      chatId: input.chatId, generationId: input.generationId,
+      origin: { kind: "sidecar", name: `Council · ${member.itemName}` },
+    };
     if (input.signal?.aborted) {
       console.debug("[council] Aborted before tool '%s' for member '%s'", toolName, member.itemName);
       break;
@@ -307,6 +313,7 @@ async function executeMemberTools(
             contextMessages,
             settings.toolsSettings.timeoutMs,
             input.signal,
+            requestContext,
           );
 
           content = await getMcpClientManager().callTool(
@@ -344,12 +351,13 @@ async function executeMemberTools(
             bareToolName,
             {
               context: contextSummary,
-              // Deadline hint is opaque and useful for the extension; userId is
-              // intentionally NOT included here — the worker host strips any
-              // attempted __userId injection before posting to the worker.
+              // Deadline hint is opaque and useful for the extension. Authenticated
+              // userId is intentionally NOT included in model-controlled args; it
+              // travels separately below as trusted host-owned transport metadata.
               __deadlineMs: Date.now() + settings.toolsSettings.timeoutMs,
             },
             settings.toolsSettings.timeoutMs,
+            input.userId,
             memberContext,
             contextMessages
           );
@@ -363,6 +371,7 @@ async function executeMemberTools(
             contextMessages,
             settings.toolsSettings.timeoutMs,
             input.signal,
+            requestContext,
           );
 
           content = await executeHostCouncilTool({
@@ -385,7 +394,8 @@ async function executeMemberTools(
             contextMessages,
             settings.toolsSettings,
             input.signal,
-            input.enrichment
+            input.enrichment,
+            requestContext,
           );
         }
         success = true;
@@ -601,15 +611,15 @@ export function appendCouncilDeliberationHistory(input: {
 }
 
 /**
- * Route a tool call to the extension worker that registered it. We never
- * forward the authenticated userId — extensions run in their own user-scoped
- * worker and reach back via the RPC bridge under that identity. Passing the
- * raw userId to the tool handler would let a malicious extension impersonate
- * the user via its own internal state, defeating the worker boundary.
+ * Extension tool invocations receive authenticated user context only as
+ * trusted host-owned transport metadata. It is never sourced from or merged
+ * into model-controlled tool args. The worker runtime exposes that context as
+ * the TOOL_INVOCATION handler's second argument so operator-scoped extensions
+ * can safely reach user-scoped Spindle APIs.
  *
- * `councilMember` is a trusted host-built snapshot of the assigned member's
- * identity/personality fields — delivered to the extension handler alongside
- * the invocation args so the tool can tailor its output to that member.
+ * `councilMember` remains a separate trusted host-built snapshot of the
+ * assigned member's identity/personality fields so the tool can tailor output
+ * without mixing either host-owned context object into user-space args.
  */
 /** Call the sidecar LLM for a single tool. */
 async function invokeSidecarTool(
@@ -621,7 +631,8 @@ async function invokeSidecarTool(
   contextMessages: LlmMessage[],
   toolsSettings: { maxWordsPerTool: number; timeoutMs: number; allowUserControl?: boolean },
   signal?: AbortSignal,
-  enrichment?: CouncilEnrichment
+  enrichment?: CouncilEnrichment,
+  requestContext?: GenerationCallOptions,
 ): Promise<string> {
   if (!tool.prompt) {
     throw new Error(`LLM council tool \"${tool.displayName}\" is missing a prompt`);
@@ -681,7 +692,7 @@ ${tool.prompt}${dynamicSuffix}${brevityNote}${userControlNote}`;
       max_tokens: sidecar.maxTokens,
     },
     signal,
-  });
+  }, { ...requestContext, origin: { kind: "sidecar", name: requestContext?.origin?.name ?? "Council", operation: `${tool.displayName} · analysis` } });
 
   return response.content || "";
 }
@@ -843,6 +854,7 @@ async function planWebSearchArgs(
   tool: RuntimeCouncilToolDefinition,
   contextMessages: LlmMessage[],
   signal?: AbortSignal,
+  requestContext?: GenerationCallOptions,
 ): Promise<Record<string, unknown>> {
   if (!conn) throw new Error("Sidecar connection not found");
 
@@ -889,7 +901,7 @@ Rules:
       max_tokens: sidecar.maxTokens,
     },
     signal,
-  });
+  }, { ...requestContext, origin: { kind: "sidecar", name: requestContext?.origin?.name ?? "Council", operation: `${tool.displayName} · search planning` } });
 
   const query = normalizeWebSearchQueryText(response.content || "");
   console.debug("[council] Web Search planner output raw=%j normalized=%j", response.content || "", query);
@@ -909,6 +921,7 @@ async function repairCallableToolArgs(
   argsSchema: Record<string, unknown>,
   invalidFields: string[],
   signal?: AbortSignal,
+  requestContext?: GenerationCallOptions,
 ): Promise<Record<string, unknown> | null> {
   if (!conn) return null;
 
@@ -932,7 +945,7 @@ Return only a JSON object that matches the schema exactly and ensures those fiel
       max_tokens: Math.min(sidecar.maxTokens, 192),
     },
     signal,
-  });
+  }, { ...requestContext, origin: { kind: "sidecar", name: requestContext?.origin?.name ?? "Council", operation: `${tool.displayName} · argument repair` } });
 
   const parsed = parseJsonObject(repairResponse.content);
   if (!parsed) return null;
@@ -985,6 +998,7 @@ async function planCallableToolArgs(
   contextMessages: LlmMessage[],
   timeoutMs: number,
   signal?: AbortSignal,
+  requestContext?: GenerationCallOptions,
 ): Promise<Record<string, unknown>> {
   const argsSchema = getCouncilToolArgsSchema(userId, tool) ?? { type: "object", properties: {}, required: [] };
   if (!toolSchemaRequiresArgs(userId, tool)) {
@@ -1064,6 +1078,7 @@ Select the most appropriate arguments from the story context and call the provid
       tool,
       contextMessages,
       signal,
+      requestContext,
     );
   }
 
@@ -1085,7 +1100,7 @@ Select the most appropriate arguments from the story context and call the provid
     parameters: planningParameters,
     tools: [planningTool],
     signal,
-  });
+  }, { ...requestContext, origin: { kind: "sidecar", name: requestContext?.origin?.name ?? "Council", operation: `${tool.displayName} · argument planning` } });
 
   const plannedCall = response.tool_calls?.find((call) => call.name === planningTool.name);
   if (plannedCall) {
@@ -1104,6 +1119,7 @@ Select the most appropriate arguments from the story context and call the provid
       argsSchema,
       invalidFields,
       signal,
+      requestContext,
     );
     if (repaired) {
       return repaired;

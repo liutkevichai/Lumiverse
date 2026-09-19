@@ -28,6 +28,11 @@ import {
   theme,
 } from "./ui";
 import { askSecret, askText, closeInput } from "./input";
+import {
+  desktopBuildCommand,
+  inspectDesktopToolchain,
+} from "./desktop-toolchain";
+import { isInsideWindowsSystem32 } from "./windows-install-location";
 
 // All input goes through askText / askSecret (scripts/input.ts) so that a
 // single raw-mode consumer owns stdin.  Mixing Node's readline with a raw
@@ -80,6 +85,22 @@ async function main() {
   const identityPath = join(dataDir, "lumiverse.identity");
   const credentialsPath = join(dataDir, "owner.credentials");
 
+  // start.ps1 performs this check before it installs Bun or dependencies. Keep
+  // the wizard guarded too in case a user invokes `bun run setup` directly.
+  const isFirstInstall = !existsSync(identityPath) || !existsSync(credentialsPath);
+  const windowsDirectory = process.env.SystemRoot ?? process.env.WINDIR;
+  if (
+    platform() === "win32"
+    && isFirstInstall
+    && isInsideWindowsSystem32(projectRoot, windowsDirectory)
+  ) {
+    console.error("");
+    console.error("  Setup stopped: Lumiverse cannot be installed inside the Windows System32 directory.");
+    console.error(`  Move this repository to a user-owned folder (for example, ${process.env.USERPROFILE ?? "C:\\Users\\YourName"}\\Lumiverse) and run setup again.`);
+    console.error("");
+    process.exit(1);
+  }
+
   // Guard: don't overwrite existing setup
   if (existsSync(identityPath) && existsSync(credentialsPath) && existsSync(envPath)) {
     console.log("");
@@ -96,7 +117,7 @@ async function main() {
 
   // ─── Step 1: Admin account ─────────────────────────────────────────────
 
-  printStepHeader(1, 5, "Admin Account", "Create the owner account for your Lumiverse instance.");
+  printStepHeader(1, 6, "Admin Account", "Create the owner account for your Lumiverse instance.");
 
   // BetterAuth rejects very short usernames and our macro/URL paths assume a
   // non-trivial identifier.  Validate up-front so a fat-finger doesn't seed
@@ -137,7 +158,7 @@ async function main() {
 
   // ─── Step 2: Server port ───────────────────────────────────────────────
 
-  printStepHeader(2, 5, "Server Port", "The port Lumiverse will listen on.");
+  printStepHeader(2, 6, "Server Port", "The port Lumiverse will listen on.");
 
   let port = 7860;
   const portInput = await askText("Port", { defaultValue: "7860" });
@@ -153,7 +174,7 @@ async function main() {
 
   // ─── Step 3: Extension storage ─────────────────────────────────────────
 
-  printStepHeader(3, 5, "Extension Storage", "Maximum disk budget for Spindle extension data pools.");
+  printStepHeader(3, 6, "Extension Storage", "Maximum disk budget for Spindle extension data pools.");
 
   const defaultStorage = 500 * 1024 * 1024; // 500MB
   const storageInput = await askText("Max extension storage", { defaultValue: "500MB" });
@@ -173,7 +194,7 @@ async function main() {
 
   // ─── Step 4: Optional SMART support ────────────────────────────────────
 
-  printStepHeader(4, 5, "Disk Health Monitoring", "Install smartmontools so Lumiverse can report physical-drive SMART health.");
+  printStepHeader(4, 6, "Disk Health Monitoring", "Install smartmontools so Lumiverse can report physical-drive SMART health.");
 
   let smartStatus = await getSmartctlStatus();
   if (smartStatus.binary) {
@@ -223,7 +244,35 @@ async function main() {
 
   // ─── Step 5: Generate identity + write config ─────────────────────────
 
-  printStepHeader(5, 5, "Generating Identity", "Creating your encryption identity and credentials.");
+  printStepHeader(5, 6, "Lumiverse Desktop (optional)", "The desktop tray app is built on this machine; no prebuilt download exists.");
+
+  // Advisory only. Probing the toolchain shells out to other programs, and a
+  // restricted environment can make that throw — which must not abort a setup
+  // run that has already collected the user's credentials.
+  const desktopReport = await inspectDesktopToolchain().catch(() => null);
+  if (!desktopReport) {
+    console.log(`    ${theme.muted}Could not check the desktop build prerequisites here.${theme.reset}`);
+    console.log(`    ${theme.muted}Run ${theme.reset}bun run desktop:doctor${theme.muted} later to check them.${theme.reset}`);
+  } else if (desktopReport.ready) {
+    console.log(`    ${theme.success}This machine has everything needed to build it.${theme.reset}`);
+    console.log(`    ${theme.muted}From the repository root:${theme.reset}`);
+    console.log(`    ${theme.muted}  ${desktopBuildCommand()}${theme.reset}`);
+  } else {
+    console.log(`    ${theme.muted}Some build prerequisites are missing:${theme.reset}`);
+    for (const check of desktopReport.checks) {
+      if (check.status !== "missing") continue;
+      console.log(`    ${theme.warning}${check.label}${theme.reset} ${theme.muted}— ${check.detail}${theme.reset}`);
+    }
+    console.log(`    ${theme.muted}Run ${theme.reset}bun run desktop:doctor${theme.muted} for the exact install steps.${theme.reset}`);
+  }
+  console.log(`    ${theme.muted}The desktop app is optional — Lumiverse runs in any browser without it.${theme.reset}`);
+
+  console.log("");
+  printDivider();
+
+  // ─── Step 6: Generate identity + write config ─────────────────────────
+
+  printStepHeader(6, 6, "Generating Identity", "Creating your encryption identity and credentials.");
 
   await printCompletionAnimation();
 
@@ -304,6 +353,7 @@ async function main() {
       "Keep the data/ directory safe — it contains your encryption key,",
       "credentials, and database. Back up the entire data/ folder.",
       "To reset your password: bun run reset-password",
+      "Desktop app prerequisites: bun run desktop:doctor",
     ]
   );
 }

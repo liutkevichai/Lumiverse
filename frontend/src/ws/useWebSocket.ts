@@ -245,6 +245,8 @@ function getEmptyGeneratedSwipeTarget(state: ReturnType<typeof useStore.getState
   if (!chatId || !state.regeneratingMessageId || state.streamingSwipeId == null) return null
   const buffered = state.getStreamBuffers().content || state.streamingContent
   if (buffered.trim().length > 0) return null
+  // Reasoning-only failures still carry useful output and diagnostics.
+  if (state.getStreamBuffers().reasoning || state.streamingReasoning) return null
   return { chatId, messageId: state.regeneratingMessageId, swipeId: state.streamingSwipeId }
 }
 
@@ -321,36 +323,7 @@ function fetchLatestMessages(chatId: string) {
   return messagesApi.list(chatId, { limit: pageSize, tail: true })
 }
 
-/**
- * GENERATION_STARTED is a durable confirmation that the backend has already
- * staged the target swipe. Reflect it locally as well as listening for
- * MESSAGE_SWIPED: a list response or a short websocket gap must not leave the
- * streaming marker pointing past the visible swipe count.
- */
-function ensureStreamingTargetSwipe(
-  state: ReturnType<typeof useStore.getState>,
-  payload: GenerationStartedPayload,
-): void {
-  if (
-    payload.generationType !== 'swipe' ||
-    !payload.targetMessageId ||
-    payload.targetSwipeId == null
-  ) return
-
-  const message = state.messages.find((item) => item.id === payload.targetMessageId)
-  if (!message || message.swipes.length > payload.targetSwipeId) return
-
-  const missing = payload.targetSwipeId - message.swipes.length + 1
-  const now = Math.floor(Date.now() / 1000)
-  state.updateMessage(message.id, {
-    swipes: [...message.swipes, ...Array<string | null>(missing).fill('')],
-    swipe_dates: [...message.swipe_dates, ...Array<number>(missing).fill(now)],
-    swipe_id: payload.targetSwipeId,
-    content: '',
-  })
-}
-
-// Deferred generation metrics (tokenCount / TTFT / TPS / model / provider) are
+// Deferred generation metrics (tokenCount / TTFT / TPS / model / provider / preset) are
 // persisted *after* GENERATION_ENDED and pushed via GENERATION_METRICS_READY,
 // which races that event's reconciliation re-fetch (the fetch can read the row
 // before the metrics land). Buffer the last few keyed by message id so the
@@ -489,6 +462,7 @@ export function useWebSocket() {
     let cancelled = false
 
     const syncOperatorStatus = async () => {
+      if (document.visibilityState !== 'visible') return
       try {
         const status = await operatorApi.getStatus()
         if (cancelled) return
@@ -550,6 +524,7 @@ export function useWebSocket() {
     }
 
     async function syncExtensionUpdates() {
+      if (document.visibilityState !== 'visible') return
       try {
         const snapshot = await spindleApi.getUpdates()
         if (cancelled) return
@@ -805,10 +780,11 @@ export function useWebSocket() {
             // called without a targetMessageId (e.g. regeneration flow).
             state.setRegeneratingMessageId(payload.targetMessageId)
           }
+          // startStreaming can reject a late event for an ended generation.
+          if (store.getState().activeGenerationId !== payload.generationId) return
           // Anchor the streaming buffer to its swipe so the user can navigate to
           // other swipes mid-generation without smearing live tokens onto them.
           state.setStreamingSwipeId(payload.targetSwipeId ?? null)
-          ensureStreamingTargetSwipe(state, payload)
           // A new generation supersedes any stale "new swipe ready" badge on this
           // message — the upcoming completion will re-flag the fresh swipe if needed.
           if (payload.targetMessageId) state.clearUnseenSwipe(payload.targetMessageId)
@@ -835,10 +811,10 @@ export function useWebSocket() {
           } else if (payload.targetMessageId && state.regeneratingMessageId !== payload.targetMessageId) {
             state.setRegeneratingMessageId(payload.targetMessageId)
           }
+          if (store.getState().activeGenerationId !== payload.generationId) return
           // Refine (never clobber) the swipe anchor — GENERATION_STARTED is the
           // authoritative source; only overwrite if this event actually carries it.
           if (payload.targetSwipeId != null) state.setStreamingSwipeId(payload.targetSwipeId)
-          ensureStreamingTargetSwipe(state, payload)
 
           // Surface context clipping once the final assembly metadata is ready.
           const clip = payload.contextClipStats
@@ -933,7 +909,7 @@ export function useWebSocket() {
           }
 
           if (payload.error) {
-            const emptySwipeTarget = getEmptyGeneratedSwipeTarget(state, payload.chatId)
+            const emptySwipeTarget = payload.finish_reason ? null : getEmptyGeneratedSwipeTarget(state, payload.chatId)
             // Remove client-side placeholder if regeneration failed before backend saved a real message
             const regenId = state.regeneratingMessageId
             if (isLocalStreamPlaceholderId(regenId)) {
@@ -1249,7 +1225,7 @@ export function useWebSocket() {
         }
       }),
 
-      // Deferred metrics (tokenCount / TTFT / TPS / model / provider) arrive after
+      // Deferred metrics (tokenCount / TTFT / TPS / model / provider / preset) arrive after
       // GENERATION_ENDED — and may land before or after its reconciliation
       // re-fetch. Apply live, and buffer so the reconciliation can re-apply if its
       // setMessages won the race and wiped this patch (see GENERATION_ENDED).
@@ -1555,6 +1531,7 @@ export function useWebSocket() {
           payload.operation,
           payload.name ?? null
         )
+        if (payload.operation === 'installed') syncExtensions(true)
         if (payload.operation === 'disabled' && payload.extensionId) {
           const state = useStore.getState()
           state.setExtensionUpdates(
@@ -1880,6 +1857,16 @@ export function useWebSocket() {
           if (state.isGroupChat && payload.characterId) {
             state.setGroupExpression(payload.characterId, payload.label, payload.imageId)
           }
+        }
+      }),
+      wsClient.on(EventType.MULTI_CHARACTER_EXPRESSIONS_CHANGED, (payload: {
+        chatId: string
+        characterId: string
+        expressions: Record<string, { label: string; imageId: string }>
+      }) => {
+        const state = store.getState()
+        if (payload.chatId === state.activeChatId && payload.characterId === state.activeCharacterId) {
+          state.setMultiCharacterExpressions(payload.expressions)
         }
       }),
       // LumiHub remote install notifications

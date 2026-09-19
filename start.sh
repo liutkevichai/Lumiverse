@@ -14,6 +14,7 @@ set -euo pipefail
 #   ./start.sh --edit-env       Edit the .env configuration file in a terminal editor
 #   ./start.sh -m|--migrate-st  Run SillyTavern migration helper
 #   ./start.sh -k|--kill-pkgs   Nuke lockfiles + node_modules, reinstall backend deps
+#   ./start.sh --install-desktop  Build/install Tauri desktop app and create launcher shortcuts
 #   ./start.sh --no-runner      Start without the visual runner
 #   ./start.sh --safe-theme     Suppress custom CSS/component overrides for recovery
 #   ./start.sh --upgrade-bun    Upgrade Bun to the latest stable release before running
@@ -177,7 +178,7 @@ verify_termux_bun_install_path() {
 
 # ─── Parse arguments ─────────────────────────────────────────────────────────
 
-MODE="all"  # all | build-only | backend-only | dev | setup | reset-password | edit-env | migrate-st | kill-pkgs
+MODE="all"  # all | build-only | backend-only | dev | setup | reset-password | edit-env | migrate-st | kill-pkgs | install-desktop
 USE_RUNNER=true
 FORCE_BUILD=false
 AUTO_OPEN=false
@@ -196,12 +197,13 @@ for arg in "$@"; do
     --edit-env)     MODE="edit-env" ;;
     --migrate-st|-m) MODE="migrate-st" ;;
     --kill-pkgs|-k) MODE="kill-pkgs" ;;
+    --install-desktop|--desktop) MODE="install-desktop" ;;
     --no-runner)    USE_RUNNER=false ;;
     --safe-theme)   SAFE_THEME=true ;;
     --upgrade-bun)        BUN_UPGRADE_CHANNEL="stable" ;;
     --upgrade-bun-canary) BUN_UPGRADE_CHANNEL="canary" ;;
     --help|-h)
-      sed -n '3,19p' "$0" | sed 's/^# *//'
+      sed -n '3,21p' "$0" | sed 's/^# *//'
       exit 0
       ;;
     *) err "Unknown argument: $arg"; exit 1 ;;
@@ -213,9 +215,11 @@ done
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BACKEND_DIR="$SCRIPT_DIR"
 FRONTEND_DIR="${FRONTEND_PATH:-$SCRIPT_DIR/frontend}"
+# Keep these aligned with frontend/package.json overrides and optionalDependencies.
+# Rolldown 1.2.4 includes the Android ARMv8.0 SIGILL fix.
 TERMUX_FRONTEND_NATIVE_DEPS=(
-  "@rolldown/binding-android-arm64@1.0.2"
-  "lightningcss-android-arm64@1.32.0"
+  "@rolldown/binding-android-arm64@1.2.4"
+  "lightningcss-android-arm64@1.33.0"
 )
 
 # ─── Ensure Bun is installed ────────────────────────────────────────────────
@@ -286,6 +290,38 @@ _resolve_bun() {
   return 1
 }
 
+# Install the standard Termux autobuild signing key when the current Termux
+# channel does not package glibc-repo (notably the Google Play channel).
+_install_termux_autobuild_key() {
+  local key_dir="${PREFIX}/etc/apt/trusted.gpg.d"
+  local key_file="${key_dir}/lumiverse-termux-autobuilds.gpg"
+  local key_url="https://raw.githubusercontent.com/termux/termux-packages/fc8cedb2e0a6ac296133631390823bf70d349281/packages/termux-keyring/termux-autobuilds.gpg"
+  local key_sha256="21c385d5a30107453bd60582d64e2f6e5f5ce11e340ac05e57f943f9c0235420"
+  local temp_key
+
+  if [[ -f "$key_file" ]] \
+     && printf '%s  %s\n' "$key_sha256" "$key_file" | sha256sum -c - &>/dev/null; then
+    return 0
+  fi
+
+  mkdir -p "$key_dir"
+  temp_key="$(mktemp "${TMPDIR:-${PREFIX}/tmp}/lumiverse-termux-key.XXXXXX")"
+  if ! curl --retry 3 -fsSL "$key_url" -o "$temp_key"; then
+    rm -f "$temp_key"
+    return 1
+  fi
+
+  if ! printf '%s  %s\n' "$key_sha256" "$temp_key" | sha256sum -c - &>/dev/null; then
+    err "Downloaded Termux repository signing key failed verification."
+    rm -f "$temp_key"
+    return 1
+  fi
+
+  install -m 600 "$temp_key" "$key_file"
+  rm -f "$temp_key"
+  ok "Installed verified Termux autobuild repository signing key"
+}
+
 # Install Termux prerequisites for running glibc-linked Bun binaries.
 # Bun is compiled against glibc, but Termux uses Android's bionic libc.
 # We need glibc-runner to bridge the gap, plus bun-termux for a proper
@@ -298,9 +334,41 @@ _install_bun_termux() {
     exit 1
   fi
 
+  local glibc_sources_dir="${PREFIX}/etc/apt/sources.list.d"
+  local glibc_source_file="${glibc_sources_dir}/glibc.list"
+  local glibc_repo_entry="deb https://packages-cf.termux.dev/apt/termux-glibc/ glibc stable"
+  local saved_glibc_source=""
+  local restore_glibc_source=false
+  local migrate_glibc_source=false
+
+  # Resume cleanly if an earlier setup attempt stopped while this source was
+  # temporarily disabled (for example, because the network dropped).
+  if [[ -f "$glibc_source_file" ]]; then
+    sed -i -E 's/^# Lumiverse setup: temporarily disabled: (deb[[:space:]].*termux-glibc.*)$/\1/' "$glibc_source_file"
+  fi
+
+  # Keep an existing glibc source out of the first package refresh. Older
+  # launchers wrote an invalid suite, while Google Play Termux installations
+  # may not have the official repository signing key linked yet. Re-enable the
+  # source after refreshing termux-keyring from the main repository, preserving
+  # any valid custom mirror the user already configured.
+  if [[ -f "$glibc_source_file" ]] \
+     && grep -Eq '^[[:space:]]*deb[[:space:]].*termux-glibc' "$glibc_source_file"; then
+    saved_glibc_source="$(cat "$glibc_source_file")"
+    restore_glibc_source=true
+    if grep -Eq 'packages(-cf)?\.termux\.dev/apt/termux-glibc/?[[:space:]]+stable[[:space:]]+main' "$glibc_source_file"; then
+      migrate_glibc_source=true
+      restore_glibc_source=false
+    fi
+    warn "Temporarily disabling the Termux glibc repository while refreshing its signing key..."
+    sed -i -E '/^[[:space:]]*deb[[:space:]].*termux-glibc/s/^/# Lumiverse setup: temporarily disabled: /' "$glibc_source_file"
+  fi
+
   # ── Step 1: Base packages ────────────────────────────────────────────────
   info "Installing base Termux prerequisites..."
   pkg update -y
+  info "Refreshing Termux repository signing keys..."
+  pkg reinstall -y termux-keyring
   pkg install -y git curl build-essential proot
 
   # ── Step 2: Set up the glibc repository ──────────────────────────────────
@@ -308,42 +376,40 @@ _install_bun_termux() {
   # termux-main repo. The glibc-repo package registers this repo source.
   info "Setting up glibc package repository..."
   local glibc_runner_installed=false
-  local glibc_sources_dir="${PREFIX}/etc/apt/sources.list.d"
 
   # Try installing glibc-repo (the repo enabler package)
   if pkg install -y glibc-repo 2>/dev/null; then
-    # Verify the glibc repo source was actually registered
-    if ls "${glibc_sources_dir}/"*glibc* &>/dev/null 2>&1; then
-      info "glibc repository registered, refreshing package lists..."
-    else
-      warn "glibc-repo installed but repo source not found — adding manually..."
-      mkdir -p "$glibc_sources_dir"
-      echo "deb https://packages-cf.termux.dev/apt/termux-glibc stable main" \
-        > "${glibc_sources_dir}/glibc.list"
-    fi
+    info "glibc repository registered, refreshing package lists..."
   else
     warn "glibc-repo package not available — adding glibc repository manually..."
-    mkdir -p "$glibc_sources_dir"
-    echo "deb https://packages-cf.termux.dev/apt/termux-glibc stable main" \
-      > "${glibc_sources_dir}/glibc.list"
+    if command -v apt-get &>/dev/null && ! _install_termux_autobuild_key; then
+      err "Could not install the verified signing key for the Termux glibc repository."
+      exit 1
+    fi
+  fi
+
+  # Restore a valid custom mirror, migrate only the known-broken legacy entry,
+  # or add the canonical source if glibc-repo did not create one.
+  mkdir -p "$glibc_sources_dir"
+  if [[ "$restore_glibc_source" == true ]]; then
+    printf '%s\n' "$saved_glibc_source" > "$glibc_source_file"
+  elif [[ "$migrate_glibc_source" == true ]] \
+       || ! grep -Eq '^[[:space:]]*deb[[:space:]].*termux-glibc' "$glibc_source_file" 2>/dev/null; then
+    echo "$glibc_repo_entry" > "$glibc_source_file"
   fi
 
   # Refresh package lists to pick up the glibc repo
-  pkg update -y 2>/dev/null || apt-get update -y 2>/dev/null || true
+  pkg update -y
 
   # ── Step 3: Install glibc-runner ─────────────────────────────────────────
   if pkg install -y glibc-runner 2>/dev/null; then
     glibc_runner_installed=true
     ok "glibc-runner installed via apt"
   else
-    warn "glibc-runner not found via apt — trying alternate mirror..."
-    # Some mirrors don't serve termux-glibc; try the primary mirror directly
-    mkdir -p "$glibc_sources_dir"
-    echo "deb https://packages.termux.dev/apt/termux-glibc stable main" \
-      > "${glibc_sources_dir}/glibc.list"
-    if apt-get update -y 2>/dev/null && pkg install -y glibc-runner 2>/dev/null; then
+    warn "glibc-runner not found — refreshing package lists and retrying..."
+    if pkg update -y 2>/dev/null && pkg install -y glibc-runner 2>/dev/null; then
       glibc_runner_installed=true
-      ok "glibc-runner installed via apt (alternate mirror)"
+      ok "glibc-runner installed after refreshing package lists"
     fi
   fi
 
@@ -705,6 +771,55 @@ repair_termux_frontend_native_deps() {
   ok "Termux frontend native bindings repaired"
 }
 
+run_bun_dependency_install() {
+  local dir="$1"
+
+  if [[ "$IS_TERMUX" == true ]]; then
+    # Android doesn't support hardlinks — use file copy backend instead.
+    # Clear Bun's install cache first — filesystem emulation can corrupt
+    # cached packages, causing random "Cannot find package" errors.
+    if [[ -d "$HOME/.bun/install/cache" ]]; then
+      rm -rf "$HOME/.bun/install/cache"
+    fi
+    # Always wrap bun install in proot on Termux — Android's seccomp filter
+    # blocks certain syscalls that bun install needs, causing "Bad system call"
+    # (SIGSYS) errors. _proot_bun handles both linker and syscall issues.
+    # --ignore-scripts avoids proot getcwd() failures in dependency lifecycle
+    # scripts; affected packages have pure-JS fallbacks.
+    (cd "$dir" && _proot_bun install --backend=copyfile --ignore-scripts)
+  elif [[ "$IS_PROOT" == true ]]; then
+    if [[ -d "$HOME/.bun/install/cache" ]]; then
+      rm -rf "$HOME/.bun/install/cache"
+    fi
+    (cd "$dir" && bun install --backend=copyfile --ignore-scripts)
+  else
+    (cd "$dir" && bun install)
+  fi
+}
+
+verify_backend_dependencies() {
+  local dir="$1"
+  (cd "$dir" && _bun -e "await import('better-auth'); await import('@better-auth/oauth-provider')")
+}
+
+verify_frontend_dependencies() {
+  local dir="$1"
+  # Exercise the browser-facing import that reaches Better Auth's transitive
+  # core files. Direct-package checks do not catch a partially extracted core.
+  (cd "$dir" && _bun -e "await import('@better-auth/oauth-provider/client')")
+}
+
+verify_dependencies() {
+  local dir="$1"
+  local name="$2"
+
+  if [[ "$name" == "backend" ]]; then
+    verify_backend_dependencies "$dir"
+  elif [[ "$name" == "frontend" ]]; then
+    verify_frontend_dependencies "$dir"
+  fi
+}
+
 install_deps() {
   local dir="$1"
   local name="$2"
@@ -722,36 +837,29 @@ install_deps() {
   info "Installing $name dependencies..."
 
   local install_status=0
-  if [[ "$IS_TERMUX" == true ]]; then
-    # Android doesn't support hardlinks — use file copy backend instead.
-    # Clear Bun's install cache first — filesystem emulation can corrupt
-    # cached packages, causing random "Cannot find package" errors.
-    if [[ -d "$HOME/.bun/install/cache" ]]; then
-      rm -rf "$HOME/.bun/install/cache"
-    fi
-    # Always wrap bun install in proot on Termux — Android's seccomp filter
-    # blocks certain syscalls that bun install needs, causing "Bad system call"
-    # (SIGSYS) errors. _proot_bun handles both linker and syscall issues.
-    # The Android arm64 native bindings (@rolldown/binding-android-arm64,
-    # lightningcss-android-arm64) are declared as optionalDependencies in
-    # frontend/package.json and resolve automatically here.
-    # --ignore-scripts: proot's path translation makes getcwd() fail when bun
-    # forks lifecycle scripts (ssh2, cpu-features), producing spurious
-    # CouldntReadCurrentDirectory errors. Both packages fall back to pure-JS.
-    (cd "$dir" && _proot_bun install --backend=copyfile --ignore-scripts) || install_status=$?
-  elif [[ "$IS_PROOT" == true ]]; then
-    # Inside proot-distro: proot already intercepts syscalls, just need copyfile backend
-    if [[ -d "$HOME/.bun/install/cache" ]]; then
-      rm -rf "$HOME/.bun/install/cache"
-    fi
-    (cd "$dir" && bun install --backend=copyfile --ignore-scripts) || install_status=$?
-  else
-    (cd "$dir" && bun install) || install_status=$?
-  fi
+  run_bun_dependency_install "$dir" || install_status=$?
 
   if [[ $install_status -ne 0 ]]; then
     err "$name install failed (exit $install_status) — node_modules will be cleaned on next launch"
     return $install_status
+  fi
+
+  if [[ "$name" == "backend" || "$name" == "frontend" ]] && ! verify_dependencies "$dir" "$name"; then
+    warn "$name dependency validation failed; clearing the package cache and reinstalling from a clean tree..."
+    _bun pm cache rm >/dev/null 2>&1 || true
+    rm -rf "$dir/node_modules"
+
+    install_status=0
+    run_bun_dependency_install "$dir" || install_status=$?
+    if [[ $install_status -ne 0 ]]; then
+      err "$name clean reinstall failed (exit $install_status)"
+      return $install_status
+    fi
+    if ! verify_dependencies "$dir" "$name"; then
+      err "$name dependencies are still unreadable after a clean reinstall"
+      return 1
+    fi
+    ok "$name dependency tree repaired"
   fi
 
   if [[ "$name" == "frontend" ]]; then
@@ -856,9 +964,20 @@ start_backend() {
     echo ""
 
     if [[ "$AUTO_OPEN" == true ]]; then
-      local url="http://localhost:${PORT:-7860}"
-      info "Opening $url..."
-      (sleep 2; open_browser "$url") &
+      if [[ -n "${LUMIVERSE_TLS_CERT_FILE:-}${LUMIVERSE_TLS_CONFIG_FILE:-}" ]]; then
+        if [[ "${AUTH_BASE_URL:-}" == https://* ]]; then
+          local url="$AUTH_BASE_URL"
+          info "Opening $url..."
+          (sleep 2; open_browser "$url") &
+        else
+          warn "Direct TLS is enabled, but its SAN hostname cannot be inferred."
+          warn "Set AUTH_BASE_URL to the public HTTPS origin or open that origin manually."
+        fi
+      else
+        local url="http://localhost:${PORT:-7860}"
+        info "Opening $url..."
+        (sleep 2; open_browser "$url") &
+      fi
     fi
 
     # $smol_flag is intentionally unquoted: empty -> no arg, "--smol" -> one arg.
@@ -934,5 +1053,8 @@ case "$MODE" in
     ;;
   kill-pkgs)
     kill_pkgs
+    ;;
+  install-desktop)
+    (cd "$BACKEND_DIR" && _bun run desktop:install)
     ;;
 esac

@@ -15,9 +15,15 @@ import { expressionsApi } from '@/api/expressions'
 import { personasApi } from '@/api/personas'
 import { globalAddonsApi } from '@/api/global-addons'
 import { imagesApi } from '@/api/images'
+import { audioApi } from '@/api/audio'
 import { getPersonaAvatarThumbUrl, getPersonaAvatarThumbUrlById, getCharacterAvatarThumbUrl } from '@/lib/avatarUrls'
 import { uuidv7 } from '@/lib/uuid'
 import { toast } from '@/lib/toast'
+import {
+  resolveImpersonationModeOverride,
+  resolveImpersonationPresetSelection,
+  type ImpersonationPreference,
+} from '@/lib/impersonationPreset'
 import { shouldForceLoomRuntimePreset } from '@/lib/loom/runtimeProfile'
 import { unmarshalPreset } from '@/lib/loom/service'
 import {
@@ -90,7 +96,8 @@ import InputAreaCustomizeModal, {
   type ComposerActionId,
 } from './InputAreaCustomizeModal'
 import { ComposerActionBarLive } from './InputAreaComposerBar'
-import { isExtensionComposerActionId } from './composerActionOwnership'
+import { isCoreOwnedComposerActionId, isExtensionComposerActionId } from './composerActionOwnership'
+import { isGuideActive, isGuideAutoEnabled } from '@/lib/guided-generations'
 
 interface InputAreaProps {
   chatId: string
@@ -313,6 +320,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
   }>>([])
   const [characterName, setCharacterName] = useState('')
   const [impersonationPresetId, setImpersonationPresetId] = useState<string | null>(null)
+  const [impersonationModeOverride, setImpersonationModeOverride] = useState<ImpersonationPreference | null>(null)
   const [promptVariablesModalOpen, setPromptVariablesModalOpen] = useState(false)
   const [promptVariablesPreset, setPromptVariablesPreset] = useState<LoomPreset | null>(null)
   const [promptVariablesBinding, setPromptVariablesBinding] = useState<PromptVariableProfileTarget | null>(null)
@@ -373,8 +381,11 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
   )
   const activeCharacterId = useStore((s) => s.activeCharacterId)
   const activeGroupCharacterId = useStore((s) => s.activeGroupCharacterId)
-  const enterToSend = useStore((s) => s.inputBarEnterToSend)
+  const enterToSendSettings = useStore((s) => s.inputBarEnterToSend)
+  const enterToSend = isMobile ? enterToSendSettings.mobile : enterToSendSettings.desktop
   const saveDraftInput = useStore((s) => s.saveDraftInput)
+  const defaultImpersonationMode = useStore((s) => s.defaultImpersonationMode)
+  const impersonationMode = impersonationModeOverride ?? defaultImpersonationMode
   const activeProfileId = useStore((s) => s.activeProfileId)
   const profiles = useStore((s) => s.profiles)
   const setActiveProfile = useStore((s) => s.setActiveProfile)
@@ -614,22 +625,36 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
       setAltFieldSelections({})
       setGroupAltFieldSelections({})
       setGroupScenarioMode('individual')
+      setImpersonationModeOverride(null)
       return
     }
     setAltFieldSelections((activeChatMetadata?.alternate_field_selections as Record<string, string>) || {})
     setGroupAltFieldSelections((activeChatMetadata?.group_alternate_field_selections as Record<string, Record<string, string>>) || {})
     const mode = activeChatMetadata?.group_scenario_override?.mode
     setGroupScenarioMode(mode === 'member' || mode === 'custom' ? mode : 'individual')
+    setImpersonationModeOverride(resolveImpersonationModeOverride(activeChatMetadata?.impersonation_mode))
   }, [activeChatMetadata, chatId])
 
   useEffect(() => {
-    if (!chatId) { setImpersonationPresetId(null); return }
+    if (!chatId) {
+      setImpersonationPresetId(null)
+      setImpersonationModeOverride(null)
+      return
+    }
+    let cancelled = false
     chatsApi.get(chatId, { messages: false })
       .then((chat) => {
+        if (cancelled) return
         const value = chat.metadata?.impersonation_preset_id
         setImpersonationPresetId(typeof value === 'string' && value ? value : null)
+        setImpersonationModeOverride(resolveImpersonationModeOverride(chat.metadata?.impersonation_mode))
       })
-      .catch(() => setImpersonationPresetId(null))
+      .catch(() => {
+        if (cancelled) return
+        setImpersonationPresetId(null)
+        setImpersonationModeOverride(null)
+      })
+    return () => { cancelled = true }
   }, [chatId])
 
   const handleAltFieldSelect = useCallback(async (field: string, variantId: string | null) => {
@@ -1101,8 +1126,18 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
     }
   }, [text, chatId, saveDraftInput])
 
-  const activeGuides = guidedGenerations.filter((g) => g.enabled)
+  const pinnedConnectionId = typeof activeChatMetadata?.connection_profile_id === 'string'
+    && profiles.some((profile) => profile.id === activeChatMetadata.connection_profile_id)
+    ? activeChatMetadata.connection_profile_id
+    : null
+  const guidedGenerationContext = useMemo(() => ({
+    connectionProfileId: pinnedConnectionId || activeProfileId,
+    chatId,
+    characterId: focusedPreviewCharacterId,
+  }), [activeProfileId, chatId, focusedPreviewCharacterId, pinnedConnectionId])
+  const activeGuides = guidedGenerations.filter((guide) => isGuideActive(guide, guidedGenerationContext))
   const activeGuideCount = activeGuides.length
+  const manuallyActiveGuideCount = guidedGenerations.filter((guide) => guide.enabled).length
   const activeQuickReplySets = quickReplySets.filter((s) => s.enabled)
   const activeLoomPresetRegistryUpdatedAt = activeLoomPresetId
     ? loomRegistry[activeLoomPresetId]?.updatedAt ?? null
@@ -1260,13 +1295,18 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
   }), [])
 
   const consumeOneshotGuides = useCallback(() => {
-    const next = guidedGenerations.map((g) =>
-      g.mode === 'oneshot' && g.enabled ? { ...g, enabled: false } : g
-    )
-    if (next.some((g, i) => g.enabled !== guidedGenerations[i].enabled)) {
+    const next = guidedGenerations.map((guide) => {
+      if (guide.mode !== 'oneshot' || !isGuideActive(guide, guidedGenerationContext)) return guide
+      return {
+        ...guide,
+        enabled: false,
+        autoEnable: isGuideAutoEnabled(guide, guidedGenerationContext) ? null : guide.autoEnable,
+      }
+    })
+    if (next.some((guide, index) => guide !== guidedGenerations[index])) {
       setSetting('guidedGenerations', next)
     }
-  }, [guidedGenerations, setSetting])
+  }, [guidedGenerations, guidedGenerationContext, setSetting])
 
   useEffect(() => {
     if (openPopover) {
@@ -1545,6 +1585,14 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
     '.html', '.htm', '.yaml', '.yml', '.log', '.rst', '.rtf',
   ]), [])
 
+  const AUDIO_EXTENSIONS = useMemo(() => new Set([
+    '.mp3', '.wav', '.aif', '.aiff', '.aac', '.ogg', '.oga', '.flac',
+  ]), [])
+
+  const VIDEO_EXTENSIONS = useMemo(() => new Set([
+    '.mp4', '.mpeg', '.mpg', '.mov', '.m4v', '.avi', '.flv', '.webm', '.wmv', '.3gp',
+  ]), [])
+
   const isDocumentFile = useCallback((file: File) => {
     const ext = file.name.lastIndexOf('.') >= 0 ? file.name.slice(file.name.lastIndexOf('.')).toLowerCase() : ''
     return DOCUMENT_EXTENSIONS.has(ext)
@@ -1555,8 +1603,10 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
     setUploading(true)
     try {
       for (const file of Array.from(files)) {
+        const ext = file.name.lastIndexOf('.') >= 0 ? file.name.slice(file.name.lastIndexOf('.')).toLowerCase() : ''
         const isImage = file.type.startsWith('image/')
-        const isAudio = file.type.startsWith('audio/')
+        const isAudio = file.type.startsWith('audio/') || AUDIO_EXTENSIONS.has(ext)
+        const isVideo = file.type.startsWith('video/') || VIDEO_EXTENSIONS.has(ext)
         const isDoc = isDocumentFile(file)
 
         if (isDoc) {
@@ -1572,21 +1622,24 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
           continue
         }
 
-        if (!isImage && !isAudio) {
+        if (!isImage && !isAudio && !isVideo) {
           toast.error(t('toast.unsupportedFileType', { name: file.name }), { title: t('toast.uploadFailed') })
           continue
         }
 
-        // Image/audio → inline attachment as before
-        const image = await imagesApi.upload(file)
+        // Images and videos share the media pipeline (including video metadata
+        // and poster extraction); audio uses its dedicated binary store.
+        const media = isAudio
+          ? await audioApi.upload(file)
+          : await imagesApi.upload(file)
         const att: MessageAttachment & { previewUrl?: string } = {
-          type: isImage ? 'image' : 'audio',
-          image_id: image.id,
-          mime_type: file.type,
+          type: isImage ? 'image' : isAudio ? 'audio' : 'video',
+          image_id: media.id,
+          mime_type: media.mime_type,
           original_filename: file.name,
-          width: image.width ?? undefined,
-          height: image.height ?? undefined,
-          previewUrl: isImage ? imagesApi.smallUrl(image.id) : undefined,
+          width: 'width' in media ? media.width ?? undefined : undefined,
+          height: 'height' in media ? media.height ?? undefined : undefined,
+          previewUrl: isImage ? imagesApi.smallUrl(media.id) : undefined,
         }
         setPendingAttachments((prev) => [...prev, att])
       }
@@ -1597,7 +1650,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
       setUploading(false)
       if (fileInputRef.current) fileInputRef.current.value = ''
     }
-  }, [isDocumentFile, chatId, characterName, t])
+  }, [AUDIO_EXTENSIONS, VIDEO_EXTENSIONS, isDocumentFile, chatId, characterName, t])
 
   const removeAttachment = useCallback((imageId: string) => {
     setPendingAttachments((prev) => prev.filter((a) => a.image_id !== imageId))
@@ -2375,15 +2428,20 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
       requestAnimationFrame(() => resizeTextarea(textareaRef.current))
     }
     try {
-      const forcedPresetId = mode === 'oneliner' ? impersonationPresetId : null
-      const presetId = forcedPresetId || getActivePresetForGeneration() || undefined
+      const presetSelection = resolveImpersonationPresetSelection(
+        mode,
+        impersonationPresetId,
+        getActivePresetForGeneration(),
+      )
+      const presetId = presetSelection.presetId
       const res = await generateApi.start({
         chat_id: chatId,
         connection_id: activeProfileId || undefined,
         persona_id: activePersonaId || undefined,
         persona_addon_states: activeGenerationAddonStates,
         preset_id: presetId,
-        force_preset_id: shouldForceLoomRuntimePreset(presetId, chatId, activeCharacterId, activeProfileId),
+        force_preset_id: presetSelection.forcePresetId
+          || shouldForceLoomRuntimePreset(presetId, chatId, activeCharacterId, activeProfileId),
         generation_type: 'impersonate',
         impersonate_mode: mode,
         impersonate_input: impersonateInput || undefined,
@@ -2536,6 +2594,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
           onSaved: (updatedChat: import('@/types/api').Chat) => {
             const value = updatedChat.metadata?.impersonation_preset_id
             setImpersonationPresetId(typeof value === 'string' && value ? value : null)
+            setImpersonationModeOverride(resolveImpersonationModeOverride(updatedChat.metadata?.impersonation_mode))
             const mode = updatedChat.metadata?.group_scenario_override?.mode
             setGroupScenarioMode(mode === 'member' || mode === 'custom' ? mode : 'individual')
           },
@@ -3252,9 +3311,15 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
             <button
               type="button"
               className={styles.actionBtn}
-              onClick={() => handleImpersonate('oneliner')}
-              title={`${t('quickMenu.oneLiner')}: ${t('quickMenu.oneLinerDesc')}`}
-              aria-label={t('quickMenu.oneLiner')}
+              onClick={() => handleImpersonate(impersonationMode)}
+              title={`${t('quickMenu.impersonate')}: ${
+                impersonationMode === 'prompts'
+                  ? t('quickMenu.presetPrompts')
+                  : impersonationMode === 'preset'
+                    ? t('quickMenu.impersonationPreset')
+                    : t('quickMenu.oneLiner')
+              }`}
+              aria-label={t('quickMenu.impersonate')}
               disabled={isGeneratingInChat}
               style={isGeneratingInChat ? { opacity: 0.5 } : undefined}
             >
@@ -3403,6 +3468,9 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
                   return composerActions[id]
                 }
                 const extraId = fromComposerExtraId(id)
+                // The pinned native launcher is the sole composer presentation.
+                // Ignore the catalog contribution and any legacy persisted copy.
+                if (isCoreOwnedComposerActionId(extraId)) return null
                 if (!hasLumiverseSuite && isExtensionComposerActionId(extraId)) return null
                 if (extraId === 'lumiverse_suite.connections_picker.open') return composerActions.connectionsPicker
                 const action = qtActionById.get(extraId)
@@ -3424,7 +3492,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
               }}
             >
               <span data-spindle-mount="chat_actions" data-spindle-scope={`chat:${chatId}:actions`} style={{ display: 'contents' }} />
-              {hasLumiverseSuite && showComposerCustomizeGear && (
+              {showComposerCustomizeGear && (
                 <button
                   type="button"
                   className={clsx(styles.actionBtn, styles.composerCustomizeGear, customizeOpen && styles.actionBtnActive)}
@@ -3447,7 +3515,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
         )
       })()}
 
-      {hasLumiverseSuite && customizeOpen && (
+      {customizeOpen && (
         <InputAreaCustomizeModal
           onClose={() => setCustomizeOpen(false)}
           order={composerActionBar.order}
@@ -3469,7 +3537,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
                     type="button"
                     className={styles.popRowBtn}
                     onClick={disableAllGuides}
-                    disabled={activeGuideCount === 0}
+                    disabled={manuallyActiveGuideCount === 0}
                   >
                     <span>{t('quickMenu.disableAllGuidedGenerations')}</span>
                     <span className={styles.popMeta}>{t('quickMenu.activeCount', { count: activeGuideCount })}</span>
@@ -3477,23 +3545,29 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
                   <div className={styles.popDivider} />
                 </>
               )}
-              {guidedGenerations.map((g) => (
-                <button
-                  key={g.id}
-                  type="button"
-                  className={clsx(styles.popRowBtn, g.enabled && styles.popRowBtnActive)}
-                  onClick={() => toggleGuide(g.id)}
-                  aria-pressed={g.enabled}
-                >
-                  <span className={styles.personaMain}>
-                    <span className={clsx(styles.popState, g.enabled && styles.popStateActive)}>
-                      {g.enabled ? t('on') : t('off')}
+              {guidedGenerations.map((g) => {
+                const autoEnabled = isGuideAutoEnabled(g, guidedGenerationContext)
+                const active = g.enabled || autoEnabled
+                return (
+                  <button
+                    key={g.id}
+                    type="button"
+                    className={clsx(styles.popRowBtn, active && styles.popRowBtnActive)}
+                    onClick={() => toggleGuide(g.id)}
+                    aria-pressed={active}
+                    disabled={autoEnabled && !g.enabled}
+                    title={autoEnabled && !g.enabled ? t('quickMenu.autoEnabledHint') : undefined}
+                  >
+                    <span className={styles.personaMain}>
+                      <span className={clsx(styles.popState, active && styles.popStateActive)}>
+                        {autoEnabled && !g.enabled ? t('quickMenu.auto') : active ? t('on') : t('off')}
+                      </span>
+                      <span>{g.name}</span>
                     </span>
-                    <span>{g.name}</span>
-                  </span>
-                  <span className={styles.popMeta}>{g.mode}</span>
-                </button>
-              ))}
+                    <span className={styles.popMeta}>{g.mode}</span>
+                  </button>
+                )
+              })}
               <button type="button" className={styles.popLink} onClick={() => {
                 setOpenPopover(null)
                 useStore.getState().openSettings('guided')
@@ -3809,42 +3883,6 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
                     </span>
                   </button>
                 )}
-                <button
-                  type="button"
-                  className={styles.popRowBtn}
-                  onClick={() => {
-                    setOpenPopover(null)
-                    handleImpersonate('prompts')
-                  }}
-                  disabled={isGeneratingInChat}
-                  style={isGeneratingInChat ? { opacity: 0.5 } : undefined}
-                >
-                  <span className={styles.personaMain}>
-                    <ScrollText size={14} />
-                    <span className={styles.personaNameGroup}>
-                      <span>{t('quickMenu.presetPrompts')}</span>
-                      <span className={styles.personaTitle}>{t('quickMenu.presetPromptsDesc')}</span>
-                    </span>
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  className={styles.popRowBtn}
-                  onClick={() => {
-                    setOpenPopover(null)
-                    handleImpersonate('oneliner')
-                  }}
-                  disabled={isGeneratingInChat}
-                  style={isGeneratingInChat ? { opacity: 0.5 } : undefined}
-                >
-                  <span className={styles.personaMain}>
-                    <MessageSquare size={14} />
-                    <span className={styles.personaNameGroup}>
-                      <span>{t('quickMenu.oneLiner')}</span>
-                      <span className={styles.personaTitle}>{t('quickMenu.oneLinerDesc')}</span>
-                    </span>
-                  </span>
-                </button>
                 <button
                   type="button"
                   className={styles.popRowBtn}
@@ -4277,7 +4315,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
         aria-label={t('input.attachFiles')}
         aria-hidden="true"
         tabIndex={-1}
-        accept="image/*,audio/*,.txt,.md,.markdown,.csv,.tsv,.json,.xml,.html,.htm,.yaml,.yml,.log,.rst,.rtf"
+        accept="image/*,audio/wav,audio/mpeg,audio/mp3,audio/aiff,audio/aac,audio/ogg,audio/flac,video/mp4,video/mpeg,video/quicktime,video/avi,video/x-msvideo,video/x-flv,video/webm,video/x-ms-wmv,video/3gpp,.mp3,.wav,.aif,.aiff,.aac,.ogg,.oga,.flac,.mp4,.mpeg,.mpg,.mov,.m4v,.avi,.flv,.webm,.wmv,.3gp,.txt,.md,.markdown,.csv,.tsv,.json,.xml,.html,.htm,.yaml,.yml,.log,.rst,.rtf"
         multiple
         style={{ display: 'none' }}
         onChange={(e) => handleAttachFiles(e.target.files)}

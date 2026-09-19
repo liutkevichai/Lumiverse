@@ -13,6 +13,9 @@ import {
 import {
   resolveCounter,
   APPROXIMATE_TOKENIZER_NAME,
+  warmTokenizerForModel,
+  tokenizerRuntime,
+  type TokenCounterMetrics,
 } from "./tokenizer.service";
 import type {
   PromptBlock,
@@ -22,7 +25,6 @@ import type {
   CustomBody,
   AuthorsNote,
   AdvancedSettings,
-  PromptVariableDef,
   PromptVariableValue,
   PromptVariableValues,
 } from "../types/preset";
@@ -36,6 +38,10 @@ import type { Message, MessageAttachment } from "../types/message";
 import type { Preset } from "../types/preset";
 import type { ConnectionProfile } from "../types/connection-profile";
 import {
+  normalizeGuidedGenerations,
+  type GuidedGeneration,
+} from "./guided-generations";
+import {
   evaluate,
   buildEnv,
   cloneEnv,
@@ -43,8 +49,11 @@ import {
   registry,
   initMacros,
   withPromptBlockContext,
+  restoreLiteralBraces,
 } from "../macros";
 import type { MacroEnv } from "../macros";
+import { coercePromptVariable } from "../utils/prompt-variable-values";
+import { createActivationInputSnapshot } from "../utils/regex-activation-inputs";
 import {
   activateWorldInfo,
   applyWorldInfoGroupLogic,
@@ -106,6 +115,7 @@ import {
 } from "./vector-store-config.service";
 import { isWorldBookEntryVectorSearchReady } from "./world-book-vector-state";
 import * as imagesSvc from "./images.service";
+import * as audioSvc from "./audio.service";
 import * as presetProfilesSvc from "./preset-profiles.service";
 import * as councilProfilesSvc from "./council/council-profiles.service";
 import { readCachedChatMemory } from "./chat-memory-cache.service";
@@ -121,6 +131,7 @@ import { getCharacterDatabankIds } from "../utils/character-databanks";
 import { getSidecarSettings } from "./sidecar-settings.service";
 import { getChatBackgroundSignal, trackChatBackgroundTask } from "./chat-background.service";
 import * as regexScriptsSvc from "./regex-scripts.service";
+import { applyPromptActivations } from "./prompt-activation.service";
 import { createPromptAssemblyProfiler } from "./prompt-assembly-profiler";
 import { rankVectorWorldInfoCandidatesInWorker } from "./world-info-vector-ranking-worker-host";
 import {
@@ -836,6 +847,70 @@ async function applyPromptRegexScriptsBeforeClipping(
   }
 }
 
+/**
+ * Restore the braces a {{#escape}} body was shielded with. The sentinels only
+ * exist to keep that body inert while macro passes run, so this must be the
+ * last text transformation applied to prompt content — every caller of
+ * `resolvePromptMacrosAfterRegexPass` gets the model-facing form.
+ */
+function restoreEscapeLiteralBraces(result: LlmMessage[]): void {
+  for (let i = 0; i < result.length; i++) {
+    const msg = result[i];
+    let content = msg.content;
+    let changed = false;
+
+    if (typeof msg.content === "string") {
+      const restored = restoreLiteralBraces(msg.content);
+      if (restored !== msg.content) {
+        content = restored;
+        changed = true;
+      }
+    } else if (Array.isArray(msg.content)) {
+      const parts = msg.content.map((part: any) => {
+        if (part?.type !== "text" || typeof part.text !== "string") return part;
+        const text = restoreLiteralBraces(part.text);
+        if (text === part.text) return part;
+        changed = true;
+        return { ...part, text };
+      });
+      if (changed) content = parts;
+    }
+
+    const reasoningContent = typeof msg.reasoning_content === "string"
+      ? restoreLiteralBraces(msg.reasoning_content)
+      : msg.reasoning_content;
+    if (reasoningContent !== msg.reasoning_content) changed = true;
+    if (!changed) continue;
+
+    const replacement: LlmMessage = {
+      ...msg,
+      content,
+      ...(reasoningContent !== undefined
+        ? { reasoning_content: reasoningContent }
+        : {}),
+    };
+    if (isChatHistoryMessage(msg)) markAsChatHistory(replacement);
+    result[i] = replacement;
+  }
+}
+
+/**
+ * Same restoration for the prompt breakdown, which snapshots block content
+ * between the two macro passes and feeds prompt display and token counts.
+ */
+function restoreEscapeLiteralBracesInBreakdown(
+  breakdown: AssemblyBreakdownEntry[],
+): void {
+  for (const entry of breakdown) {
+    if (typeof entry.content === "string") {
+      entry.content = restoreLiteralBraces(entry.content);
+    }
+    if (typeof entry.tokenCountContent === "string") {
+      entry.tokenCountContent = restoreLiteralBraces(entry.tokenCountContent);
+    }
+  }
+}
+
 export async function resolvePromptMacrosAfterRegexPass(
   result: LlmMessage[],
   macroEnv: MacroEnv,
@@ -872,6 +947,10 @@ export async function resolvePromptMacrosAfterRegexPass(
       if (isChatHistoryMessage(msg)) markAsChatHistory(result[i]);
     }
   }
+
+  // Last macro pass: the braces that {{#escape}} shielded come back now, so no
+  // pass above this point can re-expand them.
+  restoreEscapeLiteralBraces(result);
 }
 
 function isDecorativeNewChatSeparator(text: string): boolean {
@@ -886,9 +965,11 @@ function isDecorativeNewChatSeparator(text: string): boolean {
 
 async function resolveAttachmentBase64(
   userId: string,
-  imageId: string,
+  attachment: Pick<MessageAttachment, "type" | "image_id">,
 ): Promise<string | null> {
-  const filePath = await imagesSvc.getImageFilePath(userId, imageId);
+  const filePath = attachment.type === "audio"
+    ? audioSvc.getAudioFilePath(userId, attachment.image_id)
+    : await imagesSvc.getImageFilePath(userId, attachment.image_id);
   if (!filePath) return null;
   try {
     const buffer = await Bun.file(filePath).arrayBuffer();
@@ -896,6 +977,10 @@ async function resolveAttachmentBase64(
   } catch {
     return null;
   }
+}
+
+function attachmentCacheKey(attachment: Pick<MessageAttachment, "type" | "image_id">): string {
+  return `${attachment.type}:${attachment.image_id}`;
 }
 
 interface GeneratedImageContextPolicy {
@@ -937,8 +1022,13 @@ function attachmentsForContext(msg: Message, policy: GeneratedImageContextPolicy
   const attachments = Array.isArray(msg.extra?.attachments)
     ? (msg.extra.attachments as MessageAttachment[])
     : [];
-  if (!msg.extra?.image_gen) return attachments;
-  return attachments.filter(
+  // Saved TTS is attached to assistant messages for playback, but it is not
+  // model input. User-uploaded audio belongs on user messages and is included.
+  const contextualAttachments = attachments.filter(
+    (att) => att?.type !== "audio" || msg.is_user,
+  );
+  if (!msg.extra?.image_gen) return contextualAttachments;
+  return contextualAttachments.filter(
     (att) => att?.type !== "image" || policy.allowedGeneratedImageIds.has(att.image_id),
   );
 }
@@ -1194,15 +1284,6 @@ const SAMPLER_DEFAULTS: Record<string, number> = {
   temperature: 1.0,
 };
 
-interface GuidedGeneration {
-  id: string;
-  name: string;
-  content: string;
-  position: "system" | "user_prefix" | "user_suffix";
-  mode: "persistent" | "oneshot";
-  enabled: boolean;
-}
-
 function isAppendRole(role: string): boolean {
   return role === "user_append" || role === "assistant_append";
 }
@@ -1317,11 +1398,22 @@ async function evaluateHostPromptSource(
   macroEnv: MacroEnv,
   sourceHint = "prompt_source:preset_setting",
 ): Promise<string> {
-  return (await evaluate(content, macroEnv, registry, {
+  return (await evaluateForPromptAssembly(content, macroEnv, {
     phase: "prompt",
     sourceHint,
     sourceOwner: "host",
   })).text;
+}
+
+function evaluateForPromptAssembly(
+  content: string,
+  macroEnv: MacroEnv,
+  options: NonNullable<Parameters<typeof evaluate>[3]> = {},
+) {
+  return evaluate(content, macroEnv, registry, {
+    ...options,
+    deferLiteralBraceRestore: true,
+  });
 }
 
 export const DEFAULT_REGEN_FEEDBACK_FORMAT = "[OOC: {{$regenInput}}]";
@@ -1343,7 +1435,7 @@ export async function resolveRegenFeedbackPrompt(
 
   const guardedTemplate = template.split(REGEN_INPUT_PLACEHOLDER).join(guard);
   const resolved = (
-    await evaluate(guardedTemplate, macroEnv, registry, {
+    await evaluateForPromptAssembly(guardedTemplate, macroEnv, {
       phase: "prompt",
       sourceHint: "prompt_source:regen_feedback",
     })
@@ -1477,91 +1569,7 @@ export function resolvePromptVariables(
   }
 }
 
-interface CoercedPromptVar {
-  /** What {{var::name}} resolves to (or its stringified form). */
-  rendered: string | number;
-  /** Currently selected option ids — only meaningful for multiselect/select; empty otherwise. */
-  selectedIds: string[];
-}
-
-export function coercePromptVariable(
-  def: PromptVariableDef,
-  raw: unknown,
-): CoercedPromptVar {
-  switch (def.type) {
-    case "text":
-    case "textarea": {
-      if (raw === undefined || raw === null) return { rendered: def.defaultValue ?? "", selectedIds: [] };
-      return { rendered: String(raw), selectedIds: [] };
-    }
-    case "number": {
-      const fallback =
-        typeof def.defaultValue === "number" ? def.defaultValue : 0;
-      const n = raw === undefined || raw === null ? fallback : Number(raw);
-      const v = Number.isFinite(n) ? n : fallback;
-      return { rendered: clampNumber(v, def.min, def.max), selectedIds: [] };
-    }
-    case "slider": {
-      const fallback = def.defaultValue;
-      const n = raw === undefined || raw === null ? fallback : Number(raw);
-      const v = Number.isFinite(n) ? n : fallback;
-      return { rendered: clampNumber(v, def.min, def.max), selectedIds: [] };
-    }
-    case "select": {
-      const options = def.options ?? [];
-      const validIds = new Set(options.map((o) => o.id));
-      const fallback = validIds.has(def.defaultValue)
-        ? def.defaultValue
-        : options[0]?.id ?? "";
-      const candidate =
-        raw === undefined || raw === null ? fallback : String(raw);
-      const selectedId = validIds.has(candidate) ? candidate : fallback;
-      const match = options.find((o) => o.id === selectedId);
-      return {
-        rendered: match?.value ?? "",
-        selectedIds: selectedId ? [selectedId] : [],
-      };
-    }
-    case "switch": {
-      const fallback: 0 | 1 = def.defaultValue === 1 ? 1 : 0;
-      if (raw === undefined || raw === null) {
-        return { rendered: fallback, selectedIds: [] };
-      }
-      // Accept booleans, "0"/"1", "true"/"false", and numeric 0/1.
-      let on = false;
-      if (typeof raw === "boolean") on = raw;
-      else if (typeof raw === "number") on = raw === 1;
-      else {
-        const s = String(raw).trim().toLowerCase();
-        on = s === "1" || s === "true" || s === "on" || s === "yes";
-      }
-      return { rendered: on ? 1 : 0, selectedIds: [] };
-    }
-    case "multiselect": {
-      const options = def.options ?? [];
-      const validIds = new Set(options.map((o) => o.id));
-      let rawIds: string[];
-      if (Array.isArray(raw)) {
-        rawIds = raw.map((v) => String(v));
-      } else if (raw === undefined || raw === null) {
-        rawIds = Array.isArray(def.defaultValue) ? def.defaultValue.slice() : [];
-      } else if (typeof raw === "string" && raw.length > 0) {
-        rawIds = raw.split(",").map((s) => s.trim()).filter(Boolean);
-      } else {
-        rawIds = [];
-      }
-      // Preserve option-declaration order so the joined output is stable
-      // regardless of the order the end user clicked the checkboxes in.
-      const selectedSet = new Set(rawIds.filter((id) => validIds.has(id)));
-      const orderedSelected = options.filter((o) => selectedSet.has(o.id));
-      const separator = typeof def.separator === "string" ? def.separator : "\n\n";
-      return {
-        rendered: orderedSelected.map((o) => o.value).join(separator),
-        selectedIds: orderedSelected.map((o) => o.id),
-      };
-    }
-  }
-}
+export { coercePromptVariable } from "../utils/prompt-variable-values";
 
 const PROMPT_BLOCK_ROLES = new Set<PromptBlock["role"]>([
   "system",
@@ -1640,17 +1648,6 @@ export function resolvePromptBlockPlacements(
       depth: Math.floor(placement.depth),
     };
   });
-}
-
-function clampNumber(
-  value: number,
-  min: number | undefined,
-  max: number | undefined,
-): number {
-  let v = value;
-  if (typeof min === "number" && v < min) v = min;
-  if (typeof max === "number" && v > max) v = max;
-  return v;
 }
 
 interface PendingAppend {
@@ -1814,6 +1811,10 @@ export async function assemblePrompt(
       ? pf.connection
       : connectionsSvc.resolveConnection(ctx.userId, ctx.connectionId);
 
+  // Start cold file loading while the rest of assembly resolves its inputs.
+  // Clipping joins this pending load in the same runtime if it is not ready.
+  if (connection?.model) void warmTokenizerForModel(connection.model);
+
   // Resolve preset: request presetId takes priority, then connection's
   // preset_id, then any more-specific preset-profile binding can override that
   // preset selection for the active chat/character context. No-preset temp
@@ -1872,13 +1873,33 @@ export async function assemblePrompt(
   if (resolvedProfile.binding && blocks.length) {
     presetProfilesSvc.applyProfileToBlocks(blocks, resolvedProfile.binding);
   }
+  const activationScripts = preset && blocks.length
+    ? regexScriptsSvc.getPresetActivationScripts(ctx.userId, preset.id, { chatId: chat.id, characterId }) : [];
+  const activationInputs = createActivationInputSnapshot({
+    characterName: getEffectiveCharacterName(character),
+    userName: persona?.name || "User",
+    chatVariables: chat.metadata?.chat_variables,
+    preset,
+    profileValues: resolvedProfile.binding?.prompt_variables,
+    patterns: activationScripts.map((script) => script.find_regex),
+  });
+  const promptActivation = preset && blocks.length
+    ? await applyPromptActivations(
+        blocks,
+        activationScripts,
+        messages,
+        preset.id,
+        ctx.signal,
+        activationInputs,
+      )
+    : { states: [], errors: [] };
   presetProfilesSvc.normalizeCategoryBlockStates(blocks);
 
   profiler.addPhase("load-core-data", performance.now() - phaseStartedAt);
 
   // If no blocks, fall back to legacy mapping
   if (!blocks.length) {
-    return await legacyAssembly(
+    const legacyResult = await legacyAssembly(
       messages,
       ctx.generationType,
       character,
@@ -1889,6 +1910,12 @@ export async function assemblePrompt(
       ctx.userInput,
       ctx.signal,
     );
+    return {
+      ...legacyResult,
+      ...(preset
+        ? { resolvedPreset: { id: preset.id, name: preset.name } }
+        : {}),
+    };
   }
 
   // ---- Pre-flight: prepare deferred cortex warm-cache task ----
@@ -2557,6 +2584,8 @@ export async function assemblePrompt(
     macroEnv.extra.presetId = preset.id;
     macroEnv.extra.presetMetadata = preset.metadata || {};
   }
+  macroEnv.extra.promptActivation = promptActivation;
+  macroEnv.extra.activationInputSnapshots = new Map(preset ? [[preset.id, activationInputs]] : []);
 
   // Prompt variables — resolve creator-defined schemas + end-user overrides and
   // surface them on env.extra so {{var::name}} / {{hasVar::name}} / {{varDefault::name}}
@@ -2652,6 +2681,10 @@ export async function assemblePrompt(
       reasoningVal,
     );
   }
+
+  // `preset` intentionally continues through the normal full-assembly path.
+  // Its only difference from `prompts` is that the caller force-selects the
+  // chat's dedicated impersonation preset.
 
   // ---- Pre-loop: retrieve chat vector memories ----
   phaseStartedAt = performance.now();
@@ -2847,8 +2880,8 @@ export async function assemblePrompt(
   //   1. Extract slugs from every user message (pure regex, no I/O).
   //   2. Single sync batch lookup: which slugs map to valid docs in active scope.
   //   3. Strip resolved #tags from every user message.
-  //   4. Expensive content fetch + vector search runs ONCE, only for the LAST
-  //      user message's slugs (the only ones that contribute to the appendix).
+  //   4. Full document content is fetched ONCE, only for the LAST user
+  //      message's slugs (the only ones that contribute to the appendix).
   let databankMentionAppendix = "";
   {
     const charIds = databankCharIds;
@@ -2901,16 +2934,11 @@ export async function assemblePrompt(
             const lastValid = new Set<string>();
             for (const s of lastSlugs) if (validSlugs.has(s)) lastValid.add(s);
             if (lastValid.size > 0) {
-              const queryContext = messages
-                .slice(-6)
-                .map((m) => m.content)
-                .join(" ");
               const resolved = await databankSvc.resolveSlugContent(
                 ctx.userId,
                 ctx.chatId,
                 lastValid,
                 docs,
-                queryContext,
                 ctx.signal,
               );
               if (resolved.length > 0) {
@@ -2963,7 +2991,7 @@ export async function assemblePrompt(
           throw ctx.signal.reason ?? new DOMException("Aborted", "AbortError");
         }
         entry.content = (
-          await evaluate(entry.content, macroEnv, registry)
+          await evaluateForPromptAssembly(entry.content, macroEnv)
         ).text;
       }
     }
@@ -3067,6 +3095,13 @@ export async function assemblePrompt(
     if (!promptBlockMatchesCharacterTags(block.characterTagTrigger, focusedCharacter.tags)) {
       continue;
     }
+    // Structural world-info slots are unique. Presets can acquire duplicate
+    // markers during import/merge, while their independent display names can
+    // hide the collision (for example, a second marker named "Databank").
+    // Skip duplicates before marker-pinned entries are handled as those would
+    // otherwise be repeated too.
+    if (block.marker === "world_info_before" && hasWiBefore) continue;
+    if (block.marker === "world_info_after" && hasWiAfter) continue;
     // Marker-pinned WI: emit this block's "before" entries ahead of its own
     // output, and queue its "after" entries for the next-iteration flush.
     const pin = block.marker ? pinnedByMarker.get(block.marker) : undefined;
@@ -3193,23 +3228,23 @@ export async function assemblePrompt(
       // (excludeMessageId is already filtered out at the top of assemblePrompt)
       // Pre-resolve all attachment files in parallel so the per-message loop
       // doesn't pay sequential file I/O costs per attachment.
-      const attachmentImageIds = new Set<string>();
+      const attachmentSources = new Map<string, MessageAttachment>();
       for (const msg of effectiveMessages) {
         if (msg.extra?.hidden === true) continue;
         const atts = attachmentsForContext(msg, generatedImageContextPolicy);
         for (const att of atts) {
-          if (att.image_id) attachmentImageIds.add(att.image_id);
+          if (att.image_id) attachmentSources.set(attachmentCacheKey(att), att);
         }
       }
       const attachmentCache = new Map<string, string | null>();
-      if (attachmentImageIds.size > 0) {
+      if (attachmentSources.size > 0) {
         const entries = await Promise.all(
-          [...attachmentImageIds].map(
-            async (id) =>
-              [id, await resolveAttachmentBase64(ctx.userId, id)] as const,
+          [...attachmentSources].map(
+            async ([key, attachment]) =>
+              [key, await resolveAttachmentBase64(ctx.userId, attachment)] as const,
           ),
         );
-        for (const [id, b64] of entries) attachmentCache.set(id, b64);
+        for (const [key, b64] of entries) attachmentCache.set(key, b64);
       }
 
       let historyCount = 0;
@@ -3241,7 +3276,7 @@ export async function assemblePrompt(
           rawContent.includes("<CHAR>");
         const visibleResolvedContent = needsEval
           ? healFormattingArtifacts(
-              (await evaluate(rawContent, macroEnv, registry)).text,
+              (await evaluateForPromptAssembly(rawContent, macroEnv)).text,
             )
           : rawContent;
         const resolvedContent = appendAssociativeRegexContext(visibleResolvedContent, msg);
@@ -3268,7 +3303,7 @@ export async function assemblePrompt(
             parts.push({ type: "text", text: contentForPrompt });
           }
           for (const att of attachments) {
-            const b64 = attachmentCache.get(att.image_id) ?? null;
+            const b64 = attachmentCache.get(attachmentCacheKey(att)) ?? null;
             if (!b64) continue;
             if (att.type === "image") {
               parts.push({
@@ -3279,6 +3314,12 @@ export async function assemblePrompt(
             } else if (att.type === "audio") {
               parts.push({
                 type: "audio",
+                data: b64,
+                mime_type: att.mime_type,
+              });
+            } else if (att.type === "video") {
+              parts.push({
+                type: "video",
                 data: b64,
                 mime_type: att.mime_type,
               });
@@ -3754,10 +3795,16 @@ export async function assemblePrompt(
   // ---- Author's Note injection ----
   const authorsNote: AuthorsNote | null = chat.metadata?.authors_note ?? null;
   if (authorsNote && authorsNote.content) {
-    const resolvedAN = (await evaluate(authorsNote.content, macroEnv, registry))
-      .text;
+    const resolvedAN = (
+      await evaluateForPromptAssembly(authorsNote.content, macroEnv)
+    ).text;
     if (resolvedAN) {
-      const insertAt = Math.max(0, result.length - (authorsNote.depth || 4));
+      // Count backward from the latest chat message, ignoring other prompt
+      // content. Depth 0 belongs immediately after the latest chat message.
+      const insertAt = resolveChatHistoryInsertionIndex(
+        result,
+        authorsNote.depth ?? 4,
+      );
       result.splice(insertAt, 0, {
         role: authorsNote.role || "system",
         content: resolvedAN,
@@ -3797,6 +3844,11 @@ export async function assemblePrompt(
   // Guided generations (from batch-loaded settings)
   const guided = normalizeGuidedGenerations(
     settingsMap.get("guidedGenerations"),
+    {
+      connectionProfileId: connection?.id ?? null,
+      chatId: chat.id,
+      characterId,
+    },
   );
   if (guided.length > 0) {
     await applyGuidedGenerations(result, guided, macroEnv, breakdown);
@@ -3906,11 +3958,18 @@ export async function assemblePrompt(
       resolved = resolved ? `${resolved}\n\n${userInput}` : userInput;
     }
     if (resolved) {
-      result.push({ role: "system", content: resolved });
+      // Without a native assistant prefill, finish on a conventional user
+      // turn so providers that reject or mishandle prefills still receive an
+      // explicit request to answer. Prefill mode retains the system
+      // instruction followed by the partial assistant message below.
+      const role = completionSettings.continuePrefill === true
+        ? "system"
+        : "user";
+      result.push({ role, content: resolved });
       breakdown.push({
         type: "utility",
         name: "Impersonation Prompt",
-        role: "system",
+        role,
         content: resolved,
       });
     }
@@ -4000,6 +4059,9 @@ export async function assemblePrompt(
   // the response still gets appended to the original chat message.
   const prefillParts: string[] = [];
   let assistantReasoningPrefill: string | undefined;
+  const impersonationPrefillEnabled =
+    ctx.generationType !== "impersonate" ||
+    completionSettings.continuePrefill === true;
 
   // A connection profile can bind its own Start Reply With value alongside its
   // reasoning settings (metadata.reasoningBindings.promptBias). When present,
@@ -4010,6 +4072,7 @@ export async function assemblePrompt(
     ? boundPromptBias
     : settingsMap.get("promptBias");
   if (
+    impersonationPrefillEnabled &&
     ctx.generationType !== "continue" &&
     promptBiasVal &&
     typeof promptBiasVal === "string" &&
@@ -4024,7 +4087,7 @@ export async function assemblePrompt(
   }
 
   const csPrefill =
-    ctx.generationType === "continue"
+    ctx.generationType === "continue" || !impersonationPrefillEnabled
       ? ""
       : ctx.generationType === "impersonate" && completionSettings.assistantImpersonation
         ? completionSettings.assistantImpersonation
@@ -4039,6 +4102,7 @@ export async function assemblePrompt(
   // `reasoning_content`. Keep it separate from the visible assistant prefix;
   // the generation service displays it in the reasoning pane.
   if (
+    impersonationPrefillEnabled &&
     ctx.generationType !== "continue" &&
     (connection?.provider === "moonshot" || connection?.provider === "deepseek") &&
     completionSettings.reasoningPrefill
@@ -4160,6 +4224,12 @@ export async function assemblePrompt(
   await profiler.measure("post-regex-macros", () =>
     resolvePromptMacrosAfterRegexPass(result, macroEnv)
   );
+  if (assistantPrefill !== undefined) {
+    assistantPrefill = restoreLiteralBraces(assistantPrefill);
+  }
+  if (assistantReasoningPrefill !== undefined) {
+    assistantReasoningPrefill = restoreLiteralBraces(assistantReasoningPrefill);
+  }
   stripEmptyTextParts(result);
 
   // {{webSearchContext}} resolves to a private token while prompt blocks are
@@ -4170,6 +4240,10 @@ export async function assemblePrompt(
   for (const message of result) {
     captureInlineWebSearchContextSlot(message);
   }
+  // The breakdown snapshots block content as it looked between the two macro
+  // passes, so it carries {{#escape}} sentinels too. Restore them here: the
+  // breakdown feeds prompt display and block token counts.
+  restoreEscapeLiteralBracesInBreakdown(breakdown);
   for (let index = breakdown.length - 1; index >= 0; index--) {
     const entry = breakdown[index];
     if (typeof entry.content !== "string") continue;
@@ -4313,6 +4387,9 @@ export async function assemblePrompt(
     messages: result,
     breakdown,
     parameters,
+    ...(preset
+      ? { resolvedPreset: { id: preset.id, name: preset.name } }
+      : {}),
     trimIncompleteWords: prompts.advancedSettings?.trimIncompleteWords === true,
     assistantPrefill,
     assistantReasoningPrefill,
@@ -4338,33 +4415,6 @@ export async function assemblePrompt(
   }
 }
 
-function normalizeGuidedGenerations(input: unknown): GuidedGeneration[] {
-  if (!Array.isArray(input)) return [];
-  const out: GuidedGeneration[] = [];
-  for (const item of input) {
-    if (!item || typeof item !== "object") continue;
-    const g = item as Partial<GuidedGeneration>;
-    if (!g.enabled) continue;
-    if (typeof g.content !== "string" || !g.content.trim()) continue;
-    const position =
-      g.position === "user_prefix" || g.position === "user_suffix"
-        ? g.position
-        : "system";
-    out.push({
-      id: typeof g.id === "string" ? g.id : "",
-      name:
-        typeof g.name === "string" && g.name.trim()
-          ? g.name
-          : "Guided Generation",
-      content: g.content,
-      position,
-      mode: g.mode === "oneshot" ? "oneshot" : "persistent",
-      enabled: true,
-    });
-  }
-  return out;
-}
-
 async function applyGuidedGenerations(
   result: LlmMessage[],
   guides: GuidedGeneration[],
@@ -4377,7 +4427,7 @@ async function applyGuidedGenerations(
 
   for (const guide of guides) {
     const resolved = (
-      await evaluate(guide.content, macroEnv, registry)
+      await evaluateForPromptAssembly(guide.content, macroEnv)
     ).text.trim();
     if (!resolved) continue;
     if (guide.position === "system") systemInjections.push(resolved);
@@ -4661,7 +4711,7 @@ export async function resolveWorldInfoOutlets(
         }
       }
 
-      const next = (await evaluate(template, macroEnv, registry)).text;
+      const next = (await evaluateForPromptAssembly(template, macroEnv)).text;
       if (resolved.get(name) !== next) {
         resolved.set(name, next);
         changed = true;
@@ -6963,6 +7013,11 @@ export async function clipToContextBudget(
   maxResponseTokens: number | null | undefined,
   signal?: AbortSignal,
 ): Promise<ContextClipStats> {
+  const meta: Record<string, string | number | boolean | undefined> = { model: modelId ?? undefined, runtime: tokenizerRuntime() };
+  const clipProfiler = createPromptAssemblyProfiler("context-clip", meta);
+  let metrics: TokenCounterMetrics | undefined;
+  let countingStarted: number | undefined;
+  try {
   const resolvedContext =
     typeof maxContext === "number" && maxContext > 0 ? maxContext : 0;
   const resolvedResponse =
@@ -7028,7 +7083,10 @@ export async function clipToContextBudget(
   );
   const inputBudget = resolvedContext - resolvedResponse - safetyMargin;
 
-  const counter = await resolveCounter(modelId || "");
+  const counter = await clipProfiler.measure("tokenizer-wait", () => resolveCounter(modelId || ""));
+  metrics = counter.metrics;
+  meta.tokenizer = counter.name;
+  countingStarted = performance.now();
 
   // Tokenizing every message is the dominant cost on long chats. The clip only
   // ever keeps the newest run of history that fits the budget, so we tokenize
@@ -7256,6 +7314,16 @@ export async function clipToContextBudget(
     protectedHistoryTokens,
     remainingBeforeAnchor,
   });
+  } finally {
+    if (countingStarted !== undefined) clipProfiler.addPhase("count-and-clip", performance.now() - countingStarted);
+    if (metrics) {
+      meta.instance = metrics.instance;
+      meta.cacheHits = metrics.hits;
+      meta.cacheMisses = metrics.misses;
+      clipProfiler.addPhase("encode", metrics.encodeMs);
+    }
+    clipProfiler.finish();
+  }
 }
 
 /**
@@ -7769,7 +7837,8 @@ export function applyProviderReasoningOffSwitch(
 /**
  * One-liner impersonation: skip all preset blocks, include only chat history
  * and the impersonation prompt from preset behaviors. Optionally includes the
- * assistantImpersonation prefill as a trailing assistant message.
+ * assistantImpersonation prefill as a trailing assistant message when the
+ * preset's prefill checkbox is enabled.
  */
 async function onelinerImpersonation(
   messages: Message[],
@@ -7848,22 +7917,27 @@ async function onelinerImpersonation(
     resolved = resolved ? `${resolved}\n\n${userInput}` : userInput;
   }
   if (resolved) {
-    result.push({ role: "system", content: resolved });
+    const role = completionSettings.continuePrefill === true
+      ? "system"
+      : "user";
+    result.push({ role, content: resolved });
     breakdown.push({
       type: "utility",
       name: "Impersonation Prompt",
-      role: "system",
+      role,
       content: resolved,
     });
   }
 
-  // assistantImpersonation prefill — sent as actual assistant message
+  // assistantImpersonation prefill — sent as an actual assistant message only
+  // when the preset explicitly opts into native prefilling.
   let assistantPrefill: string | undefined;
   let assistantReasoningPrefill: string | undefined;
+  const prefillEnabled = completionSettings.continuePrefill === true;
   const csPrefill =
     completionSettings.assistantImpersonation ||
     completionSettings.assistantPrefill;
-  if (csPrefill) {
+  if (prefillEnabled && csPrefill) {
     const resolvedPrefill = await evaluateHostPromptSource(csPrefill, macroEnv);
     if (resolvedPrefill) {
       assistantPrefill = resolvedPrefill;
@@ -7878,6 +7952,7 @@ async function onelinerImpersonation(
   }
 
   if (
+    prefillEnabled &&
     (connection?.provider === "moonshot" || connection?.provider === "deepseek") &&
     completionSettings.reasoningPrefill
   ) {
@@ -7907,6 +7982,15 @@ async function onelinerImpersonation(
         content: assistantReasoningPrefill,
       });
     }
+  }
+
+  restoreEscapeLiteralBraces(result);
+  restoreEscapeLiteralBracesInBreakdown(breakdown);
+  if (assistantPrefill !== undefined) {
+    assistantPrefill = restoreLiteralBraces(assistantPrefill);
+  }
+  if (assistantReasoningPrefill !== undefined) {
+    assistantReasoningPrefill = restoreLiteralBraces(assistantReasoningPrefill);
   }
 
   // Build parameters from sampler overrides + reasoning settings
@@ -7950,6 +8034,9 @@ async function onelinerImpersonation(
     messages: result,
     breakdown,
     parameters,
+    ...(preset
+      ? { resolvedPreset: { id: preset.id, name: preset.name } }
+      : {}),
     trimIncompleteWords: preset?.prompts?.advancedSettings?.trimIncompleteWords === true,
     assistantPrefill,
     assistantReasoningPrefill,
@@ -8143,22 +8230,22 @@ async function legacyAssembly(
     userId ? settingsSvc.getSetting(userId, "imageGeneration")?.value : null,
     messages,
   );
-  const legacyAttachmentIds = new Set<string>();
+  const legacyAttachmentSources = new Map<string, MessageAttachment>();
   for (const m of messages) {
     if (m.extra?.hidden === true) continue;
     const atts = attachmentsForContext(m, legacyGeneratedImageContextPolicy);
     for (const att of atts) {
-      if (att.image_id) legacyAttachmentIds.add(att.image_id as string);
+      if (att.image_id) legacyAttachmentSources.set(attachmentCacheKey(att), att);
     }
   }
   const legacyAttachmentCache = new Map<string, string | null>();
-  if (legacyAttachmentIds.size > 0 && userId) {
+  if (legacyAttachmentSources.size > 0 && userId) {
     const entries = await Promise.all(
-      [...legacyAttachmentIds].map(
-        async (id) => [id, await resolveAttachmentBase64(userId, id)] as const,
+      [...legacyAttachmentSources].map(
+        async ([key, attachment]) => [key, await resolveAttachmentBase64(userId, attachment)] as const,
       ),
     );
-    for (const [id, b64] of entries) legacyAttachmentCache.set(id, b64);
+    for (const [key, b64] of entries) legacyAttachmentCache.set(key, b64);
   }
 
   const legacyFirstChatIdx = llmMessages.length;
@@ -8185,12 +8272,14 @@ async function legacyAssembly(
       }
       for (const att of attachments) {
         if (!att.image_id || !userId) continue;
-        const b64 = legacyAttachmentCache.get(att.image_id as string) ?? null;
+        const b64 = legacyAttachmentCache.get(attachmentCacheKey(att)) ?? null;
         if (!b64) continue;
         if (att.type === "image") {
           parts.push({ type: "image", data: b64, mime_type: att.mime_type });
         } else if (att.type === "audio") {
           parts.push({ type: "audio", data: b64, mime_type: att.mime_type });
+        } else if (att.type === "video") {
+          parts.push({ type: "video", data: b64, mime_type: att.mime_type });
         }
       }
       llmMessages.push(
@@ -8273,6 +8362,11 @@ async function legacyAssembly(
       );
     }
   }
+
+  // This path has no post-regex macro pass, so the {{#escape}} restoration that
+  // pass performs for the preset path happens here instead.
+  restoreEscapeLiteralBraces(llmMessages);
+  restoreEscapeLiteralBracesInBreakdown(breakdown);
 
   // Drop empty text parts or empty messages to avoid proxy/provider errors
   stripEmptyTextParts(llmMessages);

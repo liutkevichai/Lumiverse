@@ -5,7 +5,7 @@ import { act } from 'react'
 import type { Root, createRoot as CreateRoot } from 'react-dom/client'
 import { JSDOM } from 'jsdom'
 import { QUICK_TOOLBAR_POINTER_HOLD_MS } from '@/components/quick-toolbar/quickToolbarDock'
-import { isExtensionComposerActionId } from './composerActionOwnership'
+import { isCoreOwnedComposerActionId, isExtensionComposerActionId } from './composerActionOwnership'
 
 const dom = new JSDOM('<!doctype html><html><body></body></html>', {
   url: 'https://lumiverse.test/',
@@ -238,8 +238,9 @@ describe('InputArea action bar live reorder', () => {
     await act(async () => root2.unmount())
   })
 
-  test('classifies persisted Suite actions without hiding native actions', () => {
-    expect(isExtensionComposerActionId('chat.customize-composer')).toBe(true)
+  test('classifies persisted Suite actions without yielding the native customizer', () => {
+    expect(isCoreOwnedComposerActionId('chat.customize-composer')).toBe(true)
+    expect(isExtensionComposerActionId('chat.customize-composer')).toBe(false)
     expect(isExtensionComposerActionId('lumiverse_suite.connections_picker.open')).toBe(true)
     expect(isExtensionComposerActionId('spindle:lumiverse_suite:open')).toBe(true)
     expect(isExtensionComposerActionId('promptVariables')).toBe(false)
@@ -249,8 +250,24 @@ describe('InputArea action bar live reorder', () => {
   test('InputArea drops persisted Suite-owned extras while retaining native extras when Suite is off', async () => {
     const source = await Bun.file(new URL('./InputArea.tsx', import.meta.url)).text()
 
-    expect(source).toContain("import { isExtensionComposerActionId } from './composerActionOwnership'")
-    expect(source).toMatch(/const extraId = fromComposerExtraId\(id\)[\s\S]*?if \(!hasLumiverseSuite && isExtensionComposerActionId\(extraId\)\) return null[\s\S]*?const action = qtActionById\.get\(extraId\)/)
+    expect(source).toContain('isCoreOwnedComposerActionId')
+    expect(source).toMatch(/const extraId = fromComposerExtraId\(id\)[\s\S]*?if \(isCoreOwnedComposerActionId\(extraId\)\) return null[\s\S]*?if \(!hasLumiverseSuite && isExtensionComposerActionId\(extraId\)\) return null[\s\S]*?const action = qtActionById\.get\(extraId\)/)
     expect(source).toContain('if (!hasLumiverseSuite && isExtensionComposerActionId(id)) return null')
+  })
+
+  test('the single composer impersonate action follows a chat override or the global default', async () => {
+    const inputAreaSource = await Bun.file(new URL('./InputArea.tsx', import.meta.url)).text()
+    const settingsSource = await Bun.file(new URL('../modals/GroupSettingsModal.tsx', import.meta.url)).text()
+    const globalSettingsSource = await Bun.file(new URL('../modals/SettingsModal.tsx', import.meta.url)).text()
+
+    expect(inputAreaSource).toContain('handleImpersonate(impersonationMode)')
+    expect(inputAreaSource).toContain('impersonationModeOverride ?? defaultImpersonationMode')
+    expect(inputAreaSource).not.toContain("handleImpersonate('prompts')")
+    expect(inputAreaSource).not.toContain("handleImpersonate('preset')")
+    expect(inputAreaSource).not.toContain("handleImpersonate('oneliner')")
+    expect(settingsSource).toContain('impersonation_mode: impersonationMode || null')
+    expect(settingsSource).toContain('useGlobalImpersonationMode')
+    expect(settingsSource).toContain('role="radiogroup"')
+    expect(globalSettingsSource).toContain("setSetting('defaultImpersonationMode'")
   })
 })

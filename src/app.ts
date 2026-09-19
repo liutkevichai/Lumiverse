@@ -6,6 +6,7 @@ import { serveStatic } from "hono/bun";
 import { websocket } from "hono/bun";
 import { env } from "./env";
 import { auth } from "./auth";
+import { rewriteLegacySsoCallbackPath } from "./auth/callback-compat";
 import { requireAuth } from "./auth/middleware";
 import { settingsRoutes } from "./routes/settings.routes";
 import { charactersRoutes } from "./routes/characters.routes";
@@ -17,6 +18,7 @@ import { secretsRoutes } from "./routes/secrets.routes";
 import { presetsRoutes } from "./routes/presets.routes";
 import { connectionsRoutes } from "./routes/connections.routes";
 import { generateRoutes } from "./routes/generate.routes";
+import { requestHistoryRoutes } from "./routes/request-history.routes";
 import { multiplayerRoutes } from "./routes/multiplayer.routes";
 import { imagesRoutes } from "./routes/images.routes";
 import { audioRoutes } from "./routes/audio.routes";
@@ -48,6 +50,8 @@ import { loadoutsRoutes } from "./routes/loadouts.routes";
 import { regexScriptsRoutes } from "./routes/regex-scripts.routes";
 import { expressionsRoutes } from "./routes/expressions.routes";
 import { pushRoutes } from "./routes/push.routes";
+import { desktopNotificationTransportRoutes } from "./routes/desktop-notifications.routes";
+import { desktopApiRoutes } from "./routes/desktop-api.routes";
 import { memoryCortexRoutes } from "./routes/memory-cortex.routes";
 import { operatorRoutes } from "./routes/operator.routes";
 import { openrouterRoutes } from "./routes/openrouter.routes";
@@ -74,7 +78,14 @@ import {
   isOriginAllowed,
 } from "./services/trusted-hosts.service";
 import { authLockoutService } from "./services/auth-lockout.service";
-import { getClientIp } from "./utils/client-ip";
+import {
+  getClientIp,
+  isConnectionFromExplicitTrustedProxy,
+} from "./utils/client-ip";
+import {
+  requestAtResolvedOrigin,
+  resolveDesktopRequestOrigin,
+} from "./auth/request-origin";
 import { listSsoLoginOptions } from "./services/sso-providers.service";
 import { userMediaServingHeaders } from "./utils/user-media-headers";
 import { getImageFilePathPublic } from "./services/images.service";
@@ -106,6 +117,7 @@ const PUBLIC_POST_PREFIXES = [
   "/api/v1/lumihub",
   "/api/v1/openrouter/oauth-landing",
   "/api/v1/nanogpt/oauth-landing",
+  "/api/desktop-notifications/v1",
 ];
 app.use("/api/*", async (c, next) => {
   const clientId = getClientIp(c);
@@ -165,7 +177,21 @@ app.use("/api/*", async (c, next) => {
 app.use("/api/*", async (c, next) => {
   const clientId = getClientIp(c);
   const origin = c.req.header("origin");
-  if (!env.trustAnyOrigin && origin && !isOriginAllowed(origin)) {
+  const notificationTicket = c.req.query("notificationTicket");
+  const desktopNotificationWs = c.req.path === "/api/ws"
+    && typeof notificationTicket === "string"
+    && notificationTicket.length > 0
+    && (
+      origin === "http://tauri.localhost"
+      || origin === "tauri://localhost"
+      || origin === "http://localhost:1430"
+      || origin === "http://127.0.0.1:1430"
+    );
+  // The bundled tray host has a Tauri-local origin rather than the backend's
+  // origin. Only the notification-only, single-use-ticket upgrade may cross
+  // this boundary; ordinary API and user WebSocket traffic stays on the
+  // trusted-origin allowlist.
+  if (!env.trustAnyOrigin && origin && !isOriginAllowed(origin) && !desktopNotificationWs) {
     const result = authLockoutService.recordFailure(clientId, "origin", {
       method: c.req.method,
       path: c.req.path,
@@ -297,23 +323,20 @@ app.use("*", async (c, next) => {
 });
 
 // BetterAuth handler — BEFORE auth middleware
-// Rewrite the request URL to use the actual Host header so BetterAuth
-// constructs the correct redirect URLs and cookie domains when accessed via
-// a LAN IP instead of localhost. Respect X-Forwarded-Proto/Host from reverse
-// proxies (Cloudflare, nginx, HuggingFace Spaces) so BetterAuth generates
-// https:// callback URLs when served behind TLS termination.
+// Better Auth receives a URL rebuilt from an approved public origin. Forwarded
+// host/proto are considered only for an explicitly trusted socket peer, then
+// removed so downstream middleware cannot reinterpret attacker input.
 const betterAuthHandler: Handler = (c) => {
   if (c.req.path === "/api/auth/sign-up/email") {
     return c.json({ error: "Not found" }, 404);
   }
-  const host = c.req.header("x-forwarded-host") || c.req.header("host");
-  const proto = c.req.header("x-forwarded-proto") || "http";
-  if (host) {
-    const url = new URL(c.req.url);
-    const rewritten = new URL(url.pathname + url.search, `${proto}://${host}`);
-    return auth.handler(new Request(rewritten.toString(), c.req.raw));
-  }
-  return auth.handler(c.req.raw);
+  const url = new URL(c.req.url);
+  const pathname = rewriteLegacySsoCallbackPath(url.pathname);
+  const origin = resolveDesktopRequestOrigin(
+    c.req.raw,
+    isConnectionFromExplicitTrustedProxy(c),
+  );
+  return auth.handler(requestAtResolvedOrigin(c.req.raw, origin, pathname + url.search));
 };
 app.get("/api/auth/*", betterAuthHandler);
 app.post("/api/auth/*", betterAuthHandler);
@@ -453,6 +476,14 @@ app.get("/api/v1/image-gen/results/:id", async (c) => {
 // Stream Deck uses dedicated, hashed, revocable tokens rather than browser
 // sessions. Keep this deliberately narrow and outside the general v1 API.
 app.route("/api/integrations/stream-deck/v1", streamDeckIntegrationRoutes);
+// The desktop companion exchanges a durable, narrowly-scoped credential for
+// a single-use notification WebSocket ticket. This deliberately sits outside
+// browser-session auth so a desktop rebuild or WebView cookie loss does not
+// silently unregister the native destination.
+app.route("/api/desktop-notifications/v1", desktopNotificationTransportRoutes);
+// OAuth-protected, read-only desktop API. It performs scope and live role
+// checks independently of the browser-session API below.
+app.route("/api/desktop/v1", desktopApiRoutes);
 
 app.get("/api/v1/sso-providers/login-options", (c) => {
   return c.json(listSsoLoginOptions());
@@ -485,6 +516,7 @@ app.route("/api/v1/audio", audioRoutes);
 app.route("/api/v1/theme-assets", themeAssetsRoutes);
 app.route("/api/v1/notification-sounds", notificationSoundsRoutes);
 app.route("/api/v1/generate", generateRoutes);
+app.route("/api/v1/request-history", requestHistoryRoutes);
 app.route("/api/v1/multiplayer", multiplayerRoutes);
 app.route("/api/v1/providers", providersRoutes);
 app.route("/api/v1/macros", macrosRoutes);

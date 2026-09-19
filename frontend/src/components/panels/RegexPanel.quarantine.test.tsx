@@ -65,6 +65,12 @@ const evidenceReports: Array<{ id: string; payload: Record<string, unknown> }> =
 let reportEvidenceImpl: (id: string, payload: Record<string, unknown>) => Promise<unknown> = async () => ({})
 const successToasts: string[] = []
 const errorToasts: string[] = []
+let storedRegexFolders: string[] = []
+const putSetting = jest.fn(async (key: string, value: unknown) => {
+  if (key === 'regexScriptFolders' && Array.isArray(value)) {
+    storedRegexFolders = value as string[]
+  }
+})
 
 mock.module('@/api/regex', () => ({
   regexApi: {
@@ -78,8 +84,8 @@ mock.module('@/api/regex', () => ({
 }))
 mock.module('@/api/settings', () => ({
   settingsApi: {
-    get: async () => ({ value: [] }),
-    put: async () => ({}),
+    get: async (key: string) => ({ value: key === 'regexScriptFolders' ? storedRegexFolders : [] }),
+    put: putSetting,
   },
 }))
 mock.module('@/lib/toast', () => ({
@@ -211,6 +217,8 @@ afterEach(async () => {
   evidenceReports.length = 0
   successToasts.length = 0
   errorToasts.length = 0
+  storedRegexFolders = []
+  putSetting.mockClear()
   reportEvidenceImpl = async () => ({})
   loadRegexScripts.mockClear()
   updateRegexScript.mockClear()
@@ -278,5 +286,129 @@ describe('RegexPanel quarantine recovery', () => {
     expect(evidenceReports).toEqual([{ id: 'hung-script', payload: { quarantined: false } }])
     expect(errorToasts).toEqual(['Script is read-only'])
     expect(successToasts).toEqual([])
+  })
+})
+
+describe('RegexPanel folders', () => {
+  test('scoped views omit folders that contain no matching scripts', async () => {
+    storedRegexFolders = ['Empty folder']
+    storeState = {
+      ...baseStoreState([
+        script('global-script', { folder: 'Global folder' }),
+        script('matching-chat-script', { folder: 'Matching chat folder', scope: 'chat', scope_id: 'chat-1' }),
+        script('other-chat-script', { folder: 'Other chat folder', scope: 'chat', scope_id: 'chat-2' }),
+      ]),
+      activeChatId: 'chat-1',
+    }
+
+    const host = await mount(<RegexPanel />)
+
+    expect(host.textContent).toContain('Empty folder')
+    expect(host.textContent).toContain('Global folder')
+    expect(host.textContent).toContain('Matching chat folder')
+    expect(host.textContent).toContain('Other chat folder')
+
+    const chatScopeButton = [...host.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent === panels.regexPanel.scopeThisChat)
+    expect(chatScopeButton).not.toBeUndefined()
+    await click(chatScopeButton!)
+
+    expect(host.textContent).toContain('Matching chat folder')
+    expect(host.textContent).not.toContain('Empty folder')
+    expect(host.textContent).not.toContain('Global folder')
+    expect(host.textContent).not.toContain('Other chat folder')
+  })
+
+  test('creating a folder with no scripts renders a blank folder target', async () => {
+    storeState = baseStoreState([])
+    const host = await mount(<RegexPanel />)
+
+    expect(host.textContent).toContain(panels.regexPanel.noScripts)
+
+    await click(host.querySelector<HTMLElement>('button[title="Add"]')!)
+    const newFolderButton = [...host.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.includes(panels.regexPanel.newFolder))
+    expect(newFolderButton).not.toBeUndefined()
+    await click(newFolderButton!)
+
+    const folderInput = host.querySelector<HTMLInputElement>(`input[placeholder="${panels.regexPanel.folderName}"]`)
+    expect(folderInput).not.toBeNull()
+    await act(async () => {
+      const setValue = Object.getOwnPropertyDescriptor(domWindow.HTMLInputElement.prototype, 'value')?.set
+      setValue?.call(folderInput, 'Post-processing')
+      folderInput!.dispatchEvent(new domWindow.Event('input', { bubbles: true }))
+      await Promise.resolve()
+    })
+    await act(async () => {
+      folderInput!.dispatchEvent(new domWindow.KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+      await Promise.resolve()
+    })
+
+    expect(host.textContent).toContain('Post-processing')
+    expect(host.textContent).not.toContain(panels.regexPanel.noScripts)
+    expect(host.querySelector('[role="button"]')?.textContent).toContain('Post-processing0')
+  })
+
+  test('renders a previously persisted folder when the regex library is empty', async () => {
+    storedRegexFolders = ['Reusable targets']
+    storeState = baseStoreState([])
+
+    const host = await mount(<RegexPanel />)
+
+    expect(host.textContent).toContain('Reusable targets')
+    expect(host.textContent).not.toContain(panels.regexPanel.noScripts)
+  })
+
+  test('deletes a persisted empty folder after confirmation', async () => {
+    storedRegexFolders = ['Reusable targets']
+    storeState = baseStoreState([])
+
+    const host = await mount(<RegexPanel />)
+    await click(byAriaLabel(host, 'Delete all scripts in Reusable targets')!)
+    await click(document.querySelector<HTMLButtonElement>('button[type="submit"]')!)
+
+    expect(host.textContent).not.toContain('Reusable targets')
+    expect(host.textContent).toContain(panels.regexPanel.noScripts)
+  })
+
+  test('removes a populated folder from settings after all scripts are deleted', async () => {
+    storedRegexFolders = ['Reusable targets']
+    const folderScript = script('folder-script', { folder: 'Reusable targets' })
+    const bulkRemoveRegexScripts = jest.fn(async () => 1)
+    storeState = {
+      ...baseStoreState([folderScript]),
+      bulkRemoveRegexScripts,
+    }
+
+    const host = await mount(<RegexPanel />)
+    await click(byAriaLabel(host, 'Delete all scripts in Reusable targets')!)
+    await click(document.querySelector<HTMLButtonElement>('button[type="submit"]')!)
+
+    expect(bulkRemoveRegexScripts).toHaveBeenCalledWith(['folder-script'])
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(storedRegexFolders).toEqual([])
+  })
+
+  test('keeps a populated folder in settings when some scripts cannot be deleted', async () => {
+    storedRegexFolders = ['Reusable targets']
+    const scripts = [
+      script('deletable-script', { folder: 'Reusable targets' }),
+      script('protected-script', { folder: 'Reusable targets' }),
+    ]
+    const bulkRemoveRegexScripts = jest.fn(async () => 1)
+    storeState = {
+      ...baseStoreState(scripts),
+      bulkRemoveRegexScripts,
+    }
+
+    const host = await mount(<RegexPanel />)
+    await click(byAriaLabel(host, 'Delete all scripts in Reusable targets')!)
+    await click(document.querySelector<HTMLButtonElement>('button[type="submit"]')!)
+
+    expect(bulkRemoveRegexScripts).toHaveBeenCalledWith(['deletable-script', 'protected-script'])
+    expect(storedRegexFolders).toEqual(['Reusable targets'])
+    expect(errorToasts).toEqual(['1 scripts could not be deleted'])
   })
 })

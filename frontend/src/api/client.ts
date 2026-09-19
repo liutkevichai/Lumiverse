@@ -1,9 +1,22 @@
+import { isExpiredSessionResponse, signalInvalidAuthSession } from './session-lifecycle'
+
 export const BASE_URL = import.meta.env.VITE_API_BASE || '/api/v1'
 
 /** Default timeout for API requests (30s). Prevents the UI from locking
  *  indefinitely when the server hangs on slow operations (embedding calls,
  *  vector search, etc.). Individual callers can override via `options.timeout`. */
 const DEFAULT_TIMEOUT_MS = 30_000
+
+/**
+ * Render a timeout in the largest unit that still reads naturally, so a
+ * five-minute ceiling does not report itself as 300000ms.
+ */
+function formatTimeout(ms: number): string {
+  if (ms < 1000) return `${Math.round(ms)}ms`
+  if (ms < 60_000) return `${Math.round(ms / 1000)}s`
+  const minutes = ms / 60_000
+  return `${Number.isInteger(minutes) ? minutes : minutes.toFixed(1)}min`
+}
 
 export class ApiError extends Error {
   constructor(
@@ -21,7 +34,7 @@ export class RequestTimeoutError extends Error {
     public url: string,
     public timeoutMs: number
   ) {
-    super(`Request timed out after ${timeoutMs}ms`)
+    super(`Request timed out after ${formatTimeout(timeoutMs)}`)
     this.name = 'RequestTimeoutError'
   }
 }
@@ -76,6 +89,7 @@ async function handleResponse<T>(res: Response): Promise<T> {
     } catch {
       body = await res.text().catch(() => null)
     }
+    if (isExpiredSessionResponse(res.status, body)) signalInvalidAuthSession()
     throw new ApiError(res.status, res.statusText, body)
   }
   if (res.status === 204) return undefined as T
@@ -201,6 +215,7 @@ export async function getBlob(path: string, params?: Record<string, any>, option
     if (!res.ok) {
       let body: any
       try { body = await res.json() } catch { body = null }
+      if (isExpiredSessionResponse(res.status, body)) signalInvalidAuthSession()
       throw new ApiError(res.status, res.statusText, body)
     }
     return res.blob()
@@ -241,6 +256,7 @@ export async function postBlob(path: string, body?: any, options?: RequestOption
     if (!res.ok) {
       let responseBody: any
       try { responseBody = await res.json() } catch { responseBody = await res.text().catch(() => null) }
+      if (isExpiredSessionResponse(res.status, responseBody)) signalInvalidAuthSession()
       throw new ApiError(res.status, res.statusText, responseBody)
     }
     const blob = await res.blob()
@@ -330,6 +346,7 @@ export function uploadWithProgress<T>(
       } else {
         let body: any
         try { body = JSON.parse(xhr.responseText) } catch { body = xhr.responseText }
+        if (isExpiredSessionResponse(xhr.status, body)) signalInvalidAuthSession()
         reject(new ApiError(xhr.status, xhr.statusText, body))
       }
     }

@@ -190,7 +190,7 @@ export default function RegexPanel() {
   const popoverRef = useRef<HTMLDivElement>(null)
   const folderInputRef = useRef<HTMLInputElement>(null)
 
-  const { folders, createFolder } = useFolders('regexScriptFolders', regexScripts)
+  const { folders, createFolder, deleteFolder } = useFolders('regexScriptFolders', regexScripts)
 
   useEffect(() => {
     loadRegexScripts()
@@ -257,11 +257,20 @@ export default function RegexPanel() {
   }, [regexScripts])
 
   const groupedScripts = useMemo(() => {
-    if (filteredScripts.length === 0) return null
     // Keep the uncategorized bucket under a folder-style header too, so it can
     // expose the same bulk actions as named folders.
     const groups: Array<{ folder: string; scripts: RegexScript[] }> = []
     const folderMap = new Map<string, RegexScript[]>()
+    // `folders` also contains names persisted by useFolders that do not have a
+    // script yet. They are useful empty drop targets in the complete library,
+    // but scoped views must only show folders containing a matching script.
+    // Otherwise every library folder appears with a misleading zero count.
+    if (scopeFilter === 'all') {
+      for (const folder of folders) {
+        folderMap.set(folder, [])
+        groups.push({ folder, scripts: folderMap.get(folder)! })
+      }
+    }
     for (const s of filteredScripts) {
       const key = s.folder || ''
       if (!folderMap.has(key)) {
@@ -277,7 +286,7 @@ export default function RegexPanel() {
       return a.folder.localeCompare(b.folder)
     })
     return groups
-  }, [filteredScripts])
+  }, [filteredScripts, folders, scopeFilter])
 
   const toggleFolder = useCallback((folder: string) => {
     setCollapsedFolders((prev) => {
@@ -419,9 +428,12 @@ export default function RegexPanel() {
     }
   }, [removeRegexScript, expandedId, t])
 
-  const handleDeleteGroup = useCallback(async (scripts: RegexScript[]) => {
+  const handleDeleteGroup = useCallback(async (scripts: RegexScript[], folder: string) => {
     setDeleteGroupTarget(null)
-    if (scripts.length === 0) return
+    if (scripts.length === 0) {
+      if (folder) deleteFolder(folder)
+      return
+    }
     const ids = scripts.map((s) => s.id)
     try {
       const deleted = await bulkRemoveRegexScripts(ids)
@@ -429,12 +441,13 @@ export default function RegexPanel() {
       if (deleted < ids.length) {
         toast.error(t('regexPanel.deleteSomeFailed', { count: ids.length - deleted }))
       } else {
+        if (folder) deleteFolder(folder)
         toast.success(t('regexPanel.deletedScripts', { count: deleted }))
       }
     } catch (err: any) {
       toast.error(err.body?.error || err.message || t('regexPanel.requestFailed'))
     }
-  }, [bulkRemoveRegexScripts, expandedId, t])
+  }, [bulkRemoveRegexScripts, deleteFolder, expandedId, t])
 
   const handleDeleteBulk = useCallback(async (ids: string[]) => {
     setDeleteBulkTarget(null)
@@ -829,7 +842,7 @@ export default function RegexPanel() {
       )}
 
       <div className={styles.scriptList}>
-        {filteredScripts.length === 0 ? (
+        {groupedScripts.length === 0 ? (
           <div className={styles.emptyState}>
             <p>{t('regexPanel.noScripts')}</p>
             <p>{t('regexPanel.clickPlus')}</p>
@@ -837,17 +850,20 @@ export default function RegexPanel() {
         ) : (
           <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
             <SortableContext items={renderedScriptIds} strategy={verticalListSortingStrategy}>
-              {groupedScripts ? (
-                groupedScripts.map((group) => {
-                  const folderKey = group.folder || UNCATEGORIZED_KEY
-                  const isCollapsed = collapsedFolders.has(folderKey)
-                  const folderLabel = group.folder || t('shared:uncategorized')
-                  const isNamedFolder = Boolean(group.folder)
-                  const presetVersions = getRemotePresetVersions(group.scripts, presets)
-                  const spindleVersions = getSpindleExtensionFolderVersions(group.scripts)
-                  return (
-                    <div key={folderKey}>
-                      <DroppableFolderHeader folderKey={folderKey} dropDisabled={!isCollapsed} onToggle={() => toggleFolder(folderKey)}>
+              {groupedScripts.map((group) => {
+                const folderKey = group.folder || UNCATEGORIZED_KEY
+                const isCollapsed = collapsedFolders.has(folderKey)
+                const folderLabel = group.folder || t('shared:uncategorized')
+                const isNamedFolder = Boolean(group.folder)
+                const presetVersions = getRemotePresetVersions(group.scripts, presets)
+                const spindleVersions = getSpindleExtensionFolderVersions(group.scripts)
+                return (
+                  <div key={folderKey}>
+                      <DroppableFolderHeader
+                        folderKey={folderKey}
+                        dropDisabled={!isCollapsed && group.scripts.length > 0}
+                        onToggle={() => toggleFolder(folderKey)}
+                      >
                         {bulkMode ? (
                           <button
                             type="button"
@@ -940,7 +956,7 @@ export default function RegexPanel() {
                             className={clsx(styles.folderActionBtn, styles.folderDeleteBtn)}
                             onClick={(e) => {
                               e.stopPropagation()
-                              setDeleteGroupTarget({ scripts: group.scripts, folder: folderLabel })
+                              setDeleteGroupTarget({ scripts: group.scripts, folder: group.folder })
                             }}
                             title={t('regexPanel.deleteFolderScripts', { folder: folderLabel })}
                             aria-label={t('regexPanel.deleteFolderScriptsAria', { folder: folderLabel })}
@@ -971,32 +987,9 @@ export default function RegexPanel() {
                             activePresetId={activeLoomPresetId}
                           />
                         ))}
-                    </div>
-                  )
-                })
-              ) : (
-                filteredScripts.map((script) => (
-                  <ScriptRow
-                    key={script.id}
-                    script={script}
-                    expanded={expandedId === script.id}
-                    onToggleExpand={() => setExpandedId(expandedId === script.id ? null : script.id)}
-                    selectionMode={bulkMode}
-                    selected={selectedIds.has(script.id)}
-                    onSelect={() => toggleScriptSelection(script.id)}
-                    onDelete={(e) => { e.stopPropagation(); setDeleteScriptTarget(script) }}
-                    onToggle={(disabled, e) => handleToggle(script.id, disabled, e)}
-                    onBindPreset={(e) => handleBindToPreset(script, e)}
-                    onUpdate={(updates) => updateRegexScript(script.id, updates)}
-                    onOpenModal={() => openModal('regexEditor', { scriptId: script.id })}
-                    targetBadge={targetBadge(script.target)}
-                    scopeIcon={scopeIcon(script.scope)}
-                    folders={folders}
-                    onCreateFolder={createFolder}
-                    activePresetId={activeLoomPresetId}
-                  />
-                ))
-              )}
+                  </div>
+                )
+              })}
             </SortableContext>
           </DndContext>
         )}
@@ -1018,10 +1011,13 @@ export default function RegexPanel() {
         <ConfirmationModal
           isOpen={true}
           title={t('regexPanel.deleteFolderTitle')}
-          message={t('regexPanel.deleteFolderConfirm', { count: deleteGroupTarget.scripts.length, folder: deleteGroupTarget.folder })}
+          message={t('regexPanel.deleteFolderConfirm', {
+            count: deleteGroupTarget.scripts.length,
+            folder: deleteGroupTarget.folder || t('shared:uncategorized'),
+          })}
           variant="danger"
           confirmText={tc('actions.delete')}
-          onConfirm={() => { void handleDeleteGroup(deleteGroupTarget.scripts) }}
+          onConfirm={() => { void handleDeleteGroup(deleteGroupTarget.scripts, deleteGroupTarget.folder) }}
           onCancel={() => setDeleteGroupTarget(null)}
         />
       )}
@@ -1042,10 +1038,10 @@ export default function RegexPanel() {
 }
 
 /** Folder header that doubles as a drop target, so a regex dragged onto a
- *  collapsed folder moves into it. The droppable is disabled while the folder is
- *  expanded — its visible rows are the precise drop targets then, and an active
- *  header droppable would otherwise "win" the collision when dragging toward the
- *  folder's top and bounce the row to the bottom. */
+ *  collapsed or empty folder moves into it. The droppable is disabled while a
+ *  non-empty folder is expanded — its visible rows are the precise drop targets
+ *  then, and an active header droppable would otherwise "win" the collision when
+ *  dragging toward the folder's top and bounce the row to the bottom. */
 function DroppableFolderHeader({
   folderKey,
   dropDisabled,

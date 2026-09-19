@@ -14,8 +14,12 @@
   },
   "permissions": [
     "allow-configure-frontend-appearance",
+    "desktop-frontend-presence",
     "desktop-startup-appearance",
+    "desktop-frontend-file-drop",
     "desktop-widget-catalog",
+    "desktop-notification-registration",
+    "notification:allow-is-permission-granted",
     "core:event:allow-listen",
     "core:event:allow-unlisten",
     "core:window:allow-start-dragging",

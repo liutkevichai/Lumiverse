@@ -17,8 +17,10 @@ interface Identity {
 
 interface HarnessProps {
   content: string
+  depth?: number
   identity?: Identity
   isStreaming: boolean
+  onCommit?: (state: { content: string; pending: boolean }) => void
 }
 
 const dom = new JSDOM('<!doctype html><html><body></body></html>', {
@@ -57,7 +59,7 @@ const storeState = {
     flags: 'g',
     placement: ['ai_output'],
     min_depth: null,
-    max_depth: null,
+    max_depth: null as number | null,
     trim_strings: [],
     substitute_macros: 'none',
     metadata: {},
@@ -78,7 +80,6 @@ mock.module('@/lib/chatDisplaySettle', () => ({
 }))
 mock.module('@/lib/regex/pipeline', () => ({
   applyDisplayRegexTiered,
-  canApplyDisplayRegexInWorker: () => true,
 }))
 mock.module('@/api/macros', () => ({
   resolveMacrosBatch: async ({ templates }: { templates: Record<string, string> }) => ({ resolved: templates }),
@@ -136,19 +137,18 @@ mock.module('@/lib/toast', () => ({ toast: { warning: () => undefined } }))
 mock.module('@/i18n', () => ({ default: { t: (key: string) => key } }))
 
 const {
-  resetDisplayCoalesceForTests,
+  invalidateDisplayRegexCache,
   resetDisplayRegexCachesForTests,
-  setDisplayCoalesceDepsForTests,
-  useDisplayRegex,
+  useDisplayRegexState,
 } = await import('./useDisplayRegex')
-const { act, createElement } = await import('react')
+const { act, createElement, StrictMode, useLayoutEffect } = await import('react')
 const { createRoot } = await import('react-dom/client')
 
-function Harness({ content, identity, isStreaming }: HarnessProps) {
-  const rendered = useDisplayRegex(
+function Harness({ content, depth = 0, identity, isStreaming, onCommit }: HarnessProps) {
+  const rendered = useDisplayRegexState(
     content,
     false,
-    0,
+    depth,
     undefined,
     identity
       ? {
@@ -159,30 +159,12 @@ function Harness({ content, identity, isStreaming }: HarnessProps) {
       : undefined,
     isStreaming,
   )
-  return createElement('output', null, rendered)
+  useLayoutEffect(() => { onCommit?.(rendered) })
+  return createElement('output', { 'data-pending': rendered.pending }, rendered.content)
 }
 
 function readRendered(host: HTMLDivElement): string {
   return host.textContent ?? ''
-}
-
-function configureImmediateCoalescing(): void {
-  let now = 1_000
-  setDisplayCoalesceDepsForTests({
-    now: () => (now += 1_000),
-    scheduleTimer: (fn) => {
-      let active = true
-      queueMicrotask(() => { if (active) fn() })
-      return () => { active = false }
-    },
-  })
-}
-
-function configurePausedTrailingCoalescing(): void {
-  setDisplayCoalesceDepsForTests({
-    now: () => 1_000,
-    scheduleTimer: () => () => {},
-  })
 }
 
 async function flushReact(): Promise<void> {
@@ -224,19 +206,18 @@ function holdPreprocess(content: string): void {
   heldPreprocess.add(content)
 }
 
-async function releasePreprocess(content: string): Promise<void> {
+async function releasePreprocess(content: string, result = content): Promise<void> {
   heldPreprocess.delete(content)
   const resolvePreprocess = pendingPreprocess.get(content)
   if (!resolvePreprocess) throw new Error(`No held preprocess for ${content}`)
   pendingPreprocess.delete(content)
   await act(async () => {
-    resolvePreprocess({ content, cacheable: true })
+    resolvePreprocess({ content: result, cacheable: true })
     await Promise.resolve()
   })
 }
 
 async function createHarness(): Promise<{ host: HTMLDivElement; root: Root }> {
-  configureImmediateCoalescing()
   const host = document.createElement('div')
   document.body.append(host)
   return { host, root: createRoot(host) }
@@ -247,7 +228,6 @@ async function destroyHarness(host: HTMLDivElement, root: Root): Promise<void> {
   host.remove()
   pendingResults.clear()
   resetDisplayRegexCachesForTests()
-  resetDisplayCoalesceForTests()
 }
 
 afterEach(() => {
@@ -262,7 +242,6 @@ afterEach(() => {
   trackInitialDisplayResolve.mockClear()
   document.body.replaceChildren()
   resetDisplayRegexCachesForTests()
-  resetDisplayCoalesceForTests()
 })
 
 afterAll(() => {
@@ -271,6 +250,280 @@ afterAll(() => {
 })
 
 describe('useDisplayRegex resolver lifecycle', () => {
+  test('a cold virtual row stays provisional through preprocessing and HTML replacement', async () => {
+    const { host, root } = await createHarness()
+    const identity = { chatId: 'chat-virtual', messageId: 'message-virtual' }
+    const content = 'chunk virtual'
+    holdPreprocess(content)
+    try {
+      await renderWhilePreprocessPending(root, { content, identity, isStreaming: false })
+      expect(host.querySelector('output')?.dataset.pending).toBe('true')
+      expect(applyDisplayRegexTiered).not.toHaveBeenCalled()
+
+      await releasePreprocess(content)
+      await waitForPending(content)
+      expect(host.querySelector('output')?.dataset.pending).toBe('true')
+
+      await settle(content, '<div style="height:800px">Replacement</div>')
+      expect(host.querySelector('output')?.dataset.pending).toBe('false')
+      expect(readRendered(host)).toBe('<div style="height:800px">Replacement</div>')
+    } finally {
+      await destroyHarness(host, root)
+    }
+  })
+
+  test('a virtual remount commits cached HTML immediately without a provisional raw frame', async () => {
+    const { host, root } = await createHarness()
+    const props = {
+      content: 'chunk remount',
+      identity: { chatId: 'chat-remount', messageId: 'message-remount' },
+      isStreaming: false,
+    }
+    const html = '<div style="height:800px">Cached replacement</div>'
+    try {
+      await render(root, props)
+      await settle(props.content, html)
+      await act(async () => { root.render(null) })
+
+      const commits: Array<{ content: string; pending: boolean }> = []
+      await act(async () => {
+        root.render(createElement(Harness, { ...props, onCommit: (state) => commits.push(state) }))
+      })
+      expect(commits.length).toBeGreaterThan(0)
+      expect(commits.every((state) => state.content === html && !state.pending)).toBe(true)
+      expect(applyDisplayRegexTiered).toHaveBeenCalledTimes(1)
+    } finally {
+      await destroyHarness(host, root)
+    }
+  })
+
+  test('an idle cache invalidation keeps resolved HTML visible during refresh', async () => {
+    const { host, root } = await createHarness()
+    const identity = { chatId: 'chat-refresh', messageId: 'message-refresh' }
+    try {
+      await render(root, { content: 'chunk refresh', identity, isStreaming: false })
+      await settle('chunk refresh', '<div>Original replacement</div>')
+      await act(async () => { invalidateDisplayRegexCache() })
+      await waitForPending('chunk refresh')
+      expect(host.querySelector('output')?.dataset.pending).toBe('false')
+      expect(readRendered(host)).toBe('<div>Original replacement</div>')
+      await settle('chunk refresh', '<div>Refreshed replacement</div>')
+      expect(host.querySelector('output')?.dataset.pending).toBe('false')
+      expect(readRendered(host)).toBe('<div>Refreshed replacement</div>')
+    } finally {
+      await destroyHarness(host, root)
+    }
+  })
+
+  test('sending a message keeps existing HTML visible through depth-dependent preprocessing and regex work', async () => {
+    const { host, root } = await createHarness()
+    const props = {
+      content: 'chunk source',
+      identity: { chatId: 'chat-depth', messageId: 'message-depth' },
+      isStreaming: false,
+    }
+    const html = '<div style="height:800px">Existing island</div>'
+    try {
+      holdPreprocess(props.content)
+      await renderWhilePreprocessPending(root, props)
+      await releasePreprocess(props.content, 'chunk preprocessed')
+      await waitForPending('chunk preprocessed')
+      await settle('chunk preprocessed', html)
+
+      // Appending a message changes every existing row's depth, even though
+      // its source and identity are unchanged. Observe every commit: an
+      // immediate resolver would conceal the provisional blank frame.
+      const commits: Array<{ content: string; pending: boolean }> = []
+      holdPreprocess(props.content)
+      await renderWhilePreprocessPending(root, {
+        ...props, depth: 1, onCommit: (state) => commits.push(state),
+      })
+      expect(pendingPreprocess.has(props.content)).toBe(true)
+      expect(commits.length).toBeGreaterThan(0)
+      expect(commits.every((state) => state.content === html && !state.pending)).toBe(true)
+
+      await releasePreprocess(props.content, 'chunk refreshed')
+      await waitForPending('chunk refreshed')
+      expect(commits.every((state) => state.content === html && !state.pending)).toBe(true)
+      await settle('chunk refreshed', '<div>Updated island</div>')
+      expect(readRendered(host)).toBe('<div>Updated island</div>')
+      expect(host.querySelector('output')?.dataset.pending).toBe('false')
+    } finally {
+      await destroyHarness(host, root)
+    }
+  })
+
+  test('a backend preprocess refresh retains visible passthrough content until its depth update settles', async () => {
+    const { host, root } = await createHarness()
+    const props = {
+      content: 'Plain message',
+      identity: { chatId: 'chat-passthrough-depth', messageId: 'message-passthrough-depth' },
+      isStreaming: false,
+    }
+    isDisplayChatOwnedMock.mockImplementation(() => false)
+    try {
+      await renderWhilePreprocessPending(root, props)
+      await act(async () => { await new Promise<void>((resolve) => domWindow.setTimeout(resolve, 12)) })
+      expect(host.querySelector('output')?.dataset.pending).toBe('false')
+
+      const commits: Array<{ content: string; pending: boolean }> = []
+      heldRemotePreprocess.add(props.content)
+      await renderWhilePreprocessPending(root, {
+        ...props, depth: 1, onCommit: (state) => commits.push(state),
+      })
+      await act(async () => { await new Promise<void>((resolve) => domWindow.setTimeout(resolve, 12)) })
+      expect(pendingRemotePreprocess.has(props.content)).toBe(true)
+      expect(commits.length).toBeGreaterThan(0)
+      expect(commits.every((state) => state.content === props.content && !state.pending)).toBe(true)
+
+      await act(async () => {
+        pendingRemotePreprocess.get(props.content)!(remotePreprocessResponse(['Updated plain message']))
+      })
+      expect(readRendered(host)).toBe('Updated plain message')
+      expect(host.querySelector('output')?.dataset.pending).toBe('false')
+      expect(applyDisplayRegexTiered).not.toHaveBeenCalled()
+    } finally {
+      await destroyHarness(host, root)
+    }
+  })
+
+  test('a regex that expires at the new depth replaces retained HTML once preprocessing settles', async () => {
+    const { host, root } = await createHarness()
+    const props = {
+      content: 'chunk depth-limited',
+      identity: { chatId: 'chat-depth-limit', messageId: 'message-depth-limit' },
+      isStreaming: false,
+    }
+    const originalScripts = storeState.regexScripts
+    storeState.regexScripts = originalScripts.map((script) => ({ ...script, max_depth: 0 }))
+    try {
+      await render(root, props)
+      await settle(props.content, '<div>Depth-limited island</div>')
+
+      holdPreprocess(props.content)
+      await renderWhilePreprocessPending(root, { ...props, depth: 1 })
+      expect(readRendered(host)).toBe('<div>Depth-limited island</div>')
+      expect(host.querySelector('output')?.dataset.pending).toBe('false')
+
+      await releasePreprocess(props.content)
+      expect(readRendered(host)).toBe(props.content)
+      expect(host.querySelector('output')?.dataset.pending).toBe('false')
+      expect(applyDisplayRegexTiered).toHaveBeenCalledTimes(1)
+    } finally {
+      storeState.regexScripts = originalScripts
+      await destroyHarness(host, root)
+    }
+  })
+
+  test.each(['chat', 'message', 'source', 'remount'] as const)(
+    'a %s change cannot reuse the prior visible display during preprocessing',
+    async (change) => {
+      const { host, root } = await createHarness()
+      const props = {
+        content: 'chunk original',
+        identity: { chatId: 'chat-retention', messageId: 'message-retention' },
+        isStreaming: false,
+      }
+      try {
+        await render(root, props)
+        await settle(props.content, '<div>Original island</div>')
+        if (change === 'remount') await act(async () => { root.render(null) })
+        const next = {
+          ...props,
+          depth: 1,
+          content: change === 'source' ? 'chunk edited' : props.content,
+          identity: {
+            chatId: change === 'chat' ? 'chat-next' : props.identity.chatId,
+            messageId: change === 'message' ? 'message-next' : props.identity.messageId,
+          },
+        }
+        holdPreprocess(next.content)
+        await renderWhilePreprocessPending(root, next)
+        expect(readRendered(host)).toBe(next.content)
+        expect(host.querySelector('output')?.dataset.pending).toBe('true')
+        await releasePreprocess(next.content)
+        await waitForPending(next.content)
+        await settle(next.content, '<div>Next island</div>')
+        expect(readRendered(host)).toBe('<div>Next island</div>')
+        expect(host.querySelector('output')?.dataset.pending).toBe('false')
+      } finally {
+        await destroyHarness(host, root)
+      }
+    },
+  )
+
+  test('a failed regex pass releases the reserved row with fallback text', async () => {
+    const { host, root } = await createHarness()
+    applyDisplayRegexTiered.mockImplementationOnce(() => Promise.reject(new Error('resolver unavailable')))
+    try {
+      await act(async () => {
+        root.render(createElement(Harness, { content: 'chunk failure', isStreaming: false }))
+      })
+      await flushReact()
+      expect(host.querySelector('output')?.dataset.pending).toBe('false')
+      expect(readRendered(host)).toBe('chunk failure')
+    } finally {
+      await destroyHarness(host, root)
+    }
+  })
+
+  test('StrictMode effect replay still resolves the mounted message', async () => {
+    const { host, root } = await createHarness()
+    try {
+      await act(async () => root.render(createElement(StrictMode, null,
+        createElement(Harness, { content: 'chunk strict', isStreaming: true }),
+      )))
+      await waitForPending('chunk strict')
+      await settle('chunk strict', 'resolved strict')
+      expect(readRendered(host)).toBe('resolved strict')
+      expect(applyDisplayRegexTiered).toHaveBeenCalledTimes(1)
+    } finally {
+      await destroyHarness(host, root)
+    }
+  })
+
+  test('an invalidation starts fresh work and a late pre-invalidation result cannot overwrite it', async () => {
+    const { host, root } = await createHarness()
+    const identity = { chatId: 'chat-invalidated', messageId: 'message-invalidated' }
+    try {
+      await render(root, { content: 'chunk', identity, isStreaming: true })
+      const obsolete = pendingResults.get('chunk')!
+      await act(async () => invalidateDisplayRegexCache())
+      await flushReact()
+      expect(pendingResults.get('chunk')).not.toBe(obsolete)
+      await settle('chunk', 'fresh result')
+      await act(async () => obsolete({ result: 'obsolete', touchedVars: new Set(), cacheable: true }))
+      expect(readRendered(host)).toBe('fresh result')
+    } finally {
+      await destroyHarness(host, root)
+    }
+  })
+
+  test('slow preprocessing advances completed prefixes and replaces queued token revisions', async () => {
+    const { host, root } = await createHarness()
+    const identity = { chatId: 'chat-slow-preprocess', messageId: 'message-slow-preprocess' }
+    try {
+      holdPreprocess('chunk')
+      holdPreprocess('chunk one two')
+      await renderWhilePreprocessPending(root, { content: 'chunk', identity, isStreaming: true })
+      await renderWhilePreprocessPending(root, { content: 'chunk one', identity, isStreaming: true })
+      await renderWhilePreprocessPending(root, { content: 'chunk one two', identity, isStreaming: true })
+      expect([...pendingPreprocess.keys()]).toEqual(['chunk'])
+      await releasePreprocess('chunk')
+      await waitForPending('chunk')
+      expect(pendingPreprocess.has('chunk one two')).toBe(true)
+      await settle('chunk', 'resolved prefix')
+      expect(readRendered(host)).toBe('resolved prefix')
+      await releasePreprocess('chunk one two')
+      await waitForPending('chunk one two')
+      await settle('chunk one two', 'resolved latest')
+      expect(readRendered(host)).toBe('resolved latest')
+      expect(applyDisplayRegexTiered.mock.calls.map(([content]) => content)).toEqual(['chunk', 'chunk one two'])
+    } finally {
+      await destroyHarness(host, root)
+    }
+  })
+
   test('paints safe plain-text suffixes immediately but holds a new macro opener', async () => {
     const { host, root } = await createHarness()
     const identity = { chatId: 'chat-plain-stream', messageId: 'message-plain-stream' }
@@ -314,11 +567,12 @@ describe('useDisplayRegex resolver lifecycle', () => {
     }
   })
 
-  test('worker-only display regexes resolve each answer frame without waiting for the trailing edge', async () => {
+  test('display regexes resolve each answer frame without a trailing timer', async () => {
     const { host, root } = await createHarness()
     const identity = { chatId: 'chat-worker-stream', messageId: 'message-worker-stream' }
+    const originalScripts = storeState.regexScripts
+    storeState.regexScripts = originalScripts.map((script) => ({ ...script, find_regex: 'Hello' }))
     isDisplayChatOwnedMock.mockImplementation(() => false)
-    configurePausedTrailingCoalescing()
 
     try {
       await render(root, { content: 'Hello', identity, isStreaming: true })
@@ -340,8 +594,8 @@ describe('useDisplayRegex resolver lifecycle', () => {
       await settle('Hello world', '[Hello world]')
       expect(readRendered(host)).toBe('[Hello world]')
 
-      // The paused preprocess scheduler has not advanced, but a possible
-      // macro opener still holds the latest safely resolved answer frame.
+      // A possible macro opener holds the latest resolved answer frame.
+      heldRemotePreprocess.add('Hello world {')
       await act(async () => {
         root.render(createElement(Harness, {
           content: 'Hello world {',
@@ -353,6 +607,7 @@ describe('useDisplayRegex resolver lifecycle', () => {
       expect(readRendered(host)).toBe('[Hello world]')
       expect(pendingResults.has('Hello world {')).toBe(false)
     } finally {
+      storeState.regexScripts = originalScripts
       await destroyHarness(host, root)
     }
   })
@@ -378,49 +633,82 @@ describe('useDisplayRegex resolver lifecycle', () => {
     }
   })
 
-  /** **Validates: Requirements 2.5, 2.7, 3.6, 3.8** */
-  test('generated same-message settlement orderings carry only the newest resolved value and finalize the latest key', async () => {
-    const settlementOrders = [
-      ['middle', 'latest'],
-      ['latest', 'middle'],
-    ] as const
+  test('slow passes advance streaming prefixes and drain only the newest queued revision', async () => {
+    const { host, root } = await createHarness()
+    const identity = { chatId: 'chat-progress', messageId: 'message-progress' }
+    try {
+      await render(root, { content: 'chunk', identity, isStreaming: true })
+      await settle('chunk', 'resolved')
+      await render(root, { content: 'chunk one', identity, isStreaming: true })
+      await renderWhilePreprocessPending(root, { content: 'chunk one two', identity, isStreaming: true })
+      await renderWhilePreprocessPending(root, { content: 'chunk one two three', identity, isStreaming: true })
+      expect([...pendingResults.keys()]).toEqual(['chunk one'])
+      await settle('chunk one', 'resolved one')
+      expect(readRendered(host)).toBe('resolved one')
+      await waitForPending('chunk one two three')
+      expect(pendingResults.has('chunk one two')).toBe(false)
 
-    for (const [caseIndex, settlementOrder] of settlementOrders.entries()) {
-      const { host, root } = await createHarness()
-      const identity = { chatId: `chat-order-${caseIndex}`, messageId: `message-order-${caseIndex}` }
-      const seed = `chunk seed ${caseIndex}`
-      const middle = `chunk middle ${caseIndex}`
-      const latest = `chunk latest ${caseIndex}`
-      const final = `chunk final ${caseIndex}`
+      // Finalization queues behind the active pass and always drains.
+      await renderWhilePreprocessPending(root, { content: 'chunk one two three final', identity, isStreaming: false })
+      await settle('chunk one two three', 'resolved one two three')
+      expect(readRendered(host)).toBe('resolved one two three')
+      await waitForPending('chunk one two three final')
+      await settle('chunk one two three final', 'resolved final')
+      expect(readRendered(host)).toBe('resolved final')
+    } finally {
+      await destroyHarness(host, root)
+    }
+  })
 
-      try {
-        await render(root, { content: seed, identity, isStreaming: true })
-        await settle(seed, `resolved seed ${caseIndex}`)
-        expect(readRendered(host)).toBe(`resolved seed ${caseIndex}`)
+  test('a rewrite rejects an active old result while still draining the latest input', async () => {
+    const { host, root } = await createHarness()
+    const identity = { chatId: 'chat-rewrite', messageId: 'message-rewrite' }
+    try {
+      await render(root, { content: 'chunk seed', identity, isStreaming: true })
+      await settle('chunk seed', 'resolved seed')
+      await render(root, { content: 'chunk old', identity, isStreaming: true })
+      await renderWhilePreprocessPending(root, { content: 'chunk rewritten', identity, isStreaming: true })
+      await settle('chunk old', 'obsolete')
+      expect(readRendered(host)).toBe('resolved seed')
+      await waitForPending('chunk rewritten')
+      await settle('chunk rewritten', 'resolved rewritten')
+      expect(readRendered(host)).toBe('resolved rewritten')
+    } finally {
+      await destroyHarness(host, root)
+    }
+  })
 
-        await render(root, { content: middle, identity, isStreaming: true })
-        expect(readRendered(host)).toBe(`resolved seed ${caseIndex}`)
-        await render(root, { content: latest, identity, isStreaming: true })
-        expect(readRendered(host)).toBe(`resolved seed ${caseIndex}`)
-
-        let latestSettled = false
-        for (const key of settlementOrder) {
-          const content = key === 'middle' ? middle : latest
-          await settle(content, `resolved ${key} ${caseIndex}`)
-          if (key === 'latest') latestSettled = true
-          expect(readRendered(host)).toBe(
-            latestSettled ? `resolved latest ${caseIndex}` : `resolved seed ${caseIndex}`,
-          )
-        }
-
-        expect(readRendered(host)).toBe(`resolved latest ${caseIndex}`)
-        await render(root, { content: final, identity, isStreaming: false })
-        expect(readRendered(host)).toBe(`resolved latest ${caseIndex}`)
-        await settle(final, `resolved final ${caseIndex}`)
-        expect(readRendered(host)).toBe(`resolved final ${caseIndex}`)
-      } finally {
-        await destroyHarness(host, root)
+  test('unmatched backend-capable scripts stream without regex jobs or repeated preprocessing', async () => {
+    const { host, root } = await createHarness()
+    const identity = { chatId: 'chat-gate', messageId: 'message-gate' }
+    const originalScripts = storeState.regexScripts
+    isDisplayChatOwnedMock.mockImplementation(() => false)
+    storeState.regexScripts = originalScripts.map((script) => ({
+      ...script,
+      find_regex: String.raw`\[STATUS\]([\s\S]*?)\[/STATUS\]`,
+      substitute_macros: 'raw',
+      replace_string: '{{getvar::$1}}',
+    }))
+    try {
+      let content = 'Hello'
+      await renderWhilePreprocessPending(root, { content, identity, isStreaming: true })
+      await act(async () => { await new Promise<void>((resolve) => domWindow.setTimeout(resolve, 12)) })
+      for (const suffix of [...Array(40).fill(' word'), ...'[STATUS]value[/STATUS']) {
+        content += suffix
+        await act(async () => root.render(createElement(Harness, { content, identity, isStreaming: true })))
+        expect(readRendered(host)).toBe(content)
       }
+      expect(applyDisplayRegexTiered).not.toHaveBeenCalled()
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+
+      content += ']'
+      await render(root, { content, identity, isStreaming: true })
+      expect(applyDisplayRegexTiered).toHaveBeenCalledTimes(1)
+      await settle(content, 'Hello rendered status')
+      expect(readRendered(host)).toBe('Hello rendered status')
+    } finally {
+      storeState.regexScripts = originalScripts
+      await destroyHarness(host, root)
     }
   })
 

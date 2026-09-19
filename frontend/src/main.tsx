@@ -6,10 +6,12 @@ import { registerSW } from 'virtual:pwa-register'
 import { getSafeInAppNavigationUrl } from './lib/navigationSafety'
 import { installWindowOpenGuard } from './lib/windowOpenGuard'
 import { computeViewportKeyboardInset } from './lib/viewportKeyboardInset'
+import { installKeyboardFocusReveal } from './lib/keyboardFocusReveal'
 import { rememberRegistration } from './lib/swUpdater'
 import { claimServiceWorkerReload } from './lib/swUpdatePolicy'
 import { installPwaLifecycleDiagnostics } from './lib/pwaLifecycleDiagnostics'
 import { initializeSafeThemeMode } from './lib/safeThemeMode'
+import { installDisplayPerformanceTelemetry, markDisplayInteractive, markDisplayMilestone } from './lib/displayPerformance'
 import { router } from './router'
 import { installStreamDeckHandoffReceiver } from './lib/streamDeckHandoff'
 import ErrorBoundary from './components/shared/ErrorBoundary'
@@ -17,6 +19,7 @@ import './theme/variables.css'
 import './theme/reset.css'
 import './theme/global.css'
 
+installDisplayPerformanceTelemetry('application')
 installWindowOpenGuard()
 installPwaLifecycleDiagnostics()
 installStreamDeckHandoffReceiver(path => { void router.navigate(path) })
@@ -44,7 +47,9 @@ registerSW({
     // Periodically check for a new SW so deploys are picked up without
     // requiring a navigation or manual refresh.
     if (registration) {
-      setInterval(() => { registration.update() }, 60 * 60 * 1000)
+      setInterval(() => {
+        if (document.visibilityState === 'visible') registration.update()
+      }, 60 * 60 * 1000)
     }
     // Hand the registration to swUpdater so the connection-lost overlay can
     // ask for an immediate bundle check on reconnect, and so we can surface
@@ -226,36 +231,6 @@ function findScrollableAncestor(el: HTMLElement | null): { el: HTMLElement; hori
   return null
 }
 
-// Utility: find the nearest ancestor with overflow-y: auto or scroll,
-// regardless of whether content currently overflows. Used by the focusin
-// handler to find containers that can be given scroll room via CSS padding.
-function findScrollContainer(el: HTMLElement | null): HTMLElement | null {
-  while (el && el !== document.body && el !== document.documentElement) {
-    const { overflowY } = getComputedStyle(el)
-    if (overflowY === 'auto' || overflowY === 'scroll') return el
-    el = el.parentElement
-  }
-  return null
-}
-
-function revealFocusedTargetInContainer(target: HTMLElement, container: HTMLElement) {
-  const targetRect = target.getBoundingClientRect()
-  const containerRect = container.getBoundingClientRect()
-  const viewportBottom = window.visualViewport?.height ?? window.innerHeight
-  const visibleTop = Math.max(containerRect.top, 0) + 12
-  const visibleBottom = Math.min(containerRect.bottom, viewportBottom) - 18
-
-  let delta = 0
-  if (targetRect.bottom > visibleBottom) {
-    delta = targetRect.bottom - visibleBottom
-  } else if (targetRect.top < visibleTop) {
-    delta = targetRect.top - visibleTop
-  }
-
-  if (Math.abs(delta) < 1) return
-  container.scrollTop += delta
-}
-
 // ── iOS PWA: counteract visual viewport scroll ──
 // When the virtual keyboard opens in standalone mode, iOS scrolls the visual
 // viewport upward to reveal the focused input. This shifts the entire layout
@@ -287,9 +262,9 @@ if (isIOS) {
   document.documentElement.setAttribute('data-ios', '')
 }
 
-// Mark the native dashboard WebView for desktop-specific behavior. Its macOS
-// title bar is native; the HTML title-bar component is only used by browser
-// PWAs running in window-controls-overlay mode.
+// Mark the native dashboard WebView for desktop-specific behavior. The Tauri
+// window is frameless on every desktop platform, so the HTML titlebar owns its
+// drag surface and window controls outside browser PWA display-mode queries.
 if ('__TAURI_INTERNALS__' in window) {
   document.documentElement.setAttribute('data-tauri-desktop', '')
   if (new URLSearchParams(window.location.search).has('desktopWidgetExtension')) {
@@ -408,31 +383,9 @@ if ((window.navigator as any).standalone === true && navigator.maxTouchPoints > 
     }
   }, { passive: false })
 
-  // ── Scroll focused inputs above the keyboard via container scroll ──
-  // Since we always counteract iOS's visual viewport scroll (scrollTo 0),
-  // the layout never shifts — tabs and headers stay in place. To reveal
-  // focused inputs behind the keyboard, we scroll the nearest scroll
-  // container (panelContent, modal content). Keyboard-height padding-bottom
-  // on these containers (set via CSS) creates scroll room even when the
-  // actual content is shorter than the container.
-  document.addEventListener('focusin', (e) => {
-    const target = e.target
-    if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement ||
-          (target instanceof HTMLElement && target.isContentEditable))) return
-
-    // The chat InputArea self-positions above the keyboard via
-    // --app-keyboard-inset-bottom; scrolling an ancestor here drags the
-    // absolutely-positioned bar upward with the content (regression: input
-    // "flies to top" on focus).
-    if ((target as HTMLElement).closest('[data-component="InputArea"]')) return
-
-    const container = findScrollContainer((target as HTMLElement).parentElement)
-    if (!container) return
-
-    setTimeout(() => {
-      revealFocusedTargetInContainer(target as HTMLElement, container)
-    }, 350)
-  })
+  // Ordinary fields need ancestor scrolling because PWA viewport panning is
+  // suppressed. Bounded editors retain native caret/scroll ownership.
+  installKeyboardFocusReveal()
 }
 
 // ── Mobile layout recovery after native popups / backgrounding ──
@@ -469,6 +422,7 @@ if (navigator.maxTouchPoints > 0) {
 }
 
 void Promise.all([initI18n(), initializeSafeThemeMode()]).then(() => {
+  markDisplayMilestone('render-scheduled')
   createRoot(document.getElementById('root')!).render(
     <StrictMode>
       <ErrorBoundary label="Application">
@@ -476,4 +430,5 @@ void Promise.all([initI18n(), initializeSafeThemeMode()]).then(() => {
       </ErrorBoundary>
     </StrictMode>,
   )
+  markDisplayInteractive()
 })

@@ -1,10 +1,15 @@
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import {
   FRONTEND_BUILD_STEPS,
+  backendDependencyProbeCmd,
   bunInstallCmd,
+  bunInstallTimeoutMs,
+  bunRuntimeCmd,
+  dependencyInstallStampIsStale,
+  frontendDependencyProbeCmd,
   hardSyncRefusalMessage,
   inspectDependencyTree,
   packageInstallInputsChanged,
@@ -38,6 +43,18 @@ function installPackage(dir: string, packageName: string): void {
   const packageDir = join(dir, "node_modules", ...packageName.split("/"));
   mkdirSync(packageDir, { recursive: true });
   writeFileSync(join(packageDir, "package.json"), JSON.stringify({ name: packageName, version: "1.0.0" }));
+}
+
+function installEsmPackage(dir: string, packageName: string, source: string): void {
+  const packageDir = join(dir, "node_modules", ...packageName.split("/"));
+  mkdirSync(packageDir, { recursive: true });
+  writeFileSync(join(packageDir, "package.json"), JSON.stringify({
+    name: packageName,
+    version: "1.0.0",
+    type: "module",
+    exports: "./index.js",
+  }));
+  writeFileSync(join(packageDir, "index.js"), source);
 }
 
 afterEach(() => {
@@ -80,6 +97,148 @@ test("treats an empty direct package directory as an incomplete install", () => 
 test("uses copyfile installs on Windows", () => {
   expect(bunInstallCmd("win32")).toEqual(["bun", "install", "--backend=copyfile"]);
   expect(bunInstallCmd("linux")).toEqual(["bun", "install"]);
+});
+
+test("wraps native Termux installs in proot using the detected Bun launcher", () => {
+  expect(bunInstallCmd("linux", {
+    LUMIVERSE_IS_TERMUX: "true",
+    LUMIVERSE_BUN_METHOD: "direct",
+    LUMIVERSE_BUN_PATH: "/data/data/com.termux/files/home/.bun/bin/bun",
+  })).toEqual([
+    "proot",
+    "--link2symlink",
+    "-0",
+    "/data/data/com.termux/files/home/.bun/bin/bun",
+    "install",
+    "--backend=copyfile",
+    "--ignore-scripts",
+  ]);
+
+  expect(bunInstallCmd("linux", {
+    LUMIVERSE_IS_TERMUX: "true",
+    LUMIVERSE_BUN_METHOD: "grun",
+    LUMIVERSE_BUN_PATH: "/data/data/com.termux/files/home/.bun/bin/bun",
+  }).slice(0, 5)).toEqual([
+    "proot",
+    "--link2symlink",
+    "-0",
+    "grun",
+    "/data/data/com.termux/files/home/.bun/bin/bun",
+  ]);
+});
+
+test("validates backend and frontend dependencies with the same Termux runtime wrapper", () => {
+  const env = {
+    LUMIVERSE_IS_TERMUX: "true",
+    LUMIVERSE_BUN_METHOD: "grun",
+    LUMIVERSE_BUN_PATH: "/data/data/com.termux/files/home/.bun/bin/bun",
+  };
+
+  expect(bunRuntimeCmd(["--version"], env)).toEqual([
+    "grun",
+    env.LUMIVERSE_BUN_PATH,
+    "--version",
+  ]);
+
+  const probe = backendDependencyProbeCmd(env);
+  expect(probe.slice(0, 2)).toEqual(["grun", env.LUMIVERSE_BUN_PATH]);
+  expect(probe.at(-1)).toContain("await import('better-auth')");
+  expect(probe.at(-1)).toContain("await import('@better-auth/oauth-provider')");
+
+  const frontendProbe = frontendDependencyProbeCmd(env);
+  expect(frontendProbe.slice(0, 2)).toEqual(["grun", env.LUMIVERSE_BUN_PATH]);
+  expect(frontendProbe.at(-1)).toContain("await import('@better-auth/oauth-provider/client')");
+});
+
+test("Better Auth validation detects a missing exported core subpath", () => {
+  const dir = makeTempDir();
+  const coreDir = join(dir, "node_modules", "@better-auth", "core");
+  mkdirSync(coreDir, { recursive: true });
+  writeFileSync(join(coreDir, "package.json"), JSON.stringify({
+    name: "@better-auth/core",
+    version: "1.0.0",
+    type: "module",
+    exports: { "./context": "./context.js" },
+  }));
+  const contextPath = join(coreDir, "context.js");
+  writeFileSync(contextPath, "export const context = {};\n");
+  installEsmPackage(dir, "better-auth", "import '@better-auth/core/context';\n");
+  installEsmPackage(dir, "@better-auth/oauth-provider", "import '@better-auth/core/context';\n");
+
+  const runProbe = () => Bun.spawnSync({
+    cmd: backendDependencyProbeCmd({}),
+    cwd: dir,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  expect(runProbe().exitCode).toBe(0);
+  rmSync(contextPath);
+  expect(runProbe().exitCode).not.toBe(0);
+});
+
+test("frontend dependency validation detects a missing transitive Better Auth module", () => {
+  const dir = makeTempDir();
+  const coreDir = join(dir, "node_modules", "@better-auth", "core");
+  const coreUtilsDir = join(coreDir, "utils");
+  const coreContextDir = join(coreDir, "context");
+  mkdirSync(coreUtilsDir, { recursive: true });
+  mkdirSync(coreContextDir, { recursive: true });
+  writeFileSync(join(coreDir, "package.json"), JSON.stringify({
+    name: "@better-auth/core",
+    version: "1.0.0",
+    type: "module",
+    exports: { "./utils/json": "./utils/json.js" },
+  }));
+  writeFileSync(
+    join(coreUtilsDir, "json.js"),
+    "import '../context/global.js'; export const safeJSONParse = JSON.parse;\n",
+  );
+  const globalPath = join(coreContextDir, "global.js");
+  writeFileSync(globalPath, "export const context = {};\n");
+
+  const oauthDir = join(dir, "node_modules", "@better-auth", "oauth-provider");
+  mkdirSync(oauthDir, { recursive: true });
+  writeFileSync(join(oauthDir, "package.json"), JSON.stringify({
+    name: "@better-auth/oauth-provider",
+    version: "1.0.0",
+    type: "module",
+    exports: { "./client": "./client.js" },
+  }));
+  writeFileSync(
+    join(oauthDir, "client.js"),
+    "import { safeJSONParse } from '@better-auth/core/utils/json'; export { safeJSONParse };\n",
+  );
+
+  const runProbe = () => Bun.spawnSync({
+    cmd: frontendDependencyProbeCmd({}),
+    cwd: dir,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  expect(runProbe().exitCode).toBe(0);
+  rmSync(globalPath);
+  expect(runProbe().exitCode).not.toBe(0);
+});
+
+test("uses a longer install timeout only on Termux-like runtimes", () => {
+  expect(bunInstallTimeoutMs({})).toBe(10 * 60_000);
+  expect(bunInstallTimeoutMs({ LUMIVERSE_IS_TERMUX: "true" })).toBe(30 * 60_000);
+  expect(bunInstallTimeoutMs({ LUMIVERSE_IS_PROOT: "true" })).toBe(30 * 60_000);
+});
+
+test("detects dependency inputs newer than the last completed install", () => {
+  const dir = makeTempDir();
+  writePackageJson(dir, { dependencies: ["hono"] });
+  installPackage(dir, "hono");
+  prepareDependencyInstall(dir, "backend");
+
+  expect(dependencyInstallStampIsStale(dir)).toBe(false);
+
+  const future = new Date(Date.now() + 5_000);
+  utimesSync(join(dir, "package.json"), future, future);
+  expect(dependencyInstallStampIsStale(dir)).toBe(true);
 });
 
 test("reports frontend build phases separately while preserving their order", () => {

@@ -1,6 +1,6 @@
 import { unzipSync } from "fflate";
-import { getCharacter, updateCharacter } from "./characters.service";
-import { uploadImage } from "./images.service";
+import { getCharacter, updateCharacter, type UpdateCharacterOptions } from "./characters.service";
+import { uploadImage, uploadImages } from "./images.service";
 import type { Character } from "../types/character";
 
 // Cap on the total bytes produced by expression ZIP decompression. fflate's
@@ -33,12 +33,15 @@ function makeDecompressionCapFilter(): NonNullable<Parameters<typeof unzipSync>[
 
 export interface ExpressionConfig {
   enabled: boolean;
+  /** Local chat presentation preference; absent on legacy characters. */
+  useAsAvatar?: boolean;
   defaultExpression: string;
   mappings: Record<string, string>; // label → image_id
 }
 
 const EMPTY_CONFIG: ExpressionConfig = {
   enabled: false,
+  useAsAvatar: false,
   defaultExpression: "",
   mappings: {},
 };
@@ -54,22 +57,31 @@ export function getExpressionConfig(userId: string, characterId: string): Expres
   if (!raw) return { ...EMPTY_CONFIG };
   return {
     enabled: !!raw.enabled,
+    useAsAvatar: raw.useAsAvatar === true,
     defaultExpression: raw.defaultExpression ?? "",
     mappings: raw.mappings ?? {},
   };
 }
 
-function saveConfig(userId: string, characterId: string, config: ExpressionConfig): ExpressionConfig {
+function saveConfig(
+  userId: string,
+  characterId: string,
+  config: ExpressionConfig,
+  options: UpdateCharacterOptions = {},
+): ExpressionConfig {
   const character = getCharacter(userId, characterId);
   if (!character) throw new Error("Character not found");
   const extensions = { ...getExtensions(character), expressions: config };
-  updateCharacter(userId, characterId, { extensions });
+  updateCharacter(userId, characterId, { extensions }, options);
   return config;
 }
 
 export function putExpressionConfig(userId: string, characterId: string, config: ExpressionConfig): ExpressionConfig {
   return saveConfig(userId, characterId, {
     enabled: !!config.enabled,
+    useAsAvatar: config.useAsAvatar === undefined
+      ? (getExpressionConfig(userId, characterId)?.useAsAvatar ?? false)
+      : config.useAsAvatar === true,
     defaultExpression: config.defaultExpression ?? "",
     mappings: config.mappings ?? {},
   });
@@ -128,6 +140,7 @@ export async function importFromZip(
   }
 
   const config: ExpressionConfig = {
+    useAsAvatar: existing.useAsAvatar ?? false,
     enabled: existing.enabled || Object.keys(newMappings).length > 0,
     defaultExpression: existing.defaultExpression || Object.keys(newMappings)[0] || "",
     mappings: newMappings,
@@ -145,6 +158,7 @@ export function mapFromGallery(
   const merged: Record<string, string> = { ...existing.mappings, ...mappings };
 
   const config: ExpressionConfig = {
+    useAsAvatar: existing.useAsAvatar ?? false,
     enabled: existing.enabled || Object.keys(merged).length > 0,
     defaultExpression: existing.defaultExpression || Object.keys(merged)[0] || "",
     mappings: merged,
@@ -158,6 +172,7 @@ export function removeExpression(userId: string, characterId: string, label: str
   const { [label]: _, ...rest } = existing.mappings;
 
   const config: ExpressionConfig = {
+    useAsAvatar: existing.useAsAvatar ?? false,
     enabled: existing.enabled,
     defaultExpression: existing.defaultExpression === label
       ? (Object.keys(rest)[0] || "")
@@ -182,14 +197,93 @@ export async function importFromAssets(
   }
 
   const config: ExpressionConfig = {
+    useAsAvatar: existing.useAsAvatar ?? false,
     enabled: Object.keys(newMappings).length > 0,
-    defaultExpression: existing.defaultExpression || "default" in newMappings
-      ? "default"
-      : Object.keys(newMappings)[0] || "",
+    defaultExpression: existing.defaultExpression
+      || ("default" in newMappings ? "default" : Object.keys(newMappings)[0] || ""),
     mappings: newMappings,
   };
 
   return saveConfig(userId, characterId, config);
+}
+
+export interface ExpressionImageData {
+  label: string;
+  data: Uint8Array;
+  filename: string;
+  mimeType: string;
+}
+
+export interface ExpressionImageDataImportResult {
+  config: ExpressionConfig;
+  importedLabels: string[];
+  failed: number;
+}
+
+/**
+ * Persist one bounded batch of already-downloaded expression images.
+ *
+ * `uploadImages` writes the originals in a batch and puts every eligible image
+ * on the standard deferred metadata/thumbnail queue. In particular, this must
+ * not call Sharp directly: remote expression packs can contain hundreds of
+ * images, and request-local thumbnail fan-out can exhaust small hosts.
+ */
+export async function importFromImageData(
+  userId: string,
+  characterId: string,
+  assets: readonly ExpressionImageData[],
+  options: UpdateCharacterOptions = {},
+): Promise<ExpressionImageDataImportResult> {
+  const existing = getExpressionConfig(userId, characterId) ?? { ...EMPTY_CONFIG };
+  if (assets.length === 0) {
+    return { config: existing, importedLabels: [], failed: 0 };
+  }
+
+  const results = await uploadImages(
+    userId,
+    assets.map((asset) => ({
+      data: asset.data,
+      filename: asset.filename,
+      mime_type: asset.mimeType,
+      owner_character_id: characterId,
+    })),
+    {
+      // Disk writes are cheap, but keeping this below the download batch size
+      // avoids multiplying live references to large remote response buffers.
+      concurrency: 2,
+      deferProcessing: true,
+    },
+  );
+
+  const newMappings: Record<string, string> = { ...existing.mappings };
+  const importedLabels: string[] = [];
+  let failed = 0;
+  for (let i = 0; i < assets.length; i++) {
+    const image = results[i]?.image;
+    if (!image) {
+      failed++;
+      continue;
+    }
+    newMappings[assets[i]!.label] = image.id;
+    importedLabels.push(assets[i]!.label);
+  }
+
+  if (importedLabels.length === 0) {
+    return { config: existing, importedLabels, failed };
+  }
+
+  const config: ExpressionConfig = {
+    useAsAvatar: existing.useAsAvatar ?? false,
+    enabled: existing.enabled || Object.keys(newMappings).length > 0,
+    defaultExpression: existing.defaultExpression
+      || ("default" in newMappings ? "default" : Object.keys(newMappings)[0] || ""),
+    mappings: newMappings,
+  };
+  return {
+    config: saveConfig(userId, characterId, config, options),
+    importedLabels,
+    failed,
+  };
 }
 
 export function getExpressionLabels(userId: string, characterId: string): string[] {
@@ -340,7 +434,7 @@ export function convertToGroups(
   // Clear flat expressions and set groups
   const extensions = {
     ...getExtensions(character),
-    expressions: { enabled: false, defaultExpression: "", mappings: {} },
+    expressions: { enabled: false, useAsAvatar: config?.useAsAvatar ?? false, defaultExpression: "", mappings: {} },
     expression_groups: groups,
   };
   updateCharacter(userId, characterId, { extensions });
@@ -360,6 +454,7 @@ export function convertToFlat(
   const character = getCharacter(userId, characterId);
   if (!character) throw new Error("Character not found");
   const config: ExpressionConfig = {
+    useAsAvatar: getExpressionConfig(userId, characterId)?.useAsAvatar ?? false,
     enabled: Object.keys(mappings).length > 0,
     defaultExpression: Object.keys(mappings)[0] || "",
     mappings,

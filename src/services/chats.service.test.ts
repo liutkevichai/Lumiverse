@@ -5,11 +5,16 @@ import { EventType, type EventMessage } from "../ws/events";
 import {
   addGroupMember,
   addSwipe,
+  deleteSwipe,
+  setSwipeScopedExtra,
   applyChatAppearance,
   branchChat,
   convertSoloChatToGroup,
   createChat,
+  deleteChat,
   deleteChats,
+  deleteMessage,
+  bulkDeleteMessages,
   getChat,
   getChatTree,
   cycleSwipe,
@@ -27,6 +32,7 @@ import {
   setGroupMemberAlternateFields,
   updateMessage,
 } from "./chats.service";
+import { makePromptActivationSource, promptActivationSource } from "./prompt-activation.service";
 
 function initChatsTestDb(): void {
   closeDatabase();
@@ -101,6 +107,14 @@ function initChatsTestDb(): void {
     updated_at INTEGER NOT NULL,
     UNIQUE(chat_id, settings_key)
   )`);
+
+  db.run(`CREATE TABLE message_breakdowns (
+    message_id TEXT PRIMARY KEY,
+    chat_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    data TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT 1
+  )`);
 }
 
 function seedCharacter(id: string, name: string): void {
@@ -153,6 +167,17 @@ function seedMessage(
       null,
       sendDate,
     );
+}
+
+function seedBreakdown(
+  messageId: string,
+  chatId: string,
+  data: unknown = { marker: messageId },
+  userId = "u1",
+): void {
+  getDb()
+    .query("INSERT INTO message_breakdowns (message_id, chat_id, user_id, data) VALUES (?, ?, ?, ?)")
+    .run(messageId, chatId, userId, JSON.stringify(data));
 }
 
 beforeEach(() => {
@@ -258,6 +283,42 @@ describe("chat lifecycle events", () => {
         group: true,
         character_ids: ["c1"],
       }));
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  test("emits CHAT_FORKED with the source-to-fork message ID map", async () => {
+    seedChat("source-chat", "c1", "Source", "{}", 100);
+    seedMessage("source-message-1", "source-chat", "Opening", {}, { index: 0 });
+    seedMessage("source-message-2", "source-chat", "Reply", {}, { index: 1, isUser: true });
+    seedMessage("source-message-3", "source-chat", "Not copied", {}, { index: 2 });
+
+    const events: EventMessage[] = [];
+    const unsubscribe = eventBus.on(EventType.CHAT_FORKED, (event) => events.push(event));
+
+    try {
+      const fork = branchChat("u1", "source-chat", "source-message-2");
+      expect(fork).not.toBeNull();
+
+      const forkedMessages = getMessages("u1", fork!.id);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(events).toHaveLength(1);
+      expect(events[0]?.userId).toBe("u1");
+      expect(events[0]?.payload).toEqual(expect.objectContaining({
+        sourceChatId: "source-chat",
+        forkedChatId: fork!.id,
+        forkedAtMessageId: "source-message-2",
+        forkedAtMessageIndex: 1,
+        messageIdMap: {
+          "source-message-1": forkedMessages[0]?.id,
+          "source-message-2": forkedMessages[1]?.id,
+        },
+      }));
+      expect(events[0]?.payload.messageIdMap).not.toHaveProperty("source-message-3");
+      expect(forkedMessages.map((message) => message.id)).not.toContain("source-message-1");
+      expect(forkedMessages.map((message) => message.id)).not.toContain("source-message-2");
     } finally {
       unsubscribe();
     }
@@ -474,6 +535,36 @@ describe("recent chats", () => {
     expect(result.data[0].is_group).toBe(true);
   });
 
+  test("keeps activation source on the generated swipe through navigation, deletion, and edits", () => {
+    seedChat("chat-1", "c1", "Swipe chat", "{}", 100);
+    seedMessage("msg-1", "chat-1", "first swipe", {});
+    addSwipe("u1", "msg-1", "second swipe");
+    cycleSwipe("u1", "msg-1", "left");
+    setSwipeScopedExtra("u1", "msg-1", 1, {
+      promptActivation: makePromptActivationSource("second swipe", "preset", true, "second swipe\n<state>combat</state>"),
+    });
+    expect(getMessage("u1", "msg-1")!.extra.promptActivation).toBeUndefined();
+    const second = cycleSwipe("u1", "msg-1", "right")!;
+    expect(promptActivationSource(second, "preset")).toBe("second swipe\n<state>combat</state>");
+    deleteSwipe("u1", "msg-1", 0);
+    expect(getMessage("u1", "msg-1")!.swipe_id).toBe(0);
+    expect(promptActivationSource(getMessage("u1", "msg-1")!, "preset")).toContain("<state>combat</state>");
+    updateMessage("u1", "msg-1", { content: "Edited", skipChunkRebuild: true });
+    expect(promptActivationSource(getMessage("u1", "msg-1")!, "preset")).toBe("Edited");
+  });
+
+  test("a branch only inherits activation sources up to its fork point", () => {
+    seedChat("chat-1", "c1", "Branch chat", "{}", 100);
+    seedMessage("msg-1", "chat-1", "before activation", {}, { index: 0 });
+    seedMessage("msg-2", "chat-1", "after activation", {
+      promptActivation: makePromptActivationSource("after activation", "preset", true, "after activation\n<state>combat</state>"),
+    }, { index: 1 });
+    const branch = branchChat("u1", "chat-1", "msg-1")!;
+    const messages = getMessages("u1", branch.id);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].extra.promptActivation).toBeUndefined();
+  });
+
   test("keeps reasoning scoped to the swipe it belongs to", () => {
     seedChat("chat-1", "c1", "Swipe chat", "{}", 100);
     seedMessage("msg-1", "chat-1", "first swipe", {
@@ -576,7 +667,7 @@ describe("recent chats", () => {
     seedChat("chat-1", "c1", "Swipe chat", "{}", 100);
     seedMessage("msg-1", "chat-1", "first swipe", {
       tokenCount: 11,
-      generationMetrics: { model: "first-model", tps: 1.1 },
+      generationMetrics: { model: "first-model", tps: 1.1, presetId: "preset-1", presetName: "First preset" },
       usage: { completion_tokens: 11, total_tokens: 22 },
     });
 
@@ -589,26 +680,58 @@ describe("recent chats", () => {
     patchMessageExtra("u1", "msg-1", {
       ...added.extra,
       tokenCount: 33,
-      generationMetrics: { model: "second-model", tps: 3.3 },
+      generationMetrics: { model: "second-model", tps: 3.3, presetId: "preset-2", presetName: "Second preset" },
       usage: { completion_tokens: 33, total_tokens: 44 },
     });
 
     const secondSwipe = getMessage("u1", "msg-1")!;
     expect(secondSwipe.extra.tokenCount).toBe(33);
-    expect(secondSwipe.extra.generationMetrics).toEqual({ model: "second-model", tps: 3.3 });
+    expect(secondSwipe.extra.generationMetrics).toEqual({
+      model: "second-model",
+      tps: 3.3,
+      presetId: "preset-2",
+      presetName: "Second preset",
+    });
     expect(secondSwipe.extra.usage).toEqual({ completion_tokens: 33, total_tokens: 44 });
 
     const firstSwipe = cycleSwipe("u1", "msg-1", "left")!;
     expect(firstSwipe.swipe_id).toBe(0);
     expect(firstSwipe.extra.tokenCount).toBe(11);
-    expect(firstSwipe.extra.generationMetrics).toEqual({ model: "first-model", tps: 1.1 });
+    expect(firstSwipe.extra.generationMetrics).toEqual({
+      model: "first-model",
+      tps: 1.1,
+      presetId: "preset-1",
+      presetName: "First preset",
+    });
     expect(firstSwipe.extra.usage).toEqual({ completion_tokens: 11, total_tokens: 22 });
 
     const restoredSecondSwipe = cycleSwipe("u1", "msg-1", "right")!;
     expect(restoredSecondSwipe.swipe_id).toBe(1);
     expect(restoredSecondSwipe.extra.tokenCount).toBe(33);
-    expect(restoredSecondSwipe.extra.generationMetrics).toEqual({ model: "second-model", tps: 3.3 });
+    expect(restoredSecondSwipe.extra.generationMetrics).toEqual({
+      model: "second-model",
+      tps: 3.3,
+      presetId: "preset-2",
+      presetName: "Second preset",
+    });
     expect(restoredSecondSwipe.extra.usage).toEqual({ completion_tokens: 33, total_tokens: 44 });
+  });
+
+  test("keeps generation outcomes on their originating swipe through navigation and deletion", () => {
+    seedChat("chat-1", "c1", "Swipe chat", "{}", 100);
+    const completed = { finish_reason: "end_turn", stop_details: null };
+    seedMessage("msg-1", "chat-1", "first swipe", { generationOutcome: completed });
+    expect(addSwipe("u1", "msg-1", "")!.extra.generationOutcome).toBeUndefined();
+    cycleSwipe("u1", "msg-1", "left");
+    const refused = { finish_reason: "refusal", stop_details: { type: "refusal", category: null, explanation: null }, error: "Declined" };
+    setSwipeScopedExtra("u1", "msg-1", 1, { generationOutcome: refused });
+    expect(getMessage("u1", "msg-1")!.extra.generationOutcome).toEqual(completed);
+    expect(cycleSwipe("u1", "msg-1", "right")!.extra.generationOutcome).toEqual(refused);
+    const remaining = deleteSwipe("u1", "msg-1", 0)!;
+    expect(remaining.extra.generationOutcome).toEqual(refused);
+    expect(remaining.extra.generationOutcomeBySwipe).toEqual([refused]);
+    setSwipeScopedExtra("u1", "msg-1", 0, { generationOutcome: completed });
+    expect(getMessage("u1", "msg-1")!.extra.generationOutcome).toEqual(completed);
   });
 
   test("converts a solo chat into a new group chat with copied messages", () => {
@@ -710,6 +833,71 @@ describe("bulk chat deletion", () => {
     expect(getChat("u1", "keep")?.name).toBe("Keep");
     const foreign = getDb().query("SELECT id FROM chats WHERE id = ?").get("foreign") as { id: string } | null;
     expect(foreign?.id).toBe("foreign");
+  });
+});
+
+describe("message breakdown deletion", () => {
+  test("deletes all breakdowns for a deleted chat and preserves other chats", () => {
+    seedChat("delete-chat", "c1", "Delete", "{}", 100);
+    seedMessage("delete-message-1", "delete-chat", "One", {}, { index: 0 });
+    seedMessage("delete-message-2", "delete-chat", "Two", {}, { index: 1 });
+    seedBreakdown("delete-message-1", "delete-chat");
+    seedBreakdown("delete-message-2", "delete-chat");
+
+    seedChat("keep-chat", "c1", "Keep", "{}", 200);
+    seedMessage("keep-message", "keep-chat", "Keep", {});
+    seedBreakdown("keep-message", "keep-chat");
+
+    expect(deleteChat("u1", "delete-chat")).toBe(true);
+
+    const deletedCount = getDb()
+      .query("SELECT COUNT(*) AS count FROM message_breakdowns WHERE chat_id = ?")
+      .get("delete-chat") as { count: number };
+    expect(deletedCount.count).toBe(0);
+    expect(getDb().query("SELECT message_id FROM message_breakdowns WHERE message_id = ?").get("keep-message")).not.toBeNull();
+  });
+
+  test("deletes the selected and later prompt breakdowns while preserving earlier ones", () => {
+    const deletedContentMarker = "deleted-sensitive-prompt-marker";
+    seedChat("message-chat", "c1", "Messages", "{}", 100);
+    seedMessage("keep-earlier", "message-chat", "Earlier", {}, { index: 0 });
+    seedMessage("delete-message", "message-chat", deletedContentMarker, {}, { index: 1 });
+    seedMessage("keep-later", "message-chat", "Later", {}, { index: 2 });
+    seedBreakdown("keep-earlier", "message-chat");
+    seedBreakdown("delete-message", "message-chat");
+    seedBreakdown("keep-later", "message-chat", {
+      messages: [
+        { role: "user", content: deletedContentMarker },
+        { role: "assistant", content: "Later" },
+      ],
+    });
+
+    expect(deleteMessage("u1", "delete-message")).toBe(true);
+
+    expect(getDb().query("SELECT message_id FROM message_breakdowns WHERE message_id = ?").get("delete-message")).toBeNull();
+    expect(getDb().query("SELECT message_id FROM message_breakdowns WHERE message_id = ?").get("keep-later")).toBeNull();
+    expect(getDb().query("SELECT message_id FROM message_breakdowns WHERE message_id = ?").get("keep-earlier")).not.toBeNull();
+    expect(getMessage("u1", "keep-later")).not.toBeNull();
+    const retainedMarkerCount = getDb()
+      .query("SELECT COUNT(*) AS count FROM message_breakdowns WHERE instr(data, ?) > 0")
+      .get(deletedContentMarker) as { count: number };
+    expect(retainedMarkerCount.count).toBe(0);
+  });
+
+  test("deletes breakdowns for bulk-deleted messages and preserves unselected messages", () => {
+    seedChat("bulk-message-chat", "c1", "Bulk", "{}", 100);
+    for (const [index, id] of ["delete-one", "keep", "delete-two"].entries()) {
+      seedMessage(id, "bulk-message-chat", id, {}, { index });
+      seedBreakdown(id, "bulk-message-chat");
+    }
+
+    expect(bulkDeleteMessages("u1", "bulk-message-chat", ["delete-one", "missing", "delete-two"])).toBe(2);
+
+    const remaining = getDb()
+      .query("SELECT message_id FROM message_breakdowns WHERE chat_id = ? ORDER BY message_id")
+      .all("bulk-message-chat") as Array<{ message_id: string }>;
+    expect(remaining).toEqual([]);
+    expect(getMessage("u1", "keep")).not.toBeNull();
   });
 });
 

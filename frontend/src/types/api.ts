@@ -212,7 +212,7 @@ export interface CharacterTtsExtension {
 
 // ---- Message Attachment ----
 export interface MessageAttachment {
-  type: "image" | "audio";
+  type: "image" | "audio" | "video";
   image_id: string;
   mime_type: string;
   original_filename: string;
@@ -456,6 +456,8 @@ export interface ImageGenParameterSchema {
   required?: boolean;
   options?: Array<{ id: string; label: string }>;
   group?: string;
+  /** Optional model-id prefixes that control when this parameter is shown. */
+  modelPrefixes?: string[];
   /** When set, the UI fetches models from GET /image-gen-connections/:id/models/:modelSubtype */
   modelSubtype?: string;
 }
@@ -588,6 +590,8 @@ export interface TtsConnectionVoicesPreviewInput {
   provider: string;
   api_url?: string;
   api_key?: string;
+  model?: string;
+  metadata?: Record<string, any>;
 }
 
 export interface TtsConnectionModelsPreviewInput {
@@ -595,6 +599,7 @@ export interface TtsConnectionModelsPreviewInput {
   provider: string;
   api_url?: string;
   api_key?: string;
+  metadata?: Record<string, any>;
 }
 
 export interface QwenCustomVoice {

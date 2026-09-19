@@ -1,5 +1,5 @@
 import type { StateCreator } from 'zustand'
-import type { AppStore, SettingsSlice, StartupSettings, ThemeConfig, ReasoningSettings, SettingsWriteSource } from '@/types/store'
+import type { AppStore, EnterToSendSettings, SettingsSlice, StartupSettings, ThemeConfig, ReasoningSettings, SettingsWriteSource, ToastPosition } from '@/types/store'
 import { settingsApi } from '@/api/settings'
 import { themeAssetsApi } from '@/api/theme-assets'
 import { BASE_URL } from '@/api/client'
@@ -7,6 +7,8 @@ import { beginActiveLoomPresetSelection, type PresetSelectionRequest } from '@/l
 import { generateUUID } from '@/lib/uuid'
 import { DEFAULT_THEME, normalizeTheme } from '@/theme/presets'
 import { PRODUCTIVITY_DEFAULTS, migrateProductivitySetting } from '@/lib/uiProductivityDefaults'
+import { isMobileViewportOrDevice } from '@/lib/mobile'
+import { DEFAULT_IMPERSONATION_MODE, resolveImpersonationMode } from '@/lib/impersonationPreset'
 import { createSettingsLoadGenerationGuard } from './settings-load-generation'
 import {
   deriveReorderArgs,
@@ -46,6 +48,7 @@ export const DATA_KEYS: ReadonlySet<string> = new Set([
   'bubbleUseFullAvatar',
   'bubbleOpacity',
   'saveDraftInput',
+  'defaultImpersonationMode',
   'chatWidthMode',
   'chatContentMaxWidth',
   'modalWidthMode',
@@ -73,6 +76,7 @@ export const DATA_KEYS: ReadonlySet<string> = new Set([
   'sortDirection',
   'filterTab',
   'favoritesBarCollapsed',
+  'importChubExpressions',
   // Persona browser preferences
   'personaViewMode',
   'personaSortField',
@@ -143,6 +147,20 @@ export const DATA_KEYS: ReadonlySet<string> = new Set([
   ...Object.keys(PRODUCTIVITY_DEFAULTS),
 ])
 
+/** Toast corner values accepted from storage; mirrors the ToastPosition union. */
+const TOAST_POSITIONS: ReadonlySet<string> = new Set([
+  'top-right',
+  'top-left',
+  'bottom-right',
+  'bottom-left',
+  'top',
+  'bottom',
+])
+
+function isToastPosition(value: unknown): value is ToastPosition {
+  return typeof value === 'string' && TOAST_POSITIONS.has(value)
+}
+
 // ── Debounced batch persistence ──────────────────────────────────────────
 // Dirty keys accumulate and flush as a single PUT after FLUSH_DELAY ms of
 // inactivity.  Also flushes on page unload so nothing is lost.
@@ -176,8 +194,12 @@ let localSettingsRevision = 0
 const localSettingRevisions = new Map<string, number>()
 let persistenceScope: string | null = null
 
-/** Per-user, per-device preference; seeded once from the legacy synced row. */
+/** Per-user, per-device preferences; seeded once from the legacy scalar value. */
 export const DEVICE_ENTER_TO_SEND_STORAGE_KEY = 'lumiverse:device:input-bar-enter-to-send'
+export const DEFAULT_ENTER_TO_SEND_SETTINGS: Readonly<EnterToSendSettings> = Object.freeze({
+  desktop: true,
+  mobile: false,
+})
 const LEGACY_SETTINGS_KEY_RENAMES: Readonly<Record<string, string>> = Object.freeze({
   chatSheldDisplayMode: 'chatDisplayMode',
 })
@@ -222,18 +244,27 @@ function deviceEnterToSendStorageKey(): string {
   return bridgeStorageKey(DEVICE_ENTER_TO_SEND_STORAGE_KEY)
 }
 
-function readDeviceEnterToSend(): boolean | null {
+function parseEnterToSendSettings(value: unknown): EnterToSendSettings | null {
+  if (!isPlainObject(value)) return null
+  return {
+    desktop: typeof value.desktop === 'boolean' ? value.desktop : DEFAULT_ENTER_TO_SEND_SETTINGS.desktop,
+    mobile: typeof value.mobile === 'boolean' ? value.mobile : DEFAULT_ENTER_TO_SEND_SETTINGS.mobile,
+  }
+}
+
+function readDeviceEnterToSend(): EnterToSendSettings | boolean | null {
   try {
     const value = localStorage.getItem(deviceEnterToSendStorageKey())
     if (value === 'true') return true
     if (value === 'false') return false
+    if (value !== null) return parseEnterToSendSettings(JSON.parse(value))
   } catch {}
   return null
 }
 
-function persistDeviceEnterToSend(value: boolean): void {
+function persistDeviceEnterToSend(value: EnterToSendSettings): void {
   try {
-    localStorage.setItem(deviceEnterToSendStorageKey(), String(value))
+    localStorage.setItem(deviceEnterToSendStorageKey(), JSON.stringify(value))
   } catch {
     // The setting remains usable when browser storage is unavailable.
   }
@@ -482,6 +513,22 @@ export function migrateStoredImageGeneration(storedValue: any): any {
   return storedValue
 }
 
+/** Rewrites the removed 'sidecar' API source to the active connection. */
+export function migrateStoredSummarization(storedValue: any): any {
+  if (isPlainObject(storedValue) && storedValue.apiSource === 'sidecar') {
+    return { ...storedValue, apiSource: 'active' }
+  }
+  return storedValue
+}
+
+function migrateStoredSettingValue(key: string, value: any): any {
+  let migrated = key === 'imageGeneration' ? migrateStoredImageGeneration(value) : value
+  migrated = migrateProductivitySetting(key, migrated)
+  migrated = key === 'summarization' ? migrateStoredSummarization(migrated) : migrated
+  migrated = key === 'defaultImpersonationMode' ? resolveImpersonationMode(migrated) : migrated
+  return migrated
+}
+
 /** Immediately flush any pending settings (e.g. on page unload). */
 export function flushSettings() {
   if (flushTimer !== null) {
@@ -642,8 +689,9 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
   bubbleHideAvatarBg: false,
   bubbleUseFullAvatar: false,
   bubbleOpacity: 1,
-  inputBarEnterToSend: true,
+  inputBarEnterToSend: { ...DEFAULT_ENTER_TO_SEND_SETTINGS },
   saveDraftInput: false,
+  defaultImpersonationMode: DEFAULT_IMPERSONATION_MODE,
   chatWidthMode: 'full',
   chatContentMaxWidth: 900,
   modalWidthMode: 'full',
@@ -690,6 +738,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
   messageContextMenuEnabled: true,
   suppressContextDropWarnings: false,
   favoritesBarCollapsed: false,
+  importChubExpressions: true,
   globalWorldBooks: [],
   worldInfoSettings: {
     forceCaseSensitive: false,
@@ -715,7 +764,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
   useCharacterBackground: false,
 
   thumbnailSettings: { smallSize: 300, largeSize: 700 },
-  pushNotificationPreferences: { enabled: true, events: { generation_ended: true, generation_error: false } },
+  pushNotificationPreferences: { enabled: true, events: { generation_ended: true, generation_error: true } },
   chatHeadsEnabled: true,
   chatHeadsSize: 48,
   chatHeadsDirection: 'column' as const,
@@ -770,6 +819,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
     if (settings.viewMode) patch.viewMode = settings.viewMode
     if (typeof settings.charactersPerPage === 'number') patch.charactersPerPage = settings.charactersPerPage
     if (typeof settings.favoritesBarCollapsed === 'boolean') patch.favoritesBarCollapsed = settings.favoritesBarCollapsed
+    if (typeof settings.importChubExpressions === 'boolean') patch.importChubExpressions = settings.importChubExpressions
     if ('theme' in settings) patch.theme = normalizeTheme(settings.theme)
     if (typeof settings.landingPageChatsDisplayed === 'number' && Number.isFinite(settings.landingPageChatsDisplayed)) {
       patch.landingPageChatsDisplayed = settings.landingPageChatsDisplayed
@@ -800,6 +850,12 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
     }
     if (settings.connectionsOrder && typeof settings.connectionsOrder === 'object') {
       patch.connectionsOrder = normalizeConnectionsOrder(settings.connectionsOrder)
+    }
+    if (isToastPosition(settings.toastPosition)) {
+      patch.toastPosition = settings.toastPosition
+    }
+    if (settings.defaultImpersonationMode) {
+      patch.defaultImpersonationMode = resolveImpersonationMode(settings.defaultImpersonationMode)
     }
 
     set(patch as any)
@@ -832,7 +888,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
 
   setSetting: (key, value, source: SettingsWriteSource = 'user') => {
     if (key === 'inputBarEnterToSend') {
-      get().setInputBarEnterToSend(value as boolean)
+      get().setInputBarEnterToSend(value as EnterToSendSettings)
       return
     }
     const previous = (get() as unknown as Record<string, unknown>)[key as string]
@@ -876,9 +932,10 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
     }
   },
 
-  setInputBarEnterToSend: (enabled) => {
-    persistDeviceEnterToSend(enabled)
-    set({ inputBarEnterToSend: enabled })
+  setInputBarEnterToSend: (settings) => {
+    const normalized = parseEnterToSendSettings(settings) ?? { ...DEFAULT_ENTER_TO_SEND_SETTINGS }
+    persistDeviceEnterToSend(normalized)
+    set({ inputBarEnterToSend: normalized })
   },
 
   setTheme: (theme) => {
@@ -972,6 +1029,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
       const theme = {
         ...packTheme,
         desktopBackground: packTheme.desktopBackground ?? get().theme?.desktopBackground,
+        renderingMode: pack.theme?.renderingMode ?? get().theme?.renderingMode,
       }
       patch.theme = theme
       persistKey('theme', theme)
@@ -1049,6 +1107,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
       const theme = {
         ...entry.theme,
         desktopBackground: entry.theme.desktopBackground ?? get().theme?.desktopBackground,
+        renderingMode: entry.theme.renderingMode ?? get().theme?.renderingMode,
       }
       get().setTheme(theme)
     } else {
@@ -1167,10 +1226,11 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
           // Prefer a canonical setting row when both its legacy and current
           // names are present in the account.
           || (canonicalKey !== row.key && rows.some((candidate) => candidate.key === canonicalKey))
+          // Drop values outside the ToastPosition union; the startup payload
+          // validates identically so the two hydration paths cannot disagree.
+          || (canonicalKey === 'toastPosition' && !isToastPosition(row.value))
         ) continue
-        const storedValue = canonicalKey === 'imageGeneration'
-          ? migrateStoredImageGeneration(row.value)
-          : migrateProductivitySetting(canonicalKey, row.value)
+        const storedValue = migrateStoredSettingValue(canonicalKey, row.value)
         if (canonicalKey === 'quickToolbarSettings' && !pendingValuesMatch(storedValue, row.value)) {
           migratedProductivityKeys.add(canonicalKey)
         }
@@ -1181,18 +1241,23 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
       // This preference was historically synced with the account. Seed each
       // device once from that committed backend row, then keep later changes
       // local so phones and desktops can choose different send-key behavior.
-      const deviceEnterToSend = readDeviceEnterToSend()
-      if (deviceEnterToSend !== null) {
-        patch.inputBarEnterToSend = deviceEnterToSend
-      } else {
-        const backendEnterToSend = rows.find((row) => row.key === 'inputBarEnterToSend')?.value
-          ?? rows.find((row) => row.key === LEGACY_ENTER_TO_SEND_SETTING_KEY)?.value
-        const migratedEnterToSend = typeof backendEnterToSend === 'boolean'
+      const storedDeviceEnterToSend = readDeviceEnterToSend()
+      const backendEnterToSend = rows.find((row) => row.key === 'inputBarEnterToSend')?.value
+        ?? rows.find((row) => row.key === LEGACY_ENTER_TO_SEND_SETTING_KEY)?.value
+      const migratedBackendSettings = parseEnterToSendSettings(backendEnterToSend) ?? {
+        ...DEFAULT_ENTER_TO_SEND_SETTINGS,
+        desktop: typeof backendEnterToSend === 'boolean'
           ? backendEnterToSend
-          : defaults.inputBarEnterToSend
-        persistDeviceEnterToSend(migratedEnterToSend)
-        patch.inputBarEnterToSend = migratedEnterToSend
+          : DEFAULT_ENTER_TO_SEND_SETTINGS.desktop,
       }
+      const deviceEnterToSend = typeof storedDeviceEnterToSend === 'boolean'
+        ? {
+            ...migratedBackendSettings,
+            [isMobileViewportOrDevice() ? 'mobile' : 'desktop']: storedDeviceEnterToSend,
+          }
+        : storedDeviceEnterToSend ?? migratedBackendSettings
+      persistDeviceEnterToSend(deviceEnterToSend)
+      patch.inputBarEnterToSend = deviceEnterToSend
 
       // Recover any settings the previous page wrote to localStorage but may
       // not have persisted to the DB yet (keepalive flush races with this GET).
@@ -1203,9 +1268,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
             !DATA_KEYS.has(k)
             || hasNewerLocalSetting(k, localRevisionAtLoadStart)
           ) continue
-          const pendingValue = k === 'imageGeneration'
-            ? migrateStoredImageGeneration(v)
-            : migrateProductivitySetting(k, v)
+          const pendingValue = migrateStoredSettingValue(k, v)
           if (k === 'quickToolbarSettings' && !pendingValuesMatch(pendingValue, v)) {
             migratedProductivityKeys.add(k)
           }

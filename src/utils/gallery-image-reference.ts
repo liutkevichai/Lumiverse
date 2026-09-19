@@ -3,6 +3,30 @@ export const GALLERY_IMAGE_REFERENCE_PREFIX = "gallery://";
 const GALLERY_REFERENCE_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const CANONICAL_GALLERY_REFERENCE_TOKEN_RE = /^image-([1-9][0-9]*)$/;
 
+/**
+ * Turn a user-facing gallery image name into a portable reference token.
+ * Keeping this normalization on the server makes every client and import path
+ * agree on the final `gallery://...` value.
+ */
+export function normalizeGalleryImageReferenceName(name: string): string {
+  const withoutPrefix = name.trim().replace(/^gallery:\/\//i, "");
+  const token = withoutPrefix
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[\u2018\u2019']/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^[._-]+|[._-]+$/g, "")
+    .slice(0, 128)
+    .replace(/[._-]+$/g, "");
+
+  if (!GALLERY_REFERENCE_TOKEN_RE.test(token)) {
+    throw new Error("Reference name must contain at least one letter or number");
+  }
+  return token;
+}
+
 export function createGalleryImageReference(token: string): string {
   if (!GALLERY_REFERENCE_TOKEN_RE.test(token)) {
     throw new Error("Invalid gallery image reference token");
@@ -80,4 +104,31 @@ export function findCanonicalGalleryImageReference(
       parseCanonicalGalleryImageReference(a[0])! - parseCanonicalGalleryImageReference(b[0])!
     );
   return matches[0]?.[0] ?? null;
+}
+
+/**
+ * Replace image identifiers in a greeting-background map while preserving its
+ * greeting indices and any unknown entries. CHARX export uses this to replace
+ * local image IDs with portable gallery references; import applies the inverse
+ * mapping after the bundled gallery images receive their new local IDs.
+ */
+export function remapGreetingBackgrounds(
+  backgrounds: unknown,
+  replacements: ReadonlyMap<string, string>,
+): unknown {
+  if (!backgrounds || typeof backgrounds !== "object" || Array.isArray(backgrounds)) {
+    return backgrounds;
+  }
+
+  const current = backgrounds as Record<string, unknown>;
+  let remapped: Record<string, unknown> | null = null;
+  for (const [greetingIndex, imageId] of Object.entries(current)) {
+    if (typeof imageId !== "string") continue;
+    const replacement = replacements.get(imageId);
+    if (!replacement || replacement === imageId) continue;
+    remapped ??= { ...current };
+    remapped[greetingIndex] = replacement;
+  }
+
+  return remapped ?? backgrounds;
 }
