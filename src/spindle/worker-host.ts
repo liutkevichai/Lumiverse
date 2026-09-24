@@ -4916,7 +4916,7 @@ export class WorkerHost {
         return;
       }
 
-      const { evaluate, buildEnv, initMacros, registry } = await import("../macros");
+      const { evaluate, buildEnv, initMacros, registry, resolveGroupCharacterNames } = await import("../macros");
       initMacros();
 
       const chatsSvc = await import("../services/chats.service");
@@ -4931,7 +4931,7 @@ export class WorkerHost {
         const chat = chatsSvc.getChat(resolvedUserId, chatId);
         if (chat) {
           const charId = characterId || chat.character_id;
-          const { makeAssistantCharacter } = await import("../types/character");
+          const { makeAssistantCharacter, getEffectiveCharacterName } = await import("../types/character");
           const { isTemporaryChatMetadata } = await import("../types/chat");
           const character = charId
             ? charactersSvc.getCharacter(resolvedUserId, charId)
@@ -4943,14 +4943,51 @@ export class WorkerHost {
             const messages = chatsSvc.getMessages(resolvedUserId, chatId);
             const connection = connectionsSvc.resolveConnection(resolvedUserId);
 
+            // Group chats need the focused/target member and the member roster
+            // so group macros resolve correctly. Without these, {{charGroupFocused}}
+            // falls back to the primary card and {{group}}/{{groupOthers}}/
+            // {{groupNotMuted}}/{{groupMemberCount}} resolve empty. The caller
+            // (e.g. the Hone extension) passes the speaking member's id as
+            // `characterId`; only treat it as the target when it is actually a
+            // member of this group.
+            const isGroup = !!chat.metadata?.group;
+            const groupCharacterIds =
+              isGroup && Array.isArray(chat.metadata?.character_ids)
+                ? (chat.metadata.character_ids as string[])
+                : [];
+            const targetCharacterId =
+              isGroup &&
+              typeof characterId === "string" &&
+              groupCharacterIds.includes(characterId)
+                ? characterId
+                : undefined;
+
+            const resolveCharName = (cid: string) => {
+              const c = charactersSvc.getCharacter(resolvedUserId, cid);
+              return c ? getEffectiveCharacterName(c) : undefined;
+            };
+            const groupCharacterNames = resolveGroupCharacterNames(chat, resolveCharName);
+            const mutedIds = chatsSvc.getGroupMutedIds(chat);
+            const groupNotMutedNames =
+              groupCharacterNames && mutedIds.length > 0
+                ? resolveGroupCharacterNames(chat, (cid) =>
+                    mutedIds.includes(cid) ? undefined : resolveCharName(cid),
+                  )
+                : undefined;
+
             env = buildEnv({
               character,
+              focusedCharacter: character,
               persona,
               chat,
               messages,
               generationType: "normal",
               commit,
               connection,
+              groupCharacterNames,
+              groupNotMutedNames,
+              targetCharacterId,
+              targetCharacterName: isGroup ? getEffectiveCharacterName(character) : undefined,
             });
           }
         }
