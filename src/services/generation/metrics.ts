@@ -2,6 +2,7 @@ export interface GenerationTimingSource {
   streamingStartedAt?: number;
   firstTokenAt?: number;
   firstContentTokenAt?: number;
+  responseStoppedAt?: number;
   completedAt?: number;
   wasStreaming?: boolean;
 }
@@ -14,20 +15,30 @@ export interface GenerationTimingMetrics {
 }
 
 export interface GenerationTokenCounts {
-  /** Authoritative total generated-token count for message metadata. */
+  /** Authoritative generated-token count for message metadata. */
   messageTokenCount?: number;
-  /** Visible response-token count used for response-only throughput. */
+  /** Visible response-token count used for response throughput. */
   responseTokenCount?: number;
 }
 
+export interface GenerationTokenCountOptions {
+  hasReasoning?: boolean;
+  /** Guided reasoning is counted as ordinary content by the provider. */
+  hasDelimitedReasoning?: boolean;
+  providerRaw?: Record<string, unknown>;
+}
+
 /**
- * Provider completion usage is authoritative for the message total. Keep the
- * separately calculated visible-response count for TPS because provider totals
- * may include hidden reasoning tokens.
+ * Provider completion usage remains authoritative for message metadata. TPS
+ * uses completion usage minus reported reasoning tokens, or a local visible
+ * response count when reasoning cannot be separated from the provider total.
+ * Local message and response counts are independent: finalized-message tokens
+ * belong in the final report, and generated-response tokens belong in TPS.
  */
 export function resolveGenerationTokenCounts(
   providerCompletionTokenCount: unknown,
-  calculatedResponseTokenCount?: number,
+  calculatedTokenCounts: GenerationTokenCounts = {},
+  options: GenerationTokenCountOptions = {},
 ): GenerationTokenCounts {
   const normalizedProviderCount =
     typeof providerCompletionTokenCount === "number" &&
@@ -36,16 +47,40 @@ export function resolveGenerationTokenCounts(
       ? Math.floor(providerCompletionTokenCount)
       : undefined;
 
+  const details = options.providerRaw?.completion_tokens_details
+    ?? options.providerRaw?.output_tokens_details;
+  const reasoningTokenCount = typeof details === "object" && details !== null
+    ? (details as Record<string, unknown>).reasoning_tokens
+      ?? (details as Record<string, unknown>).thinking_tokens
+    : undefined;
+
+  let providerResponseTokenCount: number | undefined;
+  if (!options.hasDelimitedReasoning) {
+    if (
+      normalizedProviderCount != null &&
+      typeof reasoningTokenCount === "number" &&
+      Number.isInteger(reasoningTokenCount) &&
+      reasoningTokenCount >= 0 &&
+      reasoningTokenCount <= normalizedProviderCount
+    ) {
+      providerResponseTokenCount = normalizedProviderCount - reasoningTokenCount;
+    } else if (!options.hasReasoning && reasoningTokenCount == null) {
+      providerResponseTokenCount = normalizedProviderCount;
+    }
+  }
+
   return {
-    messageTokenCount: normalizedProviderCount ?? calculatedResponseTokenCount,
-    responseTokenCount: calculatedResponseTokenCount,
+    messageTokenCount: normalizedProviderCount ?? calculatedTokenCounts.messageTokenCount,
+    responseTokenCount: providerResponseTokenCount ?? calculatedTokenCounts.responseTokenCount,
   };
 }
 
 /**
- * Calculate timings for the visible response. TTFT retains its historical
- * meaning (the first provider token, including reasoning), while TPS starts at
- * the first response-content token and uses only the visible response count.
+ * Calculate response timings. TTFT retains its historical meaning (the first
+ * provider token, including reasoning), while TPS starts at the first
+ * response-content token and ends at the provider's terminal stop, before
+ * message persistence or deferred token counting. Its token count excludes
+ * reasoning to match the measured response-content interval.
  */
 export function calculateGenerationTimingMetrics(
   source: GenerationTimingSource,
@@ -63,13 +98,13 @@ export function calculateGenerationTimingMetrics(
   let tps: number | undefined;
 
   if (wasStreaming && streamStart) {
-    if (source.firstTokenAt) {
+    if (source.firstTokenAt != null) {
       ttft = Math.max(0, source.firstTokenAt - streamStart);
     }
 
-    if (source.firstContentTokenAt && responseTokenCount && responseTokenCount > 1) {
+    if (source.firstContentTokenAt != null && source.responseStoppedAt != null && responseTokenCount && responseTokenCount > 1) {
       const responseDurationSec =
-        (responseEndedAt - source.firstContentTokenAt) / 1000;
+        (source.responseStoppedAt - source.firstContentTokenAt) / 1000;
       if (responseDurationSec > 0) {
         tps = Math.round((responseTokenCount / responseDurationSec) * 10) / 10;
       }

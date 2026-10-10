@@ -19,6 +19,7 @@ import {
   readBoundedText,
   throwProviderResponseError,
 } from "../../utils/provider-errors";
+import { isClaudeOpusAtLeast } from "../../utils/claude-model";
 
 const API_VERSION = "2023-06-01";
 
@@ -71,13 +72,12 @@ export class AnthropicProvider implements LlmProvider {
   }
 
   /**
-   * Opus 4.7/4.8 and every direct Claude 5-family model ID (including
+   * Opus 4.7+ and every direct Claude 5-family model ID (including
    * point releases) use adaptive thinking and reject manual sampling params.
    */
   private omitsSamplingParams(model: string): boolean {
-    return /^claude-(?:opus-4-(?:7|8)|[a-z0-9][a-z0-9-]*-5)(?:$|[-.:@])/i.test(
-      (model || "").trim(),
-    );
+    return isClaudeOpusAtLeast(model, 4, 7) ||
+      /^claude-[a-z0-9][a-z0-9-]*-5(?:$|[-.:@])/i.test((model || "").trim());
   }
 
   private shouldSuppressThinking(request: GenerationRequest): boolean {
@@ -553,6 +553,7 @@ export class AnthropicProvider implements LlmProvider {
               terminalChunk = {
                 token: "",
                 finish_reason: finishReason,
+                stopReceivedAt: Date.now(),
                 stop_details: data.delta?.stop_details,
                 stop_sequence: data.delta?.stop_sequence,
                 tool_calls: toolCalls,

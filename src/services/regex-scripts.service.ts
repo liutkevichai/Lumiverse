@@ -97,7 +97,7 @@ const VALID_SCOPES = new Set(["global", "character", "chat"]);
 const VALID_TARGETS = new Set(["prompt", "response", "display"]);
 const VALID_FLAGS = new Set(["d", "g", "i", "m", "s", "u", "v", "y"]);
 const VALID_MACRO_MODES = new Set(["none", "find", "raw", "escaped", "after"]);
-const MAX_PATTERN_LENGTH = 10_000;
+export const MAX_REGEX_PATTERN_LENGTH = 50_000;
 const MAX_REGEX_ACTIONS = 50;
 const MAX_REGEX_ACTION_FIELD_LENGTH = 10_000;
 const REGEX_ACTION_ID_RE = /^[A-Za-z][A-Za-z0-9_:.-]{0,63}$/;
@@ -547,7 +547,7 @@ function validateRegex(
   substituteMacros: RegexScript["substitute_macros"] = "none",
   activation = false,
 ): string | null {
-  if (pattern.length > MAX_PATTERN_LENGTH) return "find_regex exceeds maximum length";
+  if (pattern.length > MAX_REGEX_PATTERN_LENGTH) return "find_regex exceeds maximum length";
   if (!validateFlags(flags)) return "Invalid flags — allowed: d, g, i, m, s, u, v, y";
   try {
     const compilePattern = activation ? activationPatternForValidation(pattern)
@@ -568,7 +568,7 @@ function validateInput(input: CreateRegexScriptInput | UpdateRegexScriptInput, i
     if (ci.find_regex === undefined || ci.find_regex === null) return "find_regex is required";
   }
 
-  if (input.find_regex !== undefined && input.find_regex.length > MAX_PATTERN_LENGTH) {
+  if (input.find_regex !== undefined && input.find_regex.length > MAX_REGEX_PATTERN_LENGTH) {
     return "find_regex exceeds maximum length";
   }
   if (input.actions !== undefined) {
@@ -796,12 +796,14 @@ export interface PresetBoundRegexAttribution {
   /** Legacy LumiHub call-site alias. */
   hubPresetId?: string | null;
   presetVersion?: string | null;
+  presetVersionNumber?: number;
   folderName?: string | null;
 }
 
 interface RemotePresetRegexAttribution {
   id: string | null;
   version: string | null;
+  versionNumber: number | null;
   folderName: string | null;
 }
 
@@ -824,8 +826,13 @@ function getRemotePresetRegexAttribution(
   if (!isPlainMetadataRecord(raw)) return null;
   const id = normalizeOptionalId(raw.id);
   const version = normalizeOptionalId(raw.version);
+  const versionNumber = normalizePresetVersionNumber(raw.versionNumber);
   const folderName = normalizeOptionalId(raw.folderName);
-  return id || version ? { id, version, folderName } : null;
+  return id || version || versionNumber ? { id, version, versionNumber, folderName } : null;
+}
+
+function normalizePresetVersionNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
 }
 
 /**
@@ -851,9 +858,12 @@ function preparePresetBoundImportedScript<T extends Record<string, any>>(
       folderName: normalizeOptionalId(attribution.folderName),
     };
   } else if (attribution?.source === "illarin") {
+    delete metadata._lumiverse_lumihub_preset;
     metadata._lumiverse_illarin_preset = {
       id: normalizeOptionalId(attribution.remotePresetId),
       version: normalizeOptionalId(attribution.presetVersion),
+      ...(normalizePresetVersionNumber(attribution.presetVersionNumber) === null
+        ? {} : { versionNumber: attribution.presetVersionNumber }),
       folderName: normalizeOptionalId(attribution.folderName),
     };
   }
@@ -1686,6 +1696,9 @@ function foldFingerprint(
 }
 
 function macroOptionsForRegexScript(script: RegexScript): EvaluateOptions | undefined {
+  if (script.owner_extension_identifier) {
+    return { sourceOwner: { extensionIdentifier: script.owner_extension_identifier } };
+  }
   if (script.preset_id && script.owner_extension_identifier == null) {
     return { sourceOwner: "host", sourceHint: "regex_script:preset" };
   }
@@ -2331,6 +2344,8 @@ interface RetireRemotePresetRegexOptions {
   previousRemotePresetId?: string | null;
   previousVersion?: string | null;
   incomingVersion?: string | null;
+  previousVersionNumber?: number | null;
+  incomingVersionNumber?: number;
   presetName: string;
   preserveIds?: string[];
 }
@@ -2404,6 +2419,8 @@ function retireRemotePresetRegexScriptsForUpdate(
   const previousRemotePresetId = normalizeOptionalId(options.previousRemotePresetId);
   const previousVersion = normalizeOptionalId(options.previousVersion);
   const incomingVersion = normalizeOptionalId(options.incomingVersion);
+  const incomingVersionNumber = options.source === "illarin"
+    ? normalizePresetVersionNumber(options.incomingVersionNumber) : null;
   if (!remotePresetId) return { archivedIds: [], replacedIds: [] };
 
   const acceptedRemoteIds = new Set([remotePresetId, previousRemotePresetId].filter((id): id is string => !!id));
@@ -2420,23 +2437,30 @@ function retireRemotePresetRegexScriptsForUpdate(
     // preset was already a tracked installation from the same remote source.
     if (!attribution?.id && !previousRemotePresetId) return [];
     const version = attribution?.version ?? previousVersion;
+    const versionNumber = attribution
+      ? attribution.versionNumber : normalizePresetVersionNumber(options.previousVersionNumber);
     return [{
       script,
       version,
+      versionNumber,
       folderName: getRemotePresetSourceFolder(script, attribution, options.presetName, version, options.source),
     }];
   });
 
-  const replaced = matching.filter(({ version }) => version === incomingVersion);
-  const archived = matching.filter(({ version }) => version !== incomingVersion);
+  const sameRelease = (entry: typeof matching[number]) => incomingVersionNumber === null
+    ? entry.version === incomingVersion
+    : entry.versionNumber === incomingVersionNumber;
+  const replaced = matching.filter(sameRelease);
+  const archived = matching.filter((entry) => !sameRelease(entry));
   const replacedIds = replaced.map(({ script }) => script.id);
   const archivedIds = archived.map(({ script }) => script.id);
   const replaceIdSet = new Set(replacedIds);
   const archiveGroups = new Map<string, { version: string | null; folderName: string; ids: Set<string> }>();
   const archiveKey = (version: string | null, folderName: string) => `${version ?? ""}\u0000${folderName}`;
-  for (const { script, version, folderName } of archived) {
-    const key = archiveKey(version, folderName);
-    const group = archiveGroups.get(key) ?? { version, folderName, ids: new Set<string>() };
+  for (const { script, version, versionNumber, folderName } of archived) {
+    const historyVersion = versionNumber === null ? version : String(versionNumber);
+    const key = archiveKey(historyVersion, folderName);
+    const group = archiveGroups.get(key) ?? { version: historyVersion, folderName, ids: new Set<string>() };
     group.ids.add(script.id);
     archiveGroups.set(key, group);
   }
@@ -2463,11 +2487,14 @@ function retireRemotePresetRegexScriptsForUpdate(
     const updateRow = db.query(
       "UPDATE regex_scripts SET disabled = 1, folder = ?, metadata = ?, updated_at = ? WHERE id = ? AND user_id = ?",
     );
-    for (const { script, version, folderName } of archived) {
+    for (const { script, version, versionNumber, folderName } of archived) {
       const metadata = isPlainMetadataRecord(script.metadata) ? { ...script.metadata } : {};
-      metadata[remotePresetMetadataKey(options.source)] = { id: remotePresetId, version, folderName };
+      metadata[remotePresetMetadataKey(options.source)] = {
+        id: remotePresetId, version, folderName,
+        ...(versionNumber === null ? {} : { versionNumber }),
+      };
       updateRow.run(
-        foldersByArchiveKey.get(archiveKey(version, folderName))!,
+        foldersByArchiveKey.get(archiveKey(versionNumber === null ? version : String(versionNumber), folderName))!,
         JSON.stringify(metadata),
         now,
         script.id,
@@ -2569,10 +2596,12 @@ export interface InstallIllarinPresetRegexOptions {
   presetName: string;
   assetId: string;
   presetVersion?: string | null;
+  presetVersionNumber?: number;
   scripts: any[];
   previous?: {
     assetId?: string | null;
     version?: string | null;
+    versionNumber?: number | null;
     presetName?: string | null;
   } | null;
 }
@@ -2583,10 +2612,12 @@ interface InstallRemotePresetRegexOptions {
   presetName: string;
   remotePresetId: string;
   presetVersion?: string | null;
+  presetVersionNumber?: number;
   scripts: any[];
   previous?: {
     remotePresetId?: string | null;
     version?: string | null;
+    versionNumber?: number | null;
     presetName?: string | null;
   } | null;
 }
@@ -2616,6 +2647,7 @@ function installRemotePresetRegexScripts(
           source: options.source,
           remotePresetId: options.remotePresetId,
           presetVersion: options.presetVersion,
+          presetVersionNumber: options.presetVersionNumber,
         },
       );
       newIds = getRegexScriptsByPresetId(userId, options.presetId)
@@ -2638,6 +2670,8 @@ function installRemotePresetRegexScripts(
           previousRemotePresetId: options.previous.remotePresetId,
           previousVersion: options.previous.version,
           incomingVersion: options.presetVersion,
+          previousVersionNumber: options.previous.versionNumber,
+          incomingVersionNumber: options.presetVersionNumber,
           presetName: normalizeOptionalId(options.previous.presetName) ?? options.presetName,
           preserveIds: newIds,
         })
@@ -2695,10 +2729,12 @@ export function installIllarinPresetRegexScripts(
     presetName: options.presetName,
     remotePresetId: options.assetId,
     presetVersion: options.presetVersion,
+    presetVersionNumber: options.presetVersionNumber,
     scripts: options.scripts,
     previous: options.previous ? {
       remotePresetId: options.previous.assetId,
       version: options.previous.version,
+      versionNumber: options.previous.versionNumber,
       presetName: options.previous.presetName,
     } : null,
   });

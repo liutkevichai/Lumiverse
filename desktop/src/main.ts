@@ -27,6 +27,8 @@ import {
   type UpdateState,
 } from "./runner-client";
 import { loadSettings, saveSetting, type TraySettings } from "./settings";
+import { createDiscordPresenceRefreshQueue } from "./discord-presence";
+import { restoreDesktopSession, type DesktopUpdateResume } from "./update-resume";
 import { type InstanceConnection, LOCAL_INSTANCE_CONNECTION } from "./instance-connection";
 import {
   pendingRemoteSnapshot,
@@ -41,6 +43,7 @@ const POLL_INTERVAL_MS = 15_000;
 // so the request client can never become the earlier cutoff.
 const DESKTOP_REBUILD_TIMEOUT_MS = 2 * 60 * 60_000 + 5 * 60_000;
 const isMac = navigator.userAgent.includes("Mac");
+const isWindows = navigator.userAgent.includes("Windows");
 
 /**
  * Alerts and pickers go through Rust commands so they never parent to —
@@ -70,6 +73,34 @@ let instanceConnection: InstanceConnection = LOCAL_INSTANCE_CONNECTION;
 let remoteSnapshot: RemoteInstanceSnapshot | null = null;
 let openIntegratedBrowserWhenReady = false;
 
+// ─── Discord Rich Presence ──────────────────────────────────────────────────
+// The tray fetches the active-chat snapshot on chat switches and polls the
+// instance's desktop API as a fallback. It relays each snapshot to the Rust
+// worker, which owns the Discord IPC connection. When
+// the Discord toggle is switched on without a usable desktop session, the
+// standard remote-instance OAuth sign-in runs once against the current
+// origin (local instances included) — always as a direct consequence of the
+// user's click, never from a background poll.
+
+interface DiscordPresenceSnapshot {
+  chatId: string | null;
+  characterName: string | null;
+  messageCount: number | null;
+  totalTokens: number | null;
+  model: string | null;
+  characterCount?: number | null;
+}
+
+type DiscordPresenceFetch =
+  | { state: "active"; snapshot: DiscordPresenceSnapshot }
+  | { state: "inactive" }
+  | { state: "disconnected" }
+  | { state: "reauth_required"; error: string | null }
+  | { state: "unreachable"; error: string | null };
+
+let discordPresenceEverActive = false;
+let discordPresenceIssueAlerted = false;
+
 function isRemoteMode(): boolean {
   return instanceConnection.mode === "remote";
 }
@@ -92,13 +123,22 @@ let checkUpdatesItem: MenuItem;
 let applyUpdateItem: MenuItem;
 let rebuildDesktopItem: MenuItem;
 let autoStartItem: CheckMenuItem;
+let discordRpcItem: CheckMenuItem;
 let loginItem: CheckMenuItem;
 let openIntegratedBrowserItem: MenuItem;
 let openDefaultBrowserItem: MenuItem;
 let reloadIntegratedBrowserItem: MenuItem;
 let remoteAuthItem: MenuItem;
 let remoteDisconnectItem: MenuItem;
+let desktopCaptureItem: MenuItem;
 let floatingWidgetsItem: Submenu;
+
+interface DesktopCaptureStatus {
+  enabled: boolean;
+  origin: string | null;
+  capabilities: { image: boolean; video: boolean; replay: boolean };
+  error: string | null;
+}
 
 interface DesktopWidgetCatalogEntry {
   id: string;
@@ -232,6 +272,12 @@ async function updateMenu(): Promise<void> {
     remote && remoteSnapshot !== null && remoteSnapshot.state !== "disconnected" && remoteSnapshot.state !== "authorizing",
   );
 
+  const capture = await invoke<DesktopCaptureStatus>("desktop_capture_status");
+  await desktopCaptureItem.setText(capture.enabled
+    ? "Disable Extension Screen Capture"
+    : "Enable Extension Screen Capture…");
+  await desktopCaptureItem.setEnabled(capture.capabilities.image && !transitioning);
+
   await statsPortItem.setText(`Port: ${remote ? (remoteSnapshot?.status?.port ?? "—") : port}`);
   await statsPidItem.setText(`PID: ${remote ? (remoteSnapshot?.status?.pid ?? "—") : (lastStatus?.pid ?? "—")}`);
   await statsUptimeItem.setText(`Uptime: ${remote
@@ -315,12 +361,12 @@ async function refreshStatus(): Promise<void> {
   }
 }
 
-async function startServer(): Promise<void> {
+async function startServer(reopenFrontend = true): Promise<void> {
   if (isRemoteMode()) throw new Error("Switch to the local instance before starting its server.");
   await ensureRunner();
   // The runner acknowledges this request while the server is still starting.
   // Defer opening the native WebView until its `running` state notification.
-  openIntegratedBrowserWhenReady = true;
+  openIntegratedBrowserWhenReady = reopenFrontend;
   serverState = "starting";
   await updateMenu();
   await client.request("start-server");
@@ -441,9 +487,9 @@ async function applyUpdate(): Promise<void> {
 /**
  * Compile the desktop shell from the configured checkout.
  *
- * This produces a bundle; it cannot replace the running app, because a process
- * cannot overwrite its own bundle. The build therefore ends by pointing the
- * user at what it made.
+ * Windows can hand the fresh NSIS bundle to a detached native helper, then
+ * gracefully exit so that helper can install it and relaunch the application.
+ * Other platforms retain the existing manual bundle handoff for now.
  */
 async function rebuildDesktop(): Promise<void> {
   await ensureRunner();
@@ -464,15 +510,63 @@ async function rebuildDesktop(): Promise<void> {
       await alert("Lumiverse", "The desktop app was rebuilt.");
       return;
     }
-    await alert(
-      "Desktop app rebuilt",
-      "The new build is ready. Quit Lumiverse Desktop and replace the " +
-        "installed app with it to finish updating.\n\n" +
-        result.bundlePath,
-    );
-    // Best-effort: a file manager that refuses to open must not turn a
-    // successful build into a reported failure.
-    await revealItemInDir(result.bundlePath).catch(() => {});
+
+    if (!isWindows) {
+      await alert(
+        "Desktop app rebuilt",
+        "The new build is ready. Quit Lumiverse Desktop and replace the " +
+          "installed app with it to finish updating.\n\n" +
+          result.bundlePath,
+      );
+      await revealItemInDir(result.bundlePath).catch(() => {});
+      return;
+    }
+
+    if (!repoDir) {
+      throw new Error("No Lumiverse checkout is configured for the desktop update.");
+    }
+
+    const restartNow = await invoke<boolean>("confirm", {
+      title: "Desktop app rebuilt",
+      message:
+        "The new desktop build is ready. Restart Lumiverse Desktop now to install it?\n\n" +
+        "The app will close, the NSIS installer will run silently, and Lumiverse Desktop " +
+        "will reopen automatically. Your checkout is not modified by this step.",
+      okLabel: "Install and restart",
+      cancelLabel: "Later",
+    });
+
+    if (!restartNow) {
+      // Keep the old escape hatch: the bundle remains usable for a manual
+      // install, and revealing it makes choosing Later non-destructive.
+      await revealItemInDir(result.bundlePath).catch(() => {});
+      return;
+    }
+
+    try {
+      // Capture at handoff time, since the user can start/stop the server or
+      // hide the browser during a long build. Do not restart external servers.
+      const status = await client.fullStatus();
+      const reopenFrontend = await invoke<boolean>("frontend_visible");
+      await invoke("stage_desktop_update", {
+        artifactPath: result.bundlePath,
+        repoDir,
+        resumeServer: !isRemoteMode() && (status.state === "running" || status.state === "starting"),
+        reopenFrontend,
+      });
+    } catch (error) {
+      await revealItemInDir(result.bundlePath).catch(() => {});
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `The desktop build succeeded, but the automatic installer handoff failed: ${reason}\n\n` +
+          `The bundle is still available at:\n${result.bundlePath}`,
+      );
+    }
+
+    // The native helper is now independent of this process and waits for our
+    // PID to disappear before running NSIS. Use the normal graceful shutdown
+    // so the runner/server are not abandoned during the handoff.
+    await quit();
   } catch (err) {
     busyMessage = null;
     await updateMenu();
@@ -590,6 +684,120 @@ async function disconnectRemoteInstance(): Promise<void> {
   await updateMenu();
 }
 
+async function toggleDesktopCapture(): Promise<void> {
+  const capture = await invoke<DesktopCaptureStatus>("desktop_capture_status");
+  if (capture.enabled) {
+    await invoke("desktop_capture_disconnect");
+  } else {
+    const origin = new URL(frontendUrl()).origin;
+    await invoke("desktop_capture_connect", { origin });
+    if (origin !== new URL(frontendUrl()).origin) {
+      await invoke("desktop_capture_disconnect");
+    }
+  }
+  await updateMenu();
+}
+
+// ─── Discord Rich Presence plumbing ─────────────────────────────────────────
+
+/** The instance origin the presence snapshot should be read from, if any. */
+function presenceOrigin(): string | null {
+  // Inline the mode check so TypeScript narrows `instanceConnection`.
+  if (instanceConnection.mode === "remote") return instanceConnection.origin;
+  if (serverState === "running" || externalRunning) return `http://localhost:${port}`;
+  return null;
+}
+
+/**
+ * Poll the active-chat snapshot once and relay it to the Discord worker.
+ * Never throws — a failed poll keeps the last known presence until the next
+ * tick. Returns "needs-auth" when the instance requires a desktop sign-in.
+ */
+async function pollDiscordPresence(): Promise<"ok" | "needs-auth"> {
+  if (!settings.discordRpcEnabled) return "ok";
+  try {
+    const origin = presenceOrigin();
+    if (!origin) {
+      await invoke("discord_rpc_update", { payload: null });
+      return "ok";
+    }
+    const result = await invoke<DiscordPresenceFetch>("discord_presence_fetch", { origin });
+    // A fetch for the old instance must not overwrite the new selection or
+    // restore activity after the user disables presence.
+    if (!settings.discordRpcEnabled || presenceOrigin() !== origin) return "ok";
+    switch (result.state) {
+      case "active":
+        discordPresenceEverActive = true;
+        await invoke("discord_rpc_update", { payload: result.snapshot });
+        return "ok";
+      case "inactive":
+        discordPresenceEverActive = true;
+        await invoke("discord_rpc_update", { payload: null });
+        return "ok";
+      case "unreachable":
+        await invoke("discord_rpc_update", { payload: null });
+        return "ok";
+      case "disconnected":
+      case "reauth_required":
+        await invoke("discord_rpc_update", { payload: null });
+        // A sign-in that lapsed mid-run is worth one mention so the missing
+        // presence is not mysterious. A user who never signed in stays silent
+        // — they were told how at toggle time.
+        if (discordPresenceEverActive && !discordPresenceIssueAlerted) {
+          discordPresenceIssueAlerted = true;
+          await alert(
+            "Discord Rich Presence",
+            "Lumiverse's desktop sign-in expired, so Discord presence is paused. Toggle Discord Rich Presence off and on in the tray menu to sign in again.",
+          );
+        }
+        return "needs-auth";
+    }
+  } catch {
+    return "ok";
+  }
+}
+
+const refreshDiscordPresence = createDiscordPresenceRefreshQueue(pollDiscordPresence);
+
+/**
+ * Run the standard desktop OAuth sign-in against the given origin so
+ * presence can flow. Opens the system browser — only call from the toggle
+ * action, never from a background poll.
+ */
+async function authorizeDiscordPresence(origin: string): Promise<void> {
+  await alert(
+    "Discord Rich Presence",
+    "Sign in to Lumiverse in your browser so the desktop app can read your active roleplay for Discord presence.",
+  );
+  // Drop any stale credential for this origin before the fresh sign-in.
+  await invoke("remote_instance_disconnect", { origin }).catch(() => {});
+  await invoke("remote_instance_connect", { origin });
+}
+
+async function toggleDiscordRpc(): Promise<void> {
+  const enabled = !settings.discordRpcEnabled;
+  settings.discordRpcEnabled = enabled;
+  await discordRpcItem.setChecked(enabled);
+  await saveSetting("discordRpcEnabled", enabled);
+  await invoke("discord_rpc_set_enabled", { enabled });
+  if (enabled) {
+    const origin = presenceOrigin();
+    if (!origin) {
+      await alert(
+        "Discord Rich Presence",
+        "Presence will start once your Lumiverse server is running. If you are not signed in yet, toggle Discord Rich Presence off and on after it starts to sign in.",
+      );
+    } else {
+      const outcome = await refreshDiscordPresence();
+      if (outcome === "needs-auth") {
+        await authorizeDiscordPresence(origin);
+        await refreshDiscordPresence();
+      }
+    }
+  }
+  await updateMenu();
+}
+
 // ─── Action wrapper ─────────────────────────────────────────────────────────
 
 function updateMenuInBackground(): void {
@@ -660,6 +868,12 @@ async function buildTray(): Promise<void> {
     action: action(disconnectRemoteInstance),
   });
 
+  desktopCaptureItem = await MenuItem.new({
+    text: "Enable Extension Screen Capture…",
+    enabled: false,
+    action: action(toggleDesktopCapture),
+  });
+
   const setFrontendUrlItem = await MenuItem.new({
     text: "Instance Connection…",
     action: action(async () => {
@@ -681,6 +895,7 @@ async function buildTray(): Promise<void> {
       openDefaultBrowserItem,
       remoteAuthItem,
       remoteDisconnectItem,
+      desktopCaptureItem,
       await PredefinedMenuItem.new({ item: "Separator" }),
       setFrontendUrlItem,
     ],
@@ -715,6 +930,11 @@ async function buildTray(): Promise<void> {
       await autoStartItem.setChecked(settings.autoStartServer);
       await saveSetting("autoStartServer", settings.autoStartServer);
     }),
+  });
+  discordRpcItem = await CheckMenuItem.new({
+    text: "Discord Rich Presence",
+    checked: settings.discordRpcEnabled,
+    action: action(toggleDiscordRpc),
   });
   loginItem = await CheckMenuItem.new({
     text: "Launch at Login",
@@ -784,6 +1004,7 @@ async function buildTray(): Promise<void> {
       rebuildDesktopItem,
       await separator(),
       autoStartItem,
+      discordRpcItem,
       loginItem,
       setFolderItem,
       await separator(),
@@ -813,6 +1034,8 @@ async function toggleServer(): Promise<void> {
 // ─── Boot ───────────────────────────────────────────────────────────────────
 
 async function tick(): Promise<void> {
+  // Presence rides the shared tick; its polling handles its own errors.
+  void refreshDiscordPresence();
   if (isRemoteMode()) {
     await pollRemoteInstance();
     await updateMenu();
@@ -830,7 +1053,12 @@ async function boot(): Promise<void> {
   settings = await loadSettings();
   instanceConnection = settings.instanceConnection;
 
+  await listen<{ origin: string }>("discord-presence-changed", ({ payload }) => {
+    if (payload?.origin === presenceOrigin()) void refreshDiscordPresence();
+  });
+
   await listen<{ connection: InstanceConnection }>("instance-connection-changed", async ({ payload }) => {
+    await invoke("desktop_capture_disconnect");
     const previousOrigin = instanceConnection.mode === "remote" ? instanceConnection.origin : null;
     instanceConnection = payload.connection;
     remoteSnapshot = null;
@@ -847,6 +1075,8 @@ async function boot(): Promise<void> {
         await alert("Lumiverse", error instanceof Error ? error.message : String(error), true);
       });
     }
+    // Re-target (or clear) presence for the newly selected instance.
+    void refreshDiscordPresence();
     await updateMenu();
   });
   await listen<DesktopWidgetCatalogEntry[]>("desktop-widget-catalog", ({ payload }) => {
@@ -881,6 +1111,9 @@ async function boot(): Promise<void> {
         .catch((err) => alert("Lumiverse", err instanceof Error ? err.message : String(err), true));
     } else if (state === "stopped" || state === "crashed") {
       openIntegratedBrowserWhenReady = false;
+      // The instance cannot serve a presence snapshot anymore — clear now
+      // rather than waiting for the next tick.
+      void refreshDiscordPresence();
     }
     if (state === "running" || state === "stopped" || state === "crashed") {
       busyMessage = null;
@@ -904,6 +1137,7 @@ async function boot(): Promise<void> {
     serverState = "stopped";
     lastStatus = null;
     busyMessage = null;
+    void refreshDiscordPresence();
     void updateMenu();
   };
 
@@ -920,7 +1154,14 @@ async function boot(): Promise<void> {
 
   await buildTray();
   await updateMenu();
+  if (settings.discordRpcEnabled) {
+    await invoke("discord_rpc_set_enabled", { enabled: true }).catch((error) => {
+      console.warn("Unable to resume Discord Rich Presence", error);
+    });
+    void refreshDiscordPresence();
+  }
   await invoke("desktop_startup_ready");
+  const updateResume = await invoke<DesktopUpdateResume | null>("take_desktop_update_resume");
 
   if (!repoDir && !isRemoteMode()) {
     await alert(
@@ -933,11 +1174,21 @@ async function boot(): Promise<void> {
     void pollRemoteInstance().then(updateMenu).catch((error) => {
       console.warn("Unable to restore remote instance authorization", error);
     });
-  } else if (settings.autoStartServer && repoDir && bunPath) {
-    action(startServer)();
-  } else {
-    void detectExternalServer().then(updateMenu);
   }
+  action(async () => {
+    await restoreDesktopSession(updateResume, {
+      remote: isRemoteMode(),
+      canStartServer: Boolean(repoDir && bunPath),
+      autoStartServer: settings.autoStartServer,
+    }, {
+      startServer,
+      detectExternalServer,
+      showFrontend: async () => {
+        await invoke("show_frontend", { port, customUrl: remoteFrontendUrl() });
+      },
+    });
+    await updateMenu();
+  })();
 
   setInterval(() => void tick(), POLL_INTERVAL_MS);
 }

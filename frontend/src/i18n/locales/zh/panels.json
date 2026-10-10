@@ -13,8 +13,8 @@
       "tabHeaderTitle": "推理"
     },
     "loom": {
-      "shortName": "织机",
-      "tabName": "织机",
+      "shortName": "预设",
+      "tabName": "预设",
       "tabDescription": "配置叙事结构与故事节拍",
       "tabHeaderTitle": "织机"
     },
@@ -1383,7 +1383,6 @@
     "cancel": "取消",
     "dropToImport": "拖放角色文件以导入",
     "dropFileTypes": ".json、.png、.charx、.jpg",
-    "desktopDropReadFailed": "Lumiverse Desktop 无法读取拖放的文件。",
     "tagFilter": {
       "label": "标签",
       "labelWithCount": "标签 ({{count}})",

@@ -2,6 +2,8 @@
 
 import { afterEach, beforeAll, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test'
 import { JSDOM } from 'jsdom'
+let registerDisplayResolver: typeof import('@/lib/spindle/display-resolver-registry').registerDisplayResolver
+let unregisterDisplayResolver: typeof import('@/lib/spindle/display-resolver-registry').unregisterDisplayResolver
 import type { Root, createRoot as CreateRoot } from 'react-dom/client'
 import type { default as MessageContentType } from './MessageContent'
 import {
@@ -28,10 +30,12 @@ Object.assign(globalThis, {
   Element: domWindow.Element,
   HTMLElement: domWindow.HTMLElement,
   HTMLImageElement: domWindow.HTMLImageElement,
+  HTMLInputElement: domWindow.HTMLInputElement,
   Event: domWindow.Event,
   EventTarget: domWindow.EventTarget,
   CustomEvent: domWindow.CustomEvent,
   MouseEvent: domWindow.MouseEvent,
+  KeyboardEvent: domWindow.KeyboardEvent,
   MutationObserver: domWindow.MutationObserver,
   DOMParser: domWindow.DOMParser,
   getComputedStyle: domWindow.getComputedStyle.bind(domWindow),
@@ -109,6 +113,11 @@ mock.module('@/lib/cssModuleRegistry', () => ({
   CSS_MODULE_REGISTRY: [],
   generateSelector: () => '',
 }))
+// The real store imports Whistle through the Spindle loader. Bun does not
+// transform Vite worker URLs, and these rendering tests never start capture.
+mock.module('@/lib/whistle/capture.worklet.ts?worker&url', () => ({
+  default: '/test-capture-worklet.js',
+}))
 
 let createRoot: typeof CreateRoot
 let MessageContent: typeof MessageContentType
@@ -135,6 +144,7 @@ async function flushLayout() {
 }
 
 beforeAll(async () => {
+  ;({ registerDisplayResolver, unregisterDisplayResolver } = await import('@/lib/spindle/display-resolver-registry'))
   ;({ createRoot } = await import('react-dom/client'))
   ;({ default: MessageContent } = await import('./MessageContent'))
   ;({ useStore } = await import('@/store'))
@@ -164,6 +174,29 @@ afterEach(async () => {
 })
 
 describe('MessageContent inline HTML rendering', () => {
+  test('formatting exemption follows the registered owner and is removed on disposal', async () => {
+    const resolver = { skipFormattingHealing: true, ready: () => true,
+      resolveBody: async () => null, resolveTemplates: async () => null, applyScripts: async () => null }
+    useStore.setState({ activeChatId: 'format-chat', activeChatDisplayOwner: 'format-owner' })
+    let dispose: (() => void) | undefined
+    try {
+      await act(async () => { root?.render(<MessageContent content='Before * padded * after' isUser={false} userName="User" chatId="format-chat" disableInterceptors />) })
+      expect(host.querySelector('em')).not.toBeNull()
+      await act(async () => { dispose = registerDisplayResolver('format-owner', resolver) })
+      expect(host.querySelector('em')).toBeNull()
+      expect(host.textContent).toContain('* padded *')
+      await act(async () => { useStore.setState({ activeChatDisplayOwner: 'other-owner' }) })
+      expect(host.querySelector('em')).not.toBeNull()
+      await act(async () => { useStore.setState({ activeChatDisplayOwner: 'format-owner' }) })
+      expect(host.querySelector('em')).toBeNull()
+      await act(async () => { dispose?.() })
+      expect(host.querySelector('em')).not.toBeNull()
+    } finally {
+      unregisterDisplayResolver('format-owner')
+      useStore.setState({ activeChatId: null, activeChatDisplayOwner: null })
+    }
+  })
+
   function inlineScene(count: number) {
     return `<div class="scene">${Array.from({ length: count }, (_, i) => `<span style="top:${i}px">Actor ${i}</span>`).join('')}<img src="https://images.example/scene.png"></div>`
   }
@@ -174,24 +207,51 @@ describe('MessageContent inline HTML rendering', () => {
     })
   }
 
+  test('keeps adjacent buttons with trailing class whitespace as HTML', async () => {
+    await render('<div class="grid"><div class="btn " risu-btn="one">One</div><div class="btn active" risu-btn="two">Two</div></div>')
+    expect(host.querySelectorAll('.btn')).toHaveLength(2)
+    expect(host.querySelector('[risu-btn="one"]')?.textContent).toBe('One')
+    expect(host.textContent).not.toContain('<div')
+  })
+
   test.each([0, 1, 2, 3, 4, 8])('keeps %i inline styles reachable by document selectors', async (count) => {
     await render(inlineScene(count))
 
     expect(host.querySelectorAll('[data-lumiverse-html-island]')).toHaveLength(0)
+    expect(host.querySelectorAll('[data-lumiverse-inline-html-card]')).toHaveLength(count >= 3 ? 1 : 0)
     expect(host.querySelectorAll('.scene > span[style]')).toHaveLength(count)
     expect(host.querySelector('.scene > img')).not.toBeNull()
   })
 
+  test('restores spacing around a mid-message inline card without isolating it', async () => {
+    await render(`Before\n\n${inlineScene(3)}\n\nAfter`)
+
+    const shell = host.querySelector<HTMLElement>('[data-lumiverse-inline-html-card]')
+    expect(shell?.firstElementChild).toBe(host.querySelector('.scene'))
+    expect(shell?.shadowRoot).toBeNull()
+    expect(host.querySelectorAll('.scene > span[style]')).toHaveLength(3)
+    expect(host.textContent).toContain('Before')
+    expect(host.textContent).toContain('After')
+  })
+
   test('keeps document selectors working across style-count changes while streaming', async () => {
     await render(inlineScene(2), true)
+    const image = host.querySelector('.scene > img')
+    const prose = host.querySelector('.scene')?.parentElement
 
     for (const count of [3, 8, 1]) {
       await render(inlineScene(count), true)
       expect(host.querySelectorAll('[data-lumiverse-html-island]')).toHaveLength(0)
+      expect(host.querySelectorAll('[data-lumiverse-inline-html-card]')).toHaveLength(count >= 3 ? 1 : 0)
       expect(host.querySelectorAll('.scene > span[style]')).toHaveLength(count)
+      expect(host.querySelector('.scene')?.parentElement).toBe(prose)
+      expect(prose?.hasAttribute('data-lumiverse-inline-html-card')).toBe(count >= 3)
+      expect(host.querySelector('.scene > img') === image).toBe(true)
     }
     await render(inlineScene(1))
     expect(host.querySelectorAll('.scene > span[style]')).toHaveLength(1)
+    expect(host.querySelectorAll('[data-lumiverse-inline-html-card]')).toHaveLength(0)
+    expect(host.querySelector('.scene > img') === image).toBe(true)
   })
 
   test.each([
@@ -564,5 +624,66 @@ describe('MessageContent island whitespace', () => {
     const island = host.querySelector('[data-lumiverse-html-island]')?.shadowRoot
     expect(island?.querySelector('.block')?.textContent).toBe(text)
     expect(island?.querySelector('.inline')?.textContent).toBe(text)
+  })
+})
+
+
+describe('owned display spacing', () => {
+  test('follows ownership, registration, revocation and streaming without changing default spacing', async () => {
+    const { revokeInlineCardWrappingOptOut } = await import('@/lib/spindle/display-resolver-registry')
+    const resolver = { skipInlineCardWrapping: true, ready: () => true,
+      resolveBody: async () => null, resolveTemplates: async () => null, applyScripts: async () => null }
+    const scene = (count: number) => `<div></div><input id="panel-toggle" type="checkbox"><label for="panel-toggle">Toggle</label><div class="panel"><img src="/panel.png">${'<span style="color:red">x</span>'.repeat(count)}</div>`
+    const render = async (content = scene(3), chatId = 'padding-chat', isStreaming = false) => {
+      await act(async () => { root?.render(<MessageContent content={content} chatId={chatId} isStreaming={isStreaming} isUser={false} userName="User" disableInterceptors />) })
+    }
+    const wrapped = () => host.querySelector('[data-lumiverse-inline-html-card]') !== null
+    useStore.setState({ activeChatId: 'padding-chat', activeChatDisplayOwner: 'padding-owner' })
+    try {
+      await render()
+      expect(wrapped()).toBe(true)
+      const image = host.querySelector('img')
+      let dispose: () => void = () => {}
+      await act(async () => { dispose = registerDisplayResolver('padding-owner', resolver) })
+      expect(wrapped()).toBe(false)
+      await act(async () => { host.querySelector<HTMLLabelElement>('label')!.click() })
+      expect(host.querySelector('#panel-toggle:checked ~ .panel')).not.toBeNull()
+      expect(host.querySelector('img')).toBe(image)
+      for (const count of [2, 3, 8, 1]) {
+        await render(scene(count), 'padding-chat', true)
+        expect(wrapped()).toBe(false)
+        expect(host.querySelector('#panel-toggle ~ .panel')).not.toBeNull()
+        expect(host.querySelector('img')).toBe(image)
+      }
+      await render()
+      await act(async () => { useStore.setState({ activeChatDisplayOwner: 'other-owner' }) })
+      expect(wrapped()).toBe(true)
+      await act(async () => { useStore.setState({ activeChatDisplayOwner: 'padding-owner' }) })
+      expect(wrapped()).toBe(false)
+      await render(scene(3), 'other-chat')
+      expect(wrapped()).toBe(true)
+      await render()
+      await act(async () => { revokeInlineCardWrappingOptOut('other-owner') })
+      expect(wrapped()).toBe(false)
+      await act(async () => { revokeInlineCardWrappingOptOut('padding-owner') })
+      expect(wrapped()).toBe(true)
+      await act(async () => { registerDisplayResolver('padding-owner', resolver); dispose() })
+      expect(wrapped()).toBe(false)
+      await act(async () => { unregisterDisplayResolver('padding-owner') })
+      expect(wrapped()).toBe(true)
+      await act(async () => { registerDisplayResolver('padding-owner', { ...resolver, skipInlineCardWrapping: false }) })
+      expect(wrapped()).toBe(true)
+      const single = '<div class="single" style="color:red"><i style="color:red"></i><b style="color:red"></b></div>'
+      await render(single)
+      const prose = host.querySelector('.single')!.parentElement!
+      expect(prose.hasAttribute('data-lumiverse-inline-html-card')).toBe(true)
+      await act(async () => { registerDisplayResolver('padding-owner', resolver) })
+      expect(host.querySelector('.single')!.parentElement).toBe(prose)
+      expect(prose.hasAttribute('data-lumiverse-inline-html-card')).toBe(false)
+      await render('<div><style>.island{color:red}</style><span class="island">Island</span></div>')
+      expect(host.querySelector('[data-lumiverse-html-island]')?.shadowRoot?.querySelector('.island')).not.toBeNull()
+    } finally {
+      await act(async () => { unregisterDisplayResolver('padding-owner'); useStore.setState({ activeChatId: null, activeChatDisplayOwner: null }) })
+    }
   })
 })

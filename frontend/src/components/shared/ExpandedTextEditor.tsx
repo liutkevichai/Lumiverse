@@ -24,6 +24,7 @@ import type { MacroGroup } from '@/lib/loom/types'
 import MessageContent from '@/components/chat/MessageContent'
 import { useStore } from '@/store'
 import { installExpandedEditorCaretReveal } from '@/lib/expandedEditorCaret'
+import { findKeyboardScrollContainer } from '@/lib/textareaKeyboardReveal'
 import {
   findExpandedTextMatches,
   replaceAllExpandedTextMatches,
@@ -665,8 +666,10 @@ export default function ExpandedTextEditor({
     const textarea = textareaRef.current
     const mirror = highlightRef.current
     if (!textarea || !mirror) return
-    return installExpandedEditorCaretReveal(textarea, mirror)
-  }, [])
+    return installExpandedEditorCaretReveal(textarea, mirror, {
+      getScrollContainer: () => inline ? findKeyboardScrollContainer(textarea) : null,
+    })
+  }, [inline])
 
   const editorContent = (
     <div className={inline ? s.inlineDialog : s.dialog} onClick={e => e.stopPropagation()}>
@@ -883,6 +886,7 @@ export default function ExpandedTextEditor({
               >{highlightNodes ?? value}{'\u200b'}</pre>
               <textarea
                 ref={textareaRef}
+                data-keyboard-caret-managed="true"
                 className={showHighlight ? s.textareaHighlighted : s.textarea}
                 value={value}
                 onChange={handleTextareaChange}
@@ -923,7 +927,7 @@ export default function ExpandedTextEditor({
  * Drop-in wrapper: renders the original textarea with an expand button overlay.
  * When expanded, opens a full-screen ExpandedTextEditor modal.
  */
-interface ExpandableTextareaProps extends Pick<TextareaHTMLAttributes<HTMLTextAreaElement>, 'name' | 'aria-label'> {
+interface ExpandableTextareaProps extends Pick<TextareaHTMLAttributes<HTMLTextAreaElement>, 'name' | 'aria-label' | 'disabled'> {
   value: string
   onChange: (value: string) => void
   title: string
@@ -959,6 +963,7 @@ export const ExpandableTextarea = forwardRef<HTMLTextAreaElement, ExpandableText
   markdownOnly,
   name,
   'aria-label': ariaLabel,
+  disabled,
 }, forwardedRef) {
   const { t } = useTranslation('shared', { keyPrefix: 'expandedTextEditor' })
   const [expanded, setExpanded] = useState(false)
@@ -998,11 +1003,14 @@ export const ExpandableTextarea = forwardRef<HTMLTextAreaElement, ExpandableText
         spellCheck={spellCheck}
         name={name}
         aria-label={ariaLabel}
+        disabled={disabled}
       />
       <button
         className={s.expandBtn}
         onClick={handleExpand}
         title={t('expandEditor')}
+        aria-label={t('expandEditor')}
+        disabled={disabled}
         type="button"
       >
         <Maximize2 size={13} />

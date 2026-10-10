@@ -1,42 +1,60 @@
 import { describe, expect, test } from "bun:test";
 import {
   characterInstallPayload,
+  illarinPresetInstallPayload,
   persistIllarinPresetCover,
   type PresetCoverDependencies,
 } from "./delivery-installer";
 import type { IllarinDelivery } from "./types";
 
-function presetDelivery(artifacts: IllarinDelivery["artifacts"]): IllarinDelivery {
+function presetDelivery(files: IllarinDelivery["files"]): IllarinDelivery {
   return {
     id: "delivery-1",
-    assetId: "asset-1",
-    contentGeneration: 2,
-    kind: "preset",
+    workId: "asset-1",
+    versionNumber: 2,
+    type: "preset",
     name: "Night Shift",
     format: "preset_lumiverse",
     label: "Lumiverse preset",
     queuedAt: "2026-08-24T20:00:00Z",
     leaseExpiresAt: "2026-08-24T20:15:00Z",
-    artifacts,
+    files,
   };
 }
 
 describe("Illarin delivery installer", () => {
+  test("rejects malformed preset documents and invalid release numbers", () => {
+    const delivery = presetDelivery([]);
+    for (const document of [{}, { preset: null }, { preset: [] }, { blocks: "invalid" }]) {
+      expect(() => illarinPresetInstallPayload(delivery, document, null)).toThrow(/prompt blocks/);
+    }
+    for (const versionNumber of [0, -1, 1.5, Number.NaN]) {
+      expect(() => illarinPresetInstallPayload({ ...delivery, versionNumber }, { blocks: [] }, null)).toThrow(/version number/);
+    }
+  });
+
+  test("a durable sidecar replaces both wrapped cover aliases", () => {
+    const payload = illarinPresetInstallPayload(presetDelivery([]), {
+      preset: { blocks: [] }, cover_url: "https://expired.example/cover",
+    }, "/api/v1/images/local");
+    expect(payload.presetData.cover_url).toBe("/api/v1/images/local");
+    expect(payload.presetData.coverUrl).toBe("/api/v1/images/local");
+  });
   test("does not import pictures twice when CharX already contains them", () => {
     const delivery: IllarinDelivery = {
       id: "delivery-1",
-      assetId: "asset-1",
-      contentGeneration: 2,
-      kind: "character",
+      workId: "asset-1",
+      versionNumber: 2,
+      type: "character",
       name: "Aster",
       format: "charx",
       label: "Character Card Exchange",
       queuedAt: "2026-08-24T20:00:00Z",
       leaseExpiresAt: "2026-08-24T20:15:00Z",
-      artifacts: [
-        { kind: "export", url: "https://illarin.com/export" },
-        { kind: "picture", url: "https://illarin.com/avatar", role: "avatar", isCover: true },
-        { kind: "picture", url: "https://illarin.com/expression", role: "expression", isCover: false },
+      files: [
+        { type: "export", url: "https://illarin.com/export" },
+        { type: "picture", url: "https://illarin.com/avatar", role: "avatar", isCover: true },
+        { type: "picture", url: "https://illarin.com/expression", role: "expression", isCover: false },
       ],
     };
 
@@ -59,9 +77,9 @@ describe("Illarin delivery installer", () => {
       },
     };
     const delivery = presetDelivery([
-      { kind: "export", url: "https://illarin.com/export" },
-      { kind: "picture", url: "https://illarin.com/gallery", isCover: false },
-      { kind: "picture", url: "https://illarin.com/cover", isCover: true },
+      { type: "export", url: "https://illarin.com/export" },
+      { type: "picture", url: "https://illarin.com/gallery", isCover: false },
+      { type: "picture", url: "https://illarin.com/cover", isCover: true },
     ]);
 
     const url = await persistIllarinPresetCover("user-1", delivery, dependencies);
@@ -84,7 +102,7 @@ describe("Illarin delivery installer", () => {
     };
 
     const url = await persistIllarinPresetCover("user-1", presetDelivery([
-      { kind: "picture", url: "https://illarin.com/gallery", isCover: false },
+      { type: "picture", url: "https://illarin.com/gallery", isCover: false },
     ]), dependencies);
 
     expect(url).toBeNull();

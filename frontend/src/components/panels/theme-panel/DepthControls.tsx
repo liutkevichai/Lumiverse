@@ -1,6 +1,7 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Toggle } from '@/components/shared/Toggle'
+import { MIN_UI_SCALE, MAX_UI_SCALE, normalizeUiScale } from '@/lib/uiScale'
 import type { DesktopBackground, RenderingMode } from '@/types/theme'
 import styles from './DepthControls.module.css'
 
@@ -68,6 +69,49 @@ function commitFromInput(e: React.SyntheticEvent, commit: (v: number) => void) {
   commit(Number((e.target as HTMLInputElement).value))
 }
 
+interface DeferredColorInputProps {
+  value: string
+  className?: string
+  onCommit: (value: string) => void
+}
+
+/**
+ * Let the native color chooser update its own small swatch while it is open,
+ * then commit the selected color once. Committing every `input` event forces
+ * the complete theme and translucent desktop surface to repaint under the
+ * native blur, which makes dragging through the chooser extremely expensive.
+ */
+export function DeferredColorInput({ value, className, onCommit }: DeferredColorInputProps) {
+  const [draft, setDraft] = useState(value)
+  const inputRef = useRef<HTMLInputElement>(null)
+  const onCommitRef = useRef(onCommit)
+
+  useEffect(() => { onCommitRef.current = onCommit }, [onCommit])
+  useEffect(() => { setDraft(value) }, [value])
+
+  useEffect(() => {
+    const input = inputRef.current
+    if (!input) return
+
+    const handleChange = () => {
+      setDraft(input.value)
+      onCommitRef.current(input.value)
+    }
+    input.addEventListener('change', handleChange)
+    return () => input.removeEventListener('change', handleChange)
+  }, [])
+
+  return (
+    <input
+      ref={inputRef}
+      type="color"
+      value={draft}
+      onInput={(event) => setDraft(event.currentTarget.value)}
+      className={className}
+    />
+  )
+}
+
 export default function DepthControls({
   radiusScale,
   enableGlass,
@@ -88,11 +132,11 @@ export default function DepthControls({
   // This gives visual feedback during drag without triggering expensive
   // theme recalculations on every step.
   const [localFontScale, setLocalFontScale] = useState(fontScale)
-  const [localUiScale, setLocalUiScale] = useState(uiScale)
+  const [localUiScale, setLocalUiScale] = useState(() => normalizeUiScale(uiScale))
   const resolvedDesktopBackground = parseDesktopBackground(desktopBackground?.color)
 
   useEffect(() => { setLocalFontScale(fontScale) }, [fontScale])
-  useEffect(() => { setLocalUiScale(uiScale) }, [uiScale])
+  useEffect(() => { setLocalUiScale(normalizeUiScale(uiScale)) }, [uiScale])
 
   return (
     <div className={styles.controls}>
@@ -135,15 +179,15 @@ export default function DepthControls({
         <span className={styles.label}>{t('uiScale')}</span>
         <input
           type="range"
-          min={0.8}
-          max={1.5}
+          min={MIN_UI_SCALE}
+          max={MAX_UI_SCALE}
           step={0.05}
           value={localUiScale}
           onChange={(e) => setLocalUiScale(Number(e.target.value))}
           onPointerUp={(e) => commitFromInput(e, onUiScaleChange)}
           onKeyUp={(e) => commitFromInput(e, onUiScaleChange)}
           className={styles.slider}
-          style={trackFill(localUiScale, 0.8, 1.5)}
+          style={trackFill(localUiScale, MIN_UI_SCALE, MAX_UI_SCALE)}
         />
         <span className={styles.value}>{localUiScale.toFixed(2)}x</span>
       </label>
@@ -189,12 +233,11 @@ export default function DepthControls({
             <div className={styles.desktopControls}>
               <label className={styles.row}>
                 <span className={styles.label}>{t('desktopBackground.tint')}</span>
-                <input
-                  type="color"
+                <DeferredColorInput
                   value={resolvedDesktopBackground.color}
-                  onChange={(event) => onDesktopBackgroundChange({
+                  onCommit={(color) => onDesktopBackgroundChange({
                     ...desktopBackground,
-                    color: desktopColor(event.target.value, resolvedDesktopBackground.opacity),
+                    color: desktopColor(color, resolvedDesktopBackground.opacity),
                   })}
                   className={styles.colorInput}
                 />
