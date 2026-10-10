@@ -2,10 +2,98 @@ import { describe, expect, test } from "bun:test";
 import { GoogleTtsProvider } from "./google-tts";
 import { GoogleVertexTtsProvider } from "./google-vertex-tts";
 import { resolveEffectiveTtsApiUrl } from "../../services/tts-connections.service";
-import { GOOGLE_TTS_MODELS, GOOGLE_TTS_VOICES, buildGeminiTtsBody, wrapPcmInWav } from "./google-tts-shared";
+import {
+  DEFAULT_GEMINI_TTS_SPEECH_STYLE, GOOGLE_TTS_MODELS, GOOGLE_TTS_VOICES, buildGeminiTtsBody,
+  extractGeminiTtsAudio, extractGeminiTtsAudioChunks, wrapPcmInWav,
+} from "./google-tts-shared";
 
 const pcmB64 = (s: string) => Buffer.from(s, "utf8").toString("base64");
 const wavText = (buf: ArrayBuffer) => Buffer.from(buf.slice(44)).toString("utf8");
+const wavWithMetadata = () => {
+  const pcm = new Uint8Array([0, 0, 128, 0, 255, 127, 0, 128]);
+  const metadata = new Uint8Array([0x4a, 0x55, 0x4e, 0x4b, 4, 0, 0, 0, 0xde, 0xad, 0xbe, 0xef]);
+  const wav = new Uint8Array(44 + pcm.length + metadata.length);
+  wav.set(new Uint8Array(wrapPcmInWav(pcm, 16000)));
+  wav.set(metadata, 44 + pcm.length);
+  new DataView(wav.buffer).setUint32(4, wav.length - 8, true);
+  return wav;
+};
+
+describe("Gemini TTS audio extraction", () => {
+  test.each([
+    "audio/wav", "audio/x-wav", "audio/wave", "audio/vnd.wave",
+    "Audio/WAV; codec=pcm", undefined, "audio/L16;codec=pcm;rate=24000",
+  ])("preserves native WAV bytes and trailing metadata (%s)", (mimeType) => {
+    const wav = wavWithMetadata();
+    const response = { candidates: [{ content: { parts: [
+      { inlineData: { mimeType, data: Buffer.from(wav).toString("base64") } },
+    ] } }] };
+
+    const audio = extractGeminiTtsAudio(response);
+    expect(audio.contentType).toBe("audio/wav");
+    expect(new Uint8Array(audio.audioData)).toEqual(wav);
+    expect(new DataView(audio.audioData).getUint32(40, true)).toBe(8);
+
+    const chunks = Array.from(extractGeminiTtsAudioChunks(response));
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0].data).toEqual(wav);
+    expect(chunks[0].kind).toBe("audio_file");
+    expect(chunks[0].mimeType).toBe("audio/wav");
+  });
+
+  test("wraps raw PCM using its declared sample rate and snake-case fields", () => {
+    const pcm = new Uint8Array([0, 0, 128, 0, 255, 127, 0, 128]);
+    const response = { candidates: [{ content: { parts: [
+      { inline_data: { mime_type: "audio/L16;codec=pcm;rate=16000", data: Buffer.from(pcm).toString("base64") } },
+    ] } }] };
+    const expected = new Uint8Array(wrapPcmInWav(pcm, 16000));
+
+    expect(new Uint8Array(extractGeminiTtsAudio(response).audioData)).toEqual(expected);
+    expect(Array.from(extractGeminiTtsAudioChunks(response))[0].data).toEqual(expected);
+  });
+
+  test("does not mistake a non-WAVE RIFF prefix for a WAV container", () => {
+    const pcm = new Uint8Array(Buffer.from("RIFF....AVI "));
+    const response = { candidates: [{ content: { parts: [
+      { inlineData: { mimeType: "audio/L16;rate=24000", data: Buffer.from(pcm).toString("base64") } },
+    ] } }] };
+    const expected = new Uint8Array(wrapPcmInWav(pcm, 24000));
+
+    expect(new Uint8Array(extractGeminiTtsAudio(response).audioData)).toEqual(expected);
+    expect(Array.from(extractGeminiTtsAudioChunks(response))[0].data).toEqual(expected);
+  });
+});
+
+describe("Gemini 3.8 speech style metadata", () => {
+  test.each(["gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts"])("%s sends delivery guidance separately from the transcript and voice", (model) => {
+    const text = "Like a delivery guy. <giggle> Still talking.";
+    const body = buildGeminiTtsBody({ text, model, voice: "Kore", parameters: {} });
+    expect(body.contents[0].parts).toEqual([{ text, speech_metadata: { style: DEFAULT_GEMINI_TTS_SPEECH_STYLE } }]);
+    expect(body.generationConfig.speech_config.voice_config.prebuilt_voice_config.voice_name).toBe("Kore");
+    expect(body.generationConfig).not.toHaveProperty("speech_metadata");
+  });
+
+  test("custom speech style replaces the default and trims surrounding whitespace", () => {
+    const body = buildGeminiTtsBody({
+      text: "Hello.", model: "gemini-3.8-flash-tts", voice: "Puck",
+      parameters: { speech_style: "  soft, conversational  ", instructions: "ignored fallback" },
+    });
+    expect(body.contents[0].parts[0]).toEqual({ text: "Hello.", speech_metadata: { style: "soft, conversational" } });
+  });
+
+  test.each(["", " \n "])("an explicitly blank speech style opts out (%j)", (speech_style) => {
+    const body = buildGeminiTtsBody({
+      text: "Hello.", model: "gemini-3.8-flash-tts", voice: "Kore",
+      parameters: { speech_style, instructions: "ignored fallback" },
+    });
+    expect(body.contents[0].parts).toEqual([{ text: "Hello." }]);
+  });
+
+  test.each(["gemini-3.1-flash-tts-preview", "gemini-2.5-pro-preview-tts"])("older model %s receives no new metadata", (model) => {
+    const body = buildGeminiTtsBody({ text: "Hello.", model, voice: "Kore", parameters: { speech_style: "conversational" } });
+    expect(body.contents[0].parts).toEqual([{ text: "Hello." }]);
+  });
+});
 
 describe("Google TTS providers", () => {
   const studio = new GoogleTtsProvider();
@@ -32,17 +120,20 @@ describe("Google TTS providers", () => {
     expect(ids).toEqual(["gemini-2.5-flash-preview-tts", "gemini-3.1-flash-tts-preview"]);
   });
 
-  test("voice mapping is non-empty, unique, and gendered", async () => {
+  test("voice mapping is unique, gendered, and includes tone descriptions", async () => {
     for (const p of [studio, vertex]) {
       const voices = await p.listVoices("", "");
       expect(voices.length).toBeGreaterThanOrEqual(30);
       expect(new Set(voices.map((v) => v.id)).size).toBe(voices.length);
       for (const v of voices) {
         expect(v.name).toBeTruthy();
-        expect(["masculine", "feminine"]).toContain((v as any).gender);
+        expect(["masculine", "feminine"]).toContain(v.gender ?? "");
+        expect(v.description?.trim()).toBeTruthy();
       }
       expect(voices.map((v) => v.id)).toContain("Kore");
       expect(voices.map((v) => v.id)).toContain("Charon");
+      expect(voices.find((v) => v.id === "Algieba")?.gender).toBe("masculine");
+      expect(voices.find((v) => v.id === "Kore")?.gender).toBe("feminine");
     }
     expect(GOOGLE_TTS_VOICES.length).toBe((await studio.listVoices("", "")).length);
   });
@@ -80,6 +171,20 @@ describe("Google TTS providers", () => {
       text: "hi", model: "gemini-2.5-flash-preview-tts", voice: "Puck", parameters: {},
     });
     expect(calls[0].startsWith("https://generativelanguage.googleapis.com/v1beta/models/")).toBe(true);
+  });
+
+  test("AI Studio preserves native WAV output from non-streaming generation", async () => {
+    const wav = wavWithMetadata();
+    (globalThis as any).fetch = async () => new Response(JSON.stringify({ candidates: [{ content: { parts: [
+      { inlineData: { mimeType: "audio/wav", data: Buffer.from(wav).toString("base64") } },
+    ] } }] }));
+
+    const result = await studio.synthesize("k", "", {
+      text: "hello", model: "gemini-3.8-flash-tts", voice: "Kore", parameters: {},
+    });
+
+    expect(result.contentType).toBe("audio/wav");
+    expect(new Uint8Array(result.audioData)).toEqual(wav);
   });
 
   test("Vertex uses service account token and regional host", async () => {
@@ -211,22 +316,27 @@ describe("Google TTS providers", () => {
     expect(chunks[2].done).toBe(true);
   });
 
-  test("AI Studio streams audio chunks via streamGenerateContent SSE", async () => {
+  test.each(["gemini-3.1-flash-tts-preview", "gemini-3.8-flash-tts"])("AI Studio streams %s with the appropriate speech metadata", async (model) => {
     const sseBody = `data: ${JSON.stringify({ candidates: [{ content: { parts: [{ inlineData: { mimeType: "audio/L16;rate=24000", data: pcmB64("studio-stream") } }] } }] })}\n\n`;
     const calls: string[] = [];
-    (globalThis as any).fetch = async (input: any) => {
+    let body: Record<string, any> = {};
+    (globalThis as any).fetch = async (input: any, init?: RequestInit) => {
       calls.push(String(input));
+      body = JSON.parse(String(init?.body));
       return new Response(sseBody, { headers: { "content-type": "text/event-stream" } });
     };
 
     const chunks: any[] = [];
     for await (const chunk of studio.synthesizeStream("my-api-key", "", {
-      text: "hello", model: "gemini-3.1-flash-tts-preview", voice: "Puck", parameters: {},
+      text: "hello", model, voice: "Puck", parameters: {},
     })) {
       chunks.push(chunk);
     }
 
-    expect(calls[0]).toBe("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-tts-preview:streamGenerateContent?alt=sse&key=my-api-key");
+    expect(calls[0]).toBe(`https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=my-api-key`);
+    expect(body.contents[0].parts[0]).toEqual(model === "gemini-3.8-flash-tts"
+      ? { text: "hello", speech_metadata: { style: DEFAULT_GEMINI_TTS_SPEECH_STYLE } }
+      : { text: "hello" });
     expect(chunks.length).toBe(2);
     expect(chunks[0].done).toBe(false);
     expect(wavText(chunks[0].data.buffer)).toBe("studio-stream");

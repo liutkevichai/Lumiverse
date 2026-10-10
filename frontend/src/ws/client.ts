@@ -1,12 +1,15 @@
+import { activeTab } from '@/lib/active-tab'
 import { EventType } from './events'
 import { BASE_URL } from '@/api/client'
+import { frontendSessionId } from '@/lib/frontend-session'
 import {
   getDesktopPresence,
   subscribeDesktopPresence,
   type DesktopPresence,
 } from '@/lib/desktop-presence'
 
-type EventHandler = (payload: any) => void
+export interface EventMetadata { stateRevision?: { epoch: string; sequence: number }; runtimeMutationId?: string }
+type EventHandler = (payload: any, metadata?: EventMetadata) => void
 
 /** Internal client-only event names — not part of the backend protocol. */
 export const WS_OPEN = '__ws_open'
@@ -99,7 +102,11 @@ export class WebSocketClient {
     this.url = url || `${protocol}//${window.location.host}${basePath}/ws`
   }
 
-  connect() {
+  private executionOwner = true
+
+  connect(options?: { executionOwner?: boolean }) {
+    if (activeTab.signal.aborted) return
+    if (options?.executionOwner !== undefined) this.executionOwner = options.executionOwner
     if (this.ws?.readyState === WebSocket.OPEN || this.ws?.readyState === WebSocket.CONNECTING) return
 
     this.shouldReconnect = true
@@ -108,7 +115,10 @@ export class WebSocketClient {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
     }
-    const socket = new WebSocket(this.url)
+    const socketUrl = new URL(this.url)
+    socketUrl.searchParams.set('frontend_session', frontendSessionId)
+    if (!this.executionOwner) socketUrl.searchParams.set('frontend_runtime', 'widget')
+    const socket = new WebSocket(socketUrl.toString())
     this.ws = socket
     this.armConnectWatchdog(socket)
     // Install lifecycle listeners while CONNECTING too. Otherwise an initial
@@ -164,7 +174,7 @@ export class WebSocketClient {
         ) {
           console.debug('[WS] ←', eventName, data.payload)
         }
-        this.emit(eventName, data.payload)
+        this.emit(eventName, data.payload, { stateRevision: data.stateRevision, runtimeMutationId: data.runtimeMutationId })
       } catch {
         // ignore malformed messages
       }
@@ -259,10 +269,10 @@ export class WebSocketClient {
     this.emit(event, payload)
   }
 
-  private emit(event: string, payload: any) {
+  private emit(event: string, payload: any, metadata?: EventMetadata) {
     this.handlers.get(event)?.forEach(handler => {
       try {
-        handler(payload)
+        handler(payload, metadata)
       } catch (err) {
         console.error(`[WS] Error in handler for ${event}:`, err)
       }
@@ -502,8 +512,7 @@ export class WebSocketClient {
     let desktopPresenceStopped = false
     void subscribeDesktopPresence((presence) => {
       if (desktopPresenceStopped) return
-      this.desktopPresence = presence
-      this.sendVisibility()
+      this.applyDesktopPresence(presence)
     }).then((unlisten) => {
       if (desktopPresenceStopped) unlisten()
       else desktopPresenceUnlisten = unlisten
@@ -599,14 +608,35 @@ export class WebSocketClient {
     this.send({ type: 'stream_focus', chatId })
   }
 
+  /**
+   * Tauri's native window state is authoritative for its embedded WebView.
+   * WebView2 can leave Page Visibility stale around native hide/show and focus
+   * transitions; treating that stale value as an additional requirement makes
+   * an actually foreground window unsubscribe from live stream tokens. The
+   * generation-pool watchdog then becomes the only update path, which presents
+   * the stream as multi-second chunks.
+   */
+  private applyDesktopPresence(presence: DesktopPresence) {
+    this.desktopPresence = presence
+    if (this.isDocumentVisible()) {
+      if (this.lifecyclePaused) this.resumeFromBackground()
+      else this.sendVisibility()
+      return
+    }
+    this.pauseForBackground()
+    this.sendVisibility()
+  }
+
   private isDocumentVisible() {
+    const desktopPresence = this.desktopPresence ?? getDesktopPresence()
+    if (desktopPresence) return desktopPresence.visible && !desktopPresence.minimized
     return document.visibilityState === 'visible'
   }
 
   private isDocumentFocused() {
-    if (!this.isDocumentVisible()) return false
     const desktopPresence = this.desktopPresence ?? getDesktopPresence()
-    return desktopPresence ? desktopPresence.active : document.hasFocus()
+    if (desktopPresence) return desktopPresence.active
+    return this.isDocumentVisible() && document.hasFocus()
   }
 
   private pauseForBackground() {
@@ -709,6 +739,7 @@ export class WebSocketClient {
   }
 
   send(data: any): void {
+    if (activeTab.signal.aborted) return
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(data))
     }
@@ -725,3 +756,4 @@ export class WebSocketClient {
 }
 
 export const wsClient = new WebSocketClient()
+activeTab.signal.addEventListener('abort', () => wsClient.disconnect(), { once: true })

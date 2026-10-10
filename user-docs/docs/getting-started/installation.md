@@ -10,16 +10,21 @@ Lumiverse runs on your own machine. It needs **Bun** (a fast JavaScript runtime)
 
 ## Requirements
 
-- **Bun** v1.4.0 or later — [Install Bun](https://bun.sh) (the start scripts auto-install Bun if missing and auto-upgrade older versions to latest stable)
+- **Bun** v1.4.2 or later — [Install Bun](https://bun.sh) (the start scripts auto-install Bun if missing and auto-upgrade older versions to latest stable)
 - A modern web browser (Chrome, Firefox, Edge, Safari)
 - An API key from at least one AI provider (OpenAI, Anthropic, Google, etc.)
 
 !!! note "Operating Systems"
     Lumiverse works on **macOS**, **Linux**, **Windows**, and **Termux** (Android).
 
+!!! note "Linux desktop audio"
+    If you use Lumiverse Desktop on Linux, see [Linux audio setup](desktop-tray.md#audio-is-silent-on-linux) for the GStreamer plugin installation commands for Debian/Ubuntu, Fedora, and Arch Linux.
+
 ---
 
 ## Install & Run
+
+For a step-by-step walkthrough, see [Desktop Installation](desktop-installation.md) or [Android / Termux](android-installation.md).
 
 ### 1. Clone the repository
 
@@ -69,9 +74,11 @@ After the shell opens, continue with the normal startup command below.
     ./start.sh
     ```
 
-    The script auto-detects Termux and installs required packages (`glibc-repo`, `glibc-runner`, `proot`). It uses a three-tier execution strategy to find the best way to run Bun on your device, then validates the exact `proot`-wrapped path it will later use for `bun install`. If Bun is older than 1.4.0, startup uses the `bun-termux` manager to atomically update both the Bun runtime and its wrapper before continuing.
+    The script auto-detects Termux and installs required packages (`glibc-repo`, `glibc-runner`, `proot`). It uses a three-tier execution strategy to find the best way to run Bun on your device, then validates the exact `proot`-wrapped path it will later use for `bun install`. If Bun is older than 1.4.2, startup uses the `bun-termux` manager to atomically update both the Bun runtime and its wrapper before continuing.
 
     If `grun bun --version` works but the native Termux install path is still broken, `start.sh` now attempts a `bun-termux` rebuild before it lets first-run setup continue.
+
+    For persistent runtime or build errors, see [Termux Troubleshooting](../reference/termux-troubleshooting.md), including the Ubuntu fallback.
 
 === "Docker"
 
@@ -123,7 +130,7 @@ The start scripts accept flags to control behavior:
 
     | Flag | Description |
     |------|-------------|
-    | *(no flags)* | Start normally; auto-upgrade Bun to latest stable when below 1.4.0 |
+    | *(no flags)* | Start normally; auto-upgrade Bun to latest stable when below 1.4.2 |
     | `-b`, `--build` | Rebuild frontend before starting |
     | `--build-only` | Rebuild frontend only, don't start |
     | `--backend-only` | Start backend only, skip frontend |
@@ -138,15 +145,15 @@ The start scripts accept flags to control behavior:
     !!! note "Termux behavior"
         Bun's built-in `bun upgrade` command does not work on native Termux — it aborts with `'bun upgrade' is unsupported on systems without ld` because Termux uses Android's bionic libc, not glibc. On Termux:
 
-        * `--upgrade-bun` updates the Bun runtime and rebuilds the [`bun-termux`](https://github.com/Happ1ness-dev/bun-termux) wrapper at `$HOME/.bun-termux`. The upstream manager installs both through atomic renames, so an already-running wrapper does not cause Android's `Text file busy` error.
+        * `--upgrade-bun` updates the Bun runtime through [`bun-termux`](https://github.com/Happ1ness-dev/bun-termux). If the installed Bun version actually changes, Lumiverse then rebuilds the wrapper at `$HOME/.bun-termux`; if Bun is already current, the working wrapper is left untouched. The upstream manager installs updates through atomic renames, so an already-running wrapper does not cause Android's `Text file busy` error.
         * `--upgrade-bun-canary` is **not supported** — bun-termux only packages stable releases. The start script will skip the upgrade and continue with the existing binary. If you specifically need canary, run Lumiverse inside a [proot-distro Linux](https://github.com/termux/proot-distro) environment, where standard `bun upgrade --canary` works normally.
-        * If native Termux reports a broken install path before first run, the fastest repair is usually `./start.sh --upgrade-bun`, which updates the runtime and wrapper in place.
+        * If native Termux reports a broken install path, launcher validation attempts a wrapper rebuild automatically before failing the install path.
 
 === "Windows (`start.ps1`)"
 
     | Flag | Description |
     |------|-------------|
-    | *(no flags)* | Start normally; auto-upgrade Bun to latest stable when below 1.4.0 |
+    | *(no flags)* | Start normally; auto-upgrade Bun to latest stable when below 1.4.2 |
     | `-Build` or `-b` | Rebuild frontend before starting |
     | `-Mode build-only` | Rebuild frontend only |
     | `-Mode backend-only` | Start backend only |
@@ -339,7 +346,9 @@ The Docker setup uses a named volume (`lumiverse-data`) mounted at `/app/data`. 
 
 ## Configuration
 
-Lumiverse uses a `.env` file for runtime configuration (created by the setup wizard). Common options:
+For a step-by-step remote-access and mobile PWA setup, see [Remote Access with Tailscale](tailscale.md).
+
+Lumiverse uses a `.env` file for runtime configuration (created by the setup wizard). See [Environment Variables (.env)](../reference/environment-variables.md) for editing instructions, defaults, and additional settings. Common options:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -366,7 +375,7 @@ API keys and account passwords are stored encrypted in the `data/` directory rat
 
 ### Direct TLS and custom certificates
 
-Lumiverse can terminate TLS directly in Bun before requests reach Hono. A reverse proxy remains a good choice when it already manages ACME issuance and renewal, but it is no longer required when you have your own certificate.
+Lumiverse can terminate TLS directly in Bun before requests reach Hono. Direct TLS negotiates HTTP/2 or HTTP/1.1 on the same port; WebSocket clients continue to use HTTP/1.1 upgrades. A reverse proxy remains a good choice when it already manages ACME issuance and renewal, but it is no longer required when you have your own certificate.
 
 For one certificate, set a PEM full chain and matching private key:
 

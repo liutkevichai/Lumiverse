@@ -3,12 +3,14 @@ import type { AppStore, EnterToSendSettings, SettingsSlice, StartupSettings, The
 import { settingsApi } from '@/api/settings'
 import { themeAssetsApi } from '@/api/theme-assets'
 import { BASE_URL } from '@/api/client'
+import { activeTab } from '@/lib/active-tab'
 import { beginActiveLoomPresetSelection, type PresetSelectionRequest } from '@/lib/loom/preset-selection-coordinator'
 import { generateUUID } from '@/lib/uuid'
 import { DEFAULT_THEME, normalizeTheme } from '@/theme/presets'
 import { PRODUCTIVITY_DEFAULTS, migrateProductivitySetting } from '@/lib/uiProductivityDefaults'
 import { isMobileViewportOrDevice } from '@/lib/mobile'
 import { DEFAULT_IMPERSONATION_MODE, resolveImpersonationMode } from '@/lib/impersonationPreset'
+import { whistleLanguage } from '@/lib/whistle/config'
 import { createSettingsLoadGenerationGuard } from './settings-load-generation'
 import {
   deriveReorderArgs,
@@ -50,10 +52,12 @@ export const DATA_KEYS: ReadonlySet<string> = new Set([
   'saveDraftInput',
   'defaultImpersonationMode',
   'chatWidthMode',
+  'centerChatWithSidebar',
   'chatContentMaxWidth',
   'modalWidthMode',
   'modalMaxWidth',
   'portraitPanelSide',
+  'desktopPinchZoomEnabled',
   'theme',
   'drawerSettings',
   'oocEnabled',
@@ -338,6 +342,7 @@ function hasNewerLocalSetting(key: string, revisionAtLoadStart: number): boolean
 }
 
 export function persistKey(key: string, value: any, source: SettingsWriteSource = 'unknown') {
+  if (activeTab.signal.aborted) return
   const revision = ++localSettingsRevision
   localSettingRevisions.set(key, revision)
   dirtyKeys.set(key, value)
@@ -419,6 +424,7 @@ function readPendingImageGenerationPatch(): Partial<AppStore['imageGeneration']>
 export function persistPendingImageGenerationPatch(
   patch: Partial<AppStore['imageGeneration']>,
 ): void {
+  if (activeTab.signal.aborted) return
   const pending = readPendingImageGenerationPatch() ?? {}
   Object.assign(pending, patch)
   try {
@@ -427,10 +433,12 @@ export function persistPendingImageGenerationPatch(
 }
 
 function clearPendingImageGenerationPatch(): void {
+  if (activeTab.signal.aborted) return
   try { localStorage.removeItem(bridgeStorageKey(PENDING_IMAGE_GENERATION_PATCH_KEY)) } catch {}
 }
 
 function mergePendingSettings(batch: Record<string, unknown>): boolean {
+  if (activeTab.signal.aborted) return false
   const pending = readPendingSettings() ?? {}
   Object.assign(pending, batch)
   try {
@@ -459,6 +467,7 @@ export function hasPendingSetting(key: string): boolean {
 }
 
 export function updatePendingSetting(key: string, value: unknown): void {
+  if (activeTab.signal.aborted) return
   const pending = readPendingSettings()
   if (!pending || !Object.prototype.hasOwnProperty.call(pending, key)) return
   pending[key] = value
@@ -468,6 +477,7 @@ export function updatePendingSetting(key: string, value: unknown): void {
 }
 
 export function clearPendingSettings(persisted: Record<string, unknown>): void {
+  if (activeTab.signal.aborted) return
   const pending = readPendingSettings()
   if (!pending) return
 
@@ -531,6 +541,7 @@ function migrateStoredSettingValue(key: string, value: any): any {
 
 /** Immediately flush any pending settings (e.g. on page unload). */
 export function flushSettings() {
+  if (activeTab.signal.aborted) return
   if (flushTimer !== null) {
     clearTimeout(flushTimer)
     flushTimer = null
@@ -693,10 +704,12 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
   saveDraftInput: false,
   defaultImpersonationMode: DEFAULT_IMPERSONATION_MODE,
   chatWidthMode: 'full',
+  centerChatWithSidebar: false,
   chatContentMaxWidth: 900,
   modalWidthMode: 'full',
   modalMaxWidth: 900,
   portraitPanelSide: 'right',
+  desktopPinchZoomEnabled: false,
   theme: null,
   characterThemeOverlay: null,
   drawerSettings: {
@@ -708,6 +721,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
     showTabLabels: true,
     hiddenTabIds: [],
     tabOrder: [],
+    layout: [],
   },
   oocEnabled: true,
   lumiaOOCStyle: 'social',
@@ -869,8 +883,16 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
   setVoiceSettings: (partial) =>
     set((state) => {
       const voiceSettings = { ...state.voiceSettings, ...partial }
-      if (partial.sttProvider === 'webspeech') {
+      if (partial.sttProvider === 'webspeech' || partial.sttProvider === 'whistle') {
         voiceSettings.sttConnectionId = null
+      }
+      if (partial.sttProvider === 'whistle') {
+        voiceSettings.sttLanguage = whistleLanguage(voiceSettings.sttLanguage) || 'auto'
+      } else if (partial.sttProvider) {
+        const locales: Record<string, string> = {
+          auto: 'en-US', en: 'en-US', de: 'de-DE', fr: 'fr-FR', es: 'es-ES', it: 'it-IT', nl: 'nl-NL', pl: 'pl-PL',
+        }
+        voiceSettings.sttLanguage = locales[voiceSettings.sttLanguage] || voiceSettings.sttLanguage
       }
       if (partial.speechDetectionRules) {
         voiceSettings.speechDetectionRules = { ...state.voiceSettings.speechDetectionRules, ...partial.speechDetectionRules }
@@ -1028,6 +1050,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
       // explicit field in the pack remains authoritative.
       const theme = {
         ...packTheme,
+        name: pack.name?.trim() || packTheme.name,
         desktopBackground: packTheme.desktopBackground ?? get().theme?.desktopBackground,
         renderingMode: pack.theme?.renderingMode ?? get().theme?.renderingMode,
       }
@@ -1069,13 +1092,42 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
   },
 
   renameSavedTheme: (id, name) => {
-    const trimmed = name.trim()
+    const trimmed = name.trim().slice(0, 200)
     if (!trimmed) return
-    const savedThemes = get().savedThemes.map((entry) =>
-      entry.id === id ? { ...entry, name: trimmed.slice(0, 200) } : entry
-    )
+    const existing = get().savedThemes.find((entry) => entry.id === id)
+    if (!existing) return
+    const savedThemes = get().savedThemes.map((entry) => {
+      if (entry.id !== id) return entry
+      if (entry.kind === 'config') {
+        return { ...entry, name: trimmed, theme: { ...entry.theme, name: trimmed } }
+      }
+      return {
+        ...entry,
+        name: trimmed,
+        pack: {
+          ...entry.pack,
+          name: trimmed,
+          theme: entry.pack.theme ? { ...entry.pack.theme, name: trimmed } : null,
+        },
+      }
+    })
     set({ savedThemes })
     persistKey('savedThemes', savedThemes)
+
+    // Keep the live ThemeConfig aligned when the renamed bundle is active.
+    // This also repairs packs created before saved-theme names were canonical.
+    if (
+      existing.kind === 'pack'
+      && existing.pack.bundleId
+      && existing.pack.bundleId === get().customCSS.bundleId
+      && get().theme
+    ) {
+      get().setTheme({ ...get().theme!, name: trimmed })
+    } else if (existing.kind === 'config' && get().theme === existing.theme) {
+      // Newly saved config themes retain object identity until hydration, so
+      // the inline rename can immediately become the live theme name too.
+      get().setTheme({ ...existing.theme, name: trimmed })
+    }
   },
 
   deleteSavedTheme: async (id) => {
@@ -1106,12 +1158,17 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
     if (entry.kind === 'config') {
       const theme = {
         ...entry.theme,
+        name: entry.name,
         desktopBackground: entry.theme.desktopBackground ?? get().theme?.desktopBackground,
         renderingMode: entry.theme.renderingMode ?? get().theme?.renderingMode,
       }
       get().setTheme(theme)
     } else {
-      get().applyThemePack(entry.pack)
+      get().applyThemePack({
+        ...entry.pack,
+        name: entry.name,
+        theme: entry.pack.theme ? { ...entry.pack.theme, name: entry.name } : null,
+      })
     }
   },
 
@@ -1121,7 +1178,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
     const savedThemes = state.savedThemes.map((entry) => {
       if (entry.id !== id) return entry
       if (entry.kind === 'config') {
-        return { ...entry, theme: currentTheme } as typeof entry
+        return { ...entry, theme: { ...currentTheme, name: entry.name } } as typeof entry
       }
 
       // A pack owns all three theme layers. Saving only its ThemeConfig made
@@ -1140,7 +1197,8 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
         ...entry,
         pack: {
           ...entry.pack,
-          theme: currentTheme,
+          name: entry.name,
+          theme: { ...currentTheme, name: entry.name },
           globalCSS: state.customCSS.css || '',
           components,
         },
@@ -1286,6 +1344,9 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
       // generateThemeVariables / ThemePanel and white-screen the app on load.
       if (patch.theme) {
         patch.theme = normalizeTheme(patch.theme)
+      }
+      if ('desktopPinchZoomEnabled' in patch) {
+        patch.desktopPinchZoomEnabled = patch.desktopPinchZoomEnabled === true
       }
       if (patch.filterTab === 'all') {
         patch.filterTab = 'characters'

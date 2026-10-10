@@ -13,8 +13,8 @@
       "tabHeaderTitle": "理性"
     },
     "loom": {
-      "shortName": "織機",
-      "tabName": "織機",
+      "shortName": "プリセット",
+      "tabName": "プリセット",
       "tabDescription": "物語の構造とストーリーのビートを設定する",
       "tabHeaderTitle": "織機"
     },
@@ -1383,7 +1383,6 @@
     "cancel": "キャンセル",
     "dropToImport": "インポートするキャラクター ファイルをドロップ",
     "dropFileTypes": ".json、.png、.charx、.jpg",
-    "desktopDropReadFailed": "Lumiverse Desktop はドロップされたファイルを読み取れませんでした。",
     "tagFilter": {
       "label": "タグ",
       "labelWithCount": "タグ ({{count}})",

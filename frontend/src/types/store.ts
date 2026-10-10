@@ -98,13 +98,15 @@ export interface ChatSlice {
   setUnseenSwipe: (messageId: string, swipeId: number) => void
   /** Clear the unseen-swipe flag for a message (e.g. once the user views it). */
   clearUnseenSwipe: (messageId: string) => void
-  endStreaming: () => void
+  endStreaming: (message?: Message) => void
   stopStreaming: () => void
   setStreamingError: (error: string | null) => void
   /** Set the regenerating message ID independently (e.g. when council sidecar stages a message after streaming started) */
   setRegeneratingMessageId: (messageId: string | null) => void
   /** Mark a generation ID as ended (prevents zombie resurrection from late HTTP responses) */
-  markGenerationEnded: (generationId: string) => void
+  markGenerationEnded: (generationId: string, completed?: boolean) => void
+  hasGenerationEnded: (generationId: string) => boolean
+  getGenerationEpoch: () => number
   /** Set impersonate draft content (from completed impersonate-draft generation) */
   setImpersonateDraftContent: (content: string | null) => void
 
@@ -216,6 +218,7 @@ export interface ResolvedPersonaBinding {
 
 export interface PersonasSlice {
   personas: Persona[]
+  personasLoaded: boolean
   activePersonaId: string | null
   /** Persona ids ordered by most recent activation, independent of edit timestamps. */
   recentPersonaIds: string[]
@@ -291,6 +294,8 @@ export interface UISlice {
   error: string | null
   drawerOpen: boolean
   drawerTab: string | null
+  councilView: import('@/lib/council-navigation').CouncilView
+  setCouncilView: (view: import('@/lib/council-navigation').CouncilView) => void
   settingsModalOpen: boolean
   settingsActiveView: string
   settingsScrollTarget: { extensionId?: string; anchorId?: string; nonce: number } | null
@@ -769,10 +774,13 @@ export interface SettingsSlice {
   saveDraftInput: boolean
   defaultImpersonationMode: ImpersonationPreference
   chatWidthMode: 'full' | 'comfortable' | 'compact' | 'custom'
+  centerChatWithSidebar: boolean
   chatContentMaxWidth: number
   modalWidthMode: 'full' | 'comfortable' | 'compact' | 'custom'
   modalMaxWidth: number
   portraitPanelSide: 'left' | 'right' | 'none'
+  /** Explicit opt-in for temporary desktop viewport magnification. */
+  desktopPinchZoomEnabled: boolean
   theme: ThemeConfig | null
   characterThemeOverlay: CharacterThemeOverlay | null
   drawerSettings: DrawerSettings
@@ -877,16 +885,54 @@ export type { ThemeConfig } from './theme'
 import type { CharacterThemeOverlay } from './theme'
 export type { CharacterThemeOverlay } from './theme'
 
+export type DrawerCustomIconTag = 'path' | 'circle' | 'rect' | 'line' | 'polyline' | 'polygon' | 'ellipse'
+
+export interface DrawerCustomIconElement {
+  tag: DrawerCustomIconTag
+  attrs: Record<string, string>
+}
+
+/** Sanitized, resource-free SVG data. Never stores raw SVG markup. */
+export interface DrawerCustomIconData {
+  viewBox: string
+  attrs: Record<string, string>
+  elements: DrawerCustomIconElement[]
+}
+
+export type DrawerLayoutItem =
+  | {
+      type: 'tab'
+      tabId: string
+    }
+  | {
+      type: 'divider'
+      id: string
+      label?: string
+    }
+  | {
+      type: 'folder'
+      id: string
+      name: string
+      icon?: string
+      customIcon?: DrawerCustomIconData
+      view?: 'list' | 'grid'
+      children: string[]
+    }
+
 export interface DrawerSettings {
   side: 'left' | 'right'
   verticalPosition: number
   tabSize: 'large' | 'compact'
   panelWidthMode: 'default' | 'custom'
   customPanelWidth: number
+  /** Drag-resized width in layout pixels. Legacy vw widths are used until the first resize. */
+  panelWidthPx?: number
   showTabLabels: boolean
   hiddenTabIds: string[]
-  /** User-defined order of tab IDs. Unknown IDs are ignored; new tabs append in registry order. */
+  /** Legacy flat tab order retained for downgrade compatibility and migration. */
   tabOrder: string[]
+  /** Ordered sidebar layout. Tabs may live at root or inside one-level folders. */
+  layout: DrawerLayoutItem[]
 }
 
 export interface SpindleSettings {
@@ -1277,7 +1323,7 @@ export interface SpindleSlice {
   updateExtension: (id: string) => Promise<void>
   switchBranch: (id: string, branch: string) => Promise<void>
   removeExtension: (id: string) => Promise<void>
-  enableExtension: (id: string) => Promise<void>
+  enableExtension: (id: string, approvedPermissions?: string[]) => Promise<void>
   disableExtension: (id: string) => Promise<void>
   restartExtension: (id: string) => Promise<void>
   grantPermission: (id: string, permission: string) => Promise<void>
@@ -1758,7 +1804,7 @@ export interface SpeechDetectionRules {
 }
 
 export interface VoiceSettings {
-  sttProvider: 'webspeech' | 'connection'
+  sttProvider: 'webspeech' | 'connection' | 'whistle'
   sttLanguage: string
   sttContinuous: boolean
   sttInterimResults: boolean

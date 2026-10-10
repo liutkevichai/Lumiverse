@@ -5,6 +5,8 @@ import { Send, RotateCw, CornerDownLeft, Square, FilePlus, Eye, UserCircle, Comp
 import { IconPlaylistAdd } from '@tabler/icons-react'
 import { useStore } from '@/store'
 import { sendRoomAction } from '@/ws/relayClient'
+import { wsClient } from '@/ws/client'
+import { EventType } from '@/types/ws-events'
 import { messagesApi, chatsApi } from '@/api/chats'
 import { presetsApi } from '@/api/presets'
 import { presetProfilesApi, type PresetProfileBinding } from '@/api/preset-profiles'
@@ -74,7 +76,11 @@ import {
   type RegexActionActivation,
 } from '@/lib/regex/actionBus'
 import { createSTTEngine, getSupportedSTTAudioFormat, isWebSpeechAvailable, type STTAudioFrame, type STTEngine } from '@/lib/sttEngine'
+import { isWhistleAvailable } from '@/lib/whistle/config'
+import { whistleClient } from '@/lib/whistle/client'
 import { composeChatSafeZones } from '@/lib/chatSurfaceLayout'
+import { createComposerTouchFocusHandlers } from '@/lib/iosKeyboardScroll'
+import { observeComposerMotion } from '@/lib/composerMotion'
 import { renderedPxToLayoutPx } from '@/lib/uiScale'
 import { applyChatAppearance } from '@/lib/chatAppearance'
 import {
@@ -98,6 +104,10 @@ import InputAreaCustomizeModal, {
 import { ComposerActionBarLive } from './InputAreaComposerBar'
 import { isCoreOwnedComposerActionId, isExtensionComposerActionId } from './composerActionOwnership'
 import { isGuideActive, isGuideAutoEnabled } from '@/lib/guided-generations'
+import {
+  chatHasDisplayableExpressions,
+  getChatExpressionCharacterIds,
+} from '@/lib/chatExpressionAvailability'
 
 interface InputAreaProps {
   chatId: string
@@ -459,14 +469,32 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
     mutedCharacterIds,
   ])
 
-  // Track whether the active character has expressions configured
+  // Track whether the solo character or any group member has expressions configured.
   const [hasExpressions, setHasExpressions] = useState(false)
+  const expressionCharacterIds = useMemo(
+    () => getChatExpressionCharacterIds(activeCharacterId, isGroupChat, groupCharacterIds),
+    [activeCharacterId, groupCharacterIds, isGroupChat],
+  )
   useEffect(() => {
-    if (!activeCharacterId) { setHasExpressions(false); return }
-    expressionsApi.get(activeCharacterId)
-      .then((cfg) => setHasExpressions(!!cfg?.enabled && Object.keys(cfg.mappings || {}).length > 0))
-      .catch(() => setHasExpressions(false))
-  }, [activeCharacterId])
+    let cancelled = false
+
+    const refresh = async () => {
+      const available = await chatHasDisplayableExpressions(expressionCharacterIds, expressionsApi.get)
+      if (!cancelled) setHasExpressions(available)
+    }
+
+    setHasExpressions(false)
+    void refresh()
+
+    const unsubscribe = wsClient.on(EventType.CHARACTER_EDITED, (payload: { id: string }) => {
+      if (expressionCharacterIds.includes(payload.id)) void refresh()
+    })
+
+    return () => {
+      cancelled = true
+      unsubscribe()
+    }
+  }, [expressionCharacterIds])
 
   // Track alternate fields for the active character or group members.
   type AltFieldVariant = { id: string; label: string; content: string }
@@ -981,7 +1009,10 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
   // iPhone-specific: match input bar bottom corners to device screen curvature
   const screenCornerRadius = useDeviceFrameRadius()
   const [inputFocused, setInputFocused] = useState(false)
+  const composerTouchFocus = useMemo(createComposerTouchFocusHandlers, [])
   const [sttStatus, setSttStatus] = useState<'idle' | 'starting' | 'listening' | 'processing'>('idle')
+  const [sttLoadingProgress, setSttLoadingProgress] = useState<number | null>(null)
+  const sttSessionConfigRef = useRef<{ provider: string; language: string; connectionId: string | null } | null>(null)
   const [sttAudioFrame, setSttAudioFrame] = useState<STTAudioFrame | null>(null)
   const sttEngineRef = useRef<STTEngine | null>(null)
   const sttDraftBaseRef = useRef('')
@@ -993,16 +1024,26 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
 
   const isSTTSupported = useMemo(() => {
     if (voiceSettings.sttProvider === 'webspeech') return isWebSpeechAvailable()
+    if (voiceSettings.sttProvider === 'whistle') return isWhistleAvailable()
     return getSupportedSTTAudioFormat() != null && typeof navigator !== 'undefined' && !!navigator.mediaDevices?.getUserMedia
   }, [voiceSettings.sttProvider])
+  useEffect(() => {
+    if (voiceSettings.sttProvider === 'whistle' && isSTTSupported) {
+      // Prepare during normal chat use, without opening the microphone.
+      void whistleClient.prepare().catch(() => {})
+    }
+  }, [voiceSettings.sttProvider, isSTTSupported])
   const isListeningToSTT = sttStatus === 'starting' || sttStatus === 'listening' || sttStatus === 'processing'
   const showSTTIndicator = isListeningToSTT
   const sttIndicatorLabel = useMemo(() => {
+    if (sttStatus === 'starting' && voiceSettings.sttProvider === 'whistle' && sttLoadingProgress !== null) {
+      return t('input.sttWhistleLoading', { percent: Math.round(sttLoadingProgress * 100) })
+    }
     if (sttStatus === 'starting') return voiceSettings.sttProvider === 'webspeech' ? t('input.sttStartingMic') : t('input.sttPreparingRecording')
     if (sttStatus === 'processing') return voiceSettings.sttProvider === 'webspeech' ? t('input.sttFinalizingTranscript') : t('input.sttTranscribingAudio')
     if (sttStatus === 'listening') return voiceSettings.sttProvider === 'webspeech' ? t('input.sttListening') : t('input.sttRecording')
     return ''
-  }, [sttStatus, voiceSettings.sttProvider, t])
+  }, [sttStatus, voiceSettings.sttProvider, sttLoadingProgress, t])
   const sttVisualizerBars = sttAudioFrame?.frequencies?.length ? sttAudioFrame.frequencies : STT_IDLE_BARS
   const sttVisualizerLevel = sttAudioFrame ? Math.max(sttAudioFrame.amplitude, sttAudioFrame.peak * 0.65) : 0.16
 
@@ -1053,7 +1094,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
     const pendingSelection = pendingSelectionRef.current
     if (!pendingSelection) return
     pendingSelectionRef.current = null
-    ta.focus()
+    ta.focus({ preventScroll: true })
     ta.setSelectionRange(pendingSelection.start, pendingSelection.end, pendingSelection.direction)
     syncTextareaMirrorScroll()
   }, [text, resizeTextarea, syncTextareaMirrorScroll])
@@ -1418,7 +1459,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
     const syncHiddenEditSafeZone = () => {
       const rootStyle = getComputedStyle(root)
       const keyboardInset = parseFloat(rootStyle.getPropertyValue('--app-keyboard-inset-bottom')) || 0
-      const zones = composeChatSafeZones(16, 0, keyboardInset)
+      const zones = composeChatSafeZones(16, 0, renderedPxToLayoutPx(keyboardInset))
       parent.style.setProperty('--lcs-composer-safe-zone', `${Math.round(zones.composerSafeZone)}px`)
       parent.style.setProperty('--lcs-input-safe-zone', `${Math.round(zones.inputSafeZone)}px`)
     }
@@ -1458,7 +1499,6 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
     const parent = el.parentElement
     if (!parent) return
     const root = document.documentElement
-    const isIOSPwa = document.documentElement.hasAttribute('data-ios-pwa')
     const loreMount = el.querySelector<HTMLElement>('[data-spindle-mount="chat_composer_above"]')
 
     const measureLoreHeight = () => {
@@ -1475,26 +1515,23 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
       const loreHeight = measureLoreHeight()
       const h = el.offsetHeight
       const composerHeight = Math.max(0, h - loreHeight) + 8
-      // On iOS PWA, read --app-keyboard-inset-bottom directly instead of
-      // getComputedStyle(el).bottom. The CSS `bottom` property transitions,
-      // so the computed value may be mid-animation when the ResizeObserver
-      // fires (triggered by the instant padding-bottom change). The CSS
-      // variable is set synchronously by JS and always reflects the final value.
-      let bottomOffset: number
-      if (isIOSPwa) {
-        const rootStyle = getComputedStyle(root)
-        bottomOffset = parseFloat(rootStyle.getPropertyValue('--app-keyboard-inset-bottom')) || 0
-      } else {
-        bottomOffset = parseFloat(getComputedStyle(el).bottom) || 12
-      }
+      // Use the animated position, so list padding and composer move together.
+      // Zero is valid for edge-to-edge PWA composers.
+      const measuredBottom = parseFloat(getComputedStyle(el).bottom)
+      const bottomOffset = Number.isFinite(measuredBottom) ? measuredBottom : 12
       const zones = composeChatSafeZones(composerHeight, loreHeight, bottomOffset)
-      parent.style.setProperty('--lcs-composer-safe-zone', `${zones.composerSafeZone}px`)
-      parent.style.setProperty('--lcs-input-safe-zone', `${zones.inputSafeZone}px`)
+      const publish = (name: string, value: number) => {
+        const next = `${Math.round(value)}px`
+        if (parent.style.getPropertyValue(name) !== next) parent.style.setProperty(name, next)
+      }
+      publish('--lcs-composer-safe-zone', zones.composerSafeZone)
+      publish('--lcs-input-safe-zone', zones.inputSafeZone)
     }
 
     const ro = new ResizeObserver(update)
     ro.observe(el)
     if (loreMount) ro.observe(loreMount)
+    const stopObservingMotion = observeComposerMotion(el, update)
     update()
 
     // On iOS PWA, the virtual keyboard changes `bottom` via CSS variable but
@@ -1507,7 +1544,9 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
       cancelAnimationFrame(vpFrame)
       vpFrame = requestAnimationFrame(update)
     }
-    const rootObserver = new MutationObserver(onViewportResize)
+    // Root writes already contain main.tsx's latest inset. Measure before
+    // paint, including when reduced motion makes the bottom change instant.
+    const rootObserver = new MutationObserver(update)
     rootObserver.observe(root, { attributes: true, attributeFilter: ['style'] })
     window.addEventListener('resize', onViewportResize)
     window.visualViewport?.addEventListener('resize', onViewportResize)
@@ -1515,6 +1554,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
 
     return () => {
       ro.disconnect()
+      stopObservingMotion()
       cancelAnimationFrame(vpFrame)
       rootObserver.disconnect()
       window.removeEventListener('resize', onViewportResize)
@@ -1851,7 +1891,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
       if (saveDraftInput) { try { localStorage.removeItem(DRAFT_KEY_PREFIX + chatId) } catch {} }
     }
     requestAnimationFrame(() => {
-      if (textareaRef.current) { resizeTextarea(textareaRef.current); textareaRef.current.focus() }
+      if (textareaRef.current) { resizeTextarea(textareaRef.current); textareaRef.current.focus({ preventScroll: true }) }
     })
     return 'sent'
   }, [text, chatId, saveDraftInput, resizeTextarea, finalizeRegexSelections])
@@ -1892,7 +1932,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
     requestAnimationFrame(() => {
       if (textareaRef.current) {
         resizeTextarea(textareaRef.current)
-        textareaRef.current.focus()
+        textareaRef.current.focus({ preventScroll: true })
       }
     })
 
@@ -1971,7 +2011,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
     requestAnimationFrame(() => {
       if (textareaRef.current) {
         resizeTextarea(textareaRef.current)
-        textareaRef.current.focus()
+        textareaRef.current.focus({ preventScroll: true })
       }
     })
 
@@ -2137,7 +2177,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
         setText((current) => applyRegexActionDraft(current, { content: action.content, mode: 'append' }))
         requestAnimationFrame(() => {
           resizeTextarea(textareaRef.current)
-          textareaRef.current?.focus()
+          textareaRef.current?.focus({ preventScroll: true })
         })
         toast.info(action.subtitle || t('toast.regexActionDraftQueued'), {
           title: action.title || t('toast.regexActionSelected'),
@@ -2172,7 +2212,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
             title: action.title || t('toast.regexActionSelected'),
             duration: 2500,
           })
-          textareaRef.current?.focus()
+          textareaRef.current?.focus({ preventScroll: true })
           return
         }
         if (action.type === 'effects') {
@@ -2190,7 +2230,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
             setText((current) => applyRegexActionDraft(current, draft))
             requestAnimationFrame(() => {
               resizeTextarea(textareaRef.current)
-              textareaRef.current?.focus()
+              textareaRef.current?.focus({ preventScroll: true })
             })
           }
           toast.info(action.subtitle || t('toast.regexActionEffectsApplied'), {
@@ -2234,7 +2274,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
             title: action.title || t('toast.regexActionSelected'),
             duration: 2500,
           })
-          textareaRef.current?.focus()
+          textareaRef.current?.focus({ preventScroll: true })
           return
         }
         await handleSend(action.content, action)
@@ -2964,6 +3004,12 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
 
   const handleSTTToggle = useCallback(async () => {
     if (isListeningToSTT) {
+      if (voiceSettings.sttProvider === 'whistle' && (sttStatus === 'starting' || sttStatus === 'processing')) {
+        stopSTTSession('destroy')
+        setSttStatus('idle')
+        setSttLoadingProgress(null)
+        return
+      }
       setSttStatus('processing')
       stopSTTSession('stop')
       return
@@ -2986,6 +3032,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
 
     try {
       setSttStatus('starting')
+      setSttLoadingProgress(null)
       setSttAudioFrame(null)
       sttDraftBaseRef.current = text.trimEnd()
       sttInterimTextRef.current = ''
@@ -3004,12 +3051,23 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
       })
       sttEngineRef.current?.destroy()
       sttEngineRef.current = engine
+      sttSessionConfigRef.current = {
+        provider: voiceSettings.sttProvider, language: voiceSettings.sttLanguage, connectionId: voiceSettings.sttConnectionId,
+      }
+
+      engine.onStatus?.((status) => {
+        if (sttEngineRef.current !== engine) return
+        setSttLoadingProgress(status.phase === 'loading' ? status.progress ?? 0 : null)
+        setSttStatus(status.phase === 'loading' ? 'starting' : status.phase)
+      })
 
       engine.onAudioFrame((frame) => {
+        if (sttEngineRef.current !== engine) return
         setSttAudioFrame(frame)
       })
 
       engine.onResult((result) => {
+        if (sttEngineRef.current !== engine) return
         if (result.isFinal) {
           const { text: commandStrippedText, shouldSend } = stripSTTSendCommand(result.text)
           if (shouldSend) sttShouldSendRef.current = true
@@ -3029,11 +3087,14 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
       })
 
       engine.onStop(() => {
+        if (sttEngineRef.current !== engine) return
+        setSttLoadingProgress(null)
         setSttAudioFrame(null)
         void finalizeSTTTranscript()
       })
 
       engine.onError((err) => {
+        if (sttEngineRef.current !== engine) return
         const msg = err.message || 'Speech-to-text failed'
         stopSTTSession('destroy')
         sttInterimTextRef.current = ''
@@ -3047,13 +3108,30 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
       })
 
       await engine.start()
+      if (sttEngineRef.current !== engine) return
       setSttStatus(engine.isListening() ? 'listening' : 'idle')
     } catch (err: any) {
       stopSTTSession('destroy')
       setSttStatus('idle')
       toast.error(err?.message || t('toast.sttFailed'), { title: t('toast.sttFailed') })
     }
-  }, [isListeningToSTT, isSTTSupported, voiceSettings, text, openModal, applySTTTranscript, stopSTTSession, finalizeSTTTranscript, t])
+  }, [isListeningToSTT, isSTTSupported, sttStatus, voiceSettings, text, openModal, applySTTTranscript, stopSTTSession, finalizeSTTTranscript, t])
+
+  useEffect(() => {
+    const config = sttSessionConfigRef.current
+    if (sttEngineRef.current && config && (config.provider !== voiceSettings.sttProvider
+      || config.language !== voiceSettings.sttLanguage || config.connectionId !== voiceSettings.sttConnectionId)) {
+      stopSTTSession('destroy')
+      setSttStatus('idle')
+      setSttLoadingProgress(null)
+    }
+  }, [voiceSettings.sttProvider, voiceSettings.sttLanguage, voiceSettings.sttConnectionId, stopSTTSession])
+
+  useEffect(() => {
+    stopSTTSession('destroy')
+    setSttStatus('idle')
+    setSttLoadingProgress(null)
+  }, [chatId, stopSTTSession])
 
   useEffect(() => {
     if (isGeneratingInChat && isListeningToSTT) {
@@ -4333,10 +4411,12 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
             '--stt-glow-x': `${12 + sttVisualizerLevel * 12}%`,
             '--stt-glow-size': `${10 + sttVisualizerLevel * 24}px`,
           } as CSSProperties}
-          onClick={sttStatus === 'processing' ? undefined : handleSTTToggle}
-          disabled={sttStatus === 'processing'}
-          title={sttStatus === 'processing' ? t('input.processingSpeech') : t('input.stopStt')}
-          aria-label={sttStatus === 'processing' ? t('input.processingSpeech') : t('input.stopStt')}
+          onClick={sttStatus === 'processing' && voiceSettings.sttProvider !== 'whistle' ? undefined : handleSTTToggle}
+          disabled={sttStatus === 'processing' && voiceSettings.sttProvider !== 'whistle'}
+          title={voiceSettings.sttProvider === 'whistle' && (sttStatus === 'starting' || sttStatus === 'processing')
+            ? t('input.sttCancel') : sttStatus === 'processing' ? t('input.processingSpeech') : t('input.stopStt')}
+          aria-label={voiceSettings.sttProvider === 'whistle' && (sttStatus === 'starting' || sttStatus === 'processing')
+            ? t('input.sttCancel') : sttStatus === 'processing' ? t('input.processingSpeech') : t('input.stopStt')}
           aria-live="polite"
         >
           <span className={styles.sttRecordingStatus}>
@@ -4365,7 +4445,8 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
             })}
           </span>
           <span className={styles.sttRecordingHint}>
-            {sttStatus === 'processing' ? t('input.transcribing') : t('input.tapToStopTranscribe')}
+            {voiceSettings.sttProvider === 'whistle' && (sttStatus === 'starting' || sttStatus === 'processing')
+              ? t('input.sttTapToCancel') : sttStatus === 'processing' ? t('input.transcribing') : t('input.tapToStopTranscribe')}
           </span>
         </button>
       ) : (
@@ -4418,6 +4499,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
               onPaste={handlePaste}
               onCompositionStart={handleCompositionStart}
               onCompositionEnd={handleCompositionEnd}
+              {...composerTouchFocus}
               onFocus={() => setInputFocused(true)}
               onBlur={() => setInputFocused(false)}
               placeholder={t('input.placeholder')}

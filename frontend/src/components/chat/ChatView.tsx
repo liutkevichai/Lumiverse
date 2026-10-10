@@ -155,7 +155,8 @@ export default function ChatView() {
   const togglePortraitPanel = useStore((s) => s.togglePortraitPanel)
   const portraitPanelSide = useStore((s) => s.portraitPanelSide)
   const suiteExtensionEnabled = useStore((s) => hasEnabledFrontendExtension(s.extensions, 'lumiverse_suite'))
-  const [portraitSurfaceOccupied, setPortraitSurfaceOccupied] = useState(false)
+  const [portraitSurfaceMounted, setPortraitSurfaceMounted] = useState(false)
+  const portraitSurfaceOccupied = suiteExtensionEnabled && portraitSurfaceMounted
   const quickToolbarSettings = useStore((s) => s.quickToolbarSettings)
   const nativeDockActionSide = suiteExtensionEnabled
     ? (quickToolbarSettings?.nativeDockActionSide === 'left' ? 'left' : 'right')
@@ -194,8 +195,8 @@ export default function ChatView() {
       // therefore miss the live owner and briefly restore the native dock. The
       // host-surface marker is unique to the extension-owned Portrait Dock, so it
       // is the ownership authority regardless of which current anchor contains it.
-      setPortraitSurfaceOccupied(Boolean(
-        document.querySelector('[data-spindle-host-surface="portrait_dock.workspace"]'),
+      setPortraitSurfaceMounted(Boolean(
+        document.querySelector('[data-spindle-host-surface="portrait_dock.workspace"] [data-surface-id="portrait_dock.workspace"]'),
       ))
       // Same authority rule for the shared oldest-message action: the rendered
       // control decides ownership, not the persisted toolbar setting. The
@@ -216,8 +217,10 @@ export default function ChatView() {
   const wallpaper = useStore((s) => s.wallpaper)
   const useCharacterBackground = useStore((s) => s.useCharacterBackground)
   const chatWidthMode = useStore((s) => s.chatWidthMode)
+  const centerChatWithSidebar = useStore((s) => s.centerChatWithSidebar)
   const chatContentMaxWidth = useStore((s) => s.chatContentMaxWidth)
   const videoRef = useRef<HTMLVideoElement>(null)
+  const chatBodyRef = useRef<HTMLDivElement>(null)
   const chatColumnInnerRef = useRef<HTMLDivElement>(null)
   const chatColumnTopRef = useRef<HTMLDivElement>(null)
   const chatTopDockRef = useRef<HTMLDivElement>(null)
@@ -646,6 +649,7 @@ export default function ChatView() {
     if (!chatId) return
 
     let cancelled = false
+    let stopPersonaResolution = () => {}
 
     const loadChat = async () => {
       // Multiplayer peers don't own this chat — the host's instance can't be
@@ -804,69 +808,82 @@ export default function ChatView() {
         // character/tag auto-bindings, then the default persona. Temporary
         // chats are persona-less — leave the global persona alone.
         if (chat.metadata?.temporary !== true) {
-          const {
-            characterPersonaBindings,
-            personaTagBindings,
-            personas: allPersonas,
-            setActivePersona,
-            activePersonaId,
-            setActiveChatMetadata,
-          } = useStore.getState()
-          const resolvedPersona = resolveChatPersonaSelection({
-            metadata: chat.metadata,
-            characterId: chat.character_id,
-            characterTags: openedCharacter?.tags ?? [],
-            personas: allPersonas,
-            characterPersonaBindings,
-            personaTagBindings,
-          })
-          const resolvedChatPersona = resolvedPersona.personaId
-            ? allPersonas.find((p) => p.id === resolvedPersona.personaId) ?? null
-            : null
-
-          if (resolvedPersona.persistedPersonaStale) {
-            const nextMetadata = setPersistedChatPersonaId(chat.metadata, null)
-            chat.metadata = nextMetadata ?? {}
-            if (!cancelled) {
-              setActiveChatMetadata(nextMetadata)
+          const resolvePersona = () => {
+            const state = useStore.getState()
+            if (cancelled || state.activeChatId !== chatId) {
+              stopPersonaResolution()
+              return
             }
-            chatsApi.patchMetadata(chatId, { [CHAT_PERSONA_METADATA_KEY]: null }).catch(() => {})
-          }
+            if (!state.personasLoaded || !state.fullSettingsLoaded) return
+            stopPersonaResolution()
+            chat.metadata = state.activeChatMetadata ?? {}
+            if (chat.metadata.temporary === true) return
+            const {
+              characterPersonaBindings,
+              personaTagBindings,
+              personas: allPersonas,
+              setActivePersona,
+              activePersonaId,
+              setActiveChatMetadata,
+            } = useStore.getState()
+            const resolvedPersona = resolveChatPersonaSelection({
+              metadata: chat.metadata,
+              characterId: chat.character_id,
+              characterTags: openedCharacter?.tags ?? [],
+              personas: allPersonas,
+              characterPersonaBindings,
+              personaTagBindings,
+            })
+            const resolvedChatPersona = resolvedPersona.personaId
+              ? allPersonas.find((p) => p.id === resolvedPersona.personaId) ?? null
+              : null
 
-          if (!cancelled && activePersonaId !== resolvedPersona.personaId) {
-            setActivePersona(resolvedPersona.personaId)
-            if (resolvedChatPersona && resolvedPersona.source !== 'default') {
-              toast.info(t('chatView.switchedPersona', { name: personaToastName(resolvedChatPersona) }))
+            if (resolvedPersona.persistedPersonaStale) {
+              const nextMetadata = setPersistedChatPersonaId(chat.metadata, null)
+              chat.metadata = nextMetadata ?? {}
+              if (!cancelled) {
+                setActiveChatMetadata(nextMetadata)
+              }
+              chatsApi.patchMetadata(chatId, { [CHAT_PERSONA_METADATA_KEY]: null }).catch(() => {})
             }
-          }
 
-          if (
-            (resolvedPersona.source === 'character' || resolvedPersona.source === 'tag') &&
-            resolvedChatPersona &&
-            resolvedPersona.addonStates &&
-            Object.keys(resolvedPersona.addonStates).length > 0 &&
-            !cancelled
-          ) {
-            // Apply the binding's add-on snapshot so the bound selections take
-            // effect and are visible in this chat. Seed only when the chat has
-            // no per-chat states for the persona yet, so a fresh chat picks up
-            // the binding while later in-chat tweaks are never clobbered.
+            if (!cancelled && activePersonaId !== resolvedPersona.personaId) {
+              setActivePersona(resolvedPersona.personaId)
+              if (resolvedChatPersona && resolvedPersona.source !== 'default') {
+                toast.info(t('chatView.switchedPersona', { name: personaToastName(resolvedChatPersona) }))
+              }
+            }
+
             if (
+              (resolvedPersona.source === 'character' || resolvedPersona.source === 'tag') &&
+              resolvedChatPersona &&
               resolvedPersona.addonStates &&
-              Object.keys(resolvedPersona.addonStates).length > 0
+              Object.keys(resolvedPersona.addonStates).length > 0 &&
+              !cancelled
             ) {
-              const existing = (chat.metadata?.persona_addon_states ?? {}) as Record<string, Record<string, boolean>>
-              if (!existing[resolvedChatPersona.id]) {
-                const nextStates = { ...existing, [resolvedChatPersona.id]: { ...resolvedPersona.addonStates } }
-                // Fold into chat.metadata and re-publish the snapshot (the
-                // canonical publish already happened alongside setMessages);
-                // persist for future opens.
-                chat.metadata = { ...(chat.metadata ?? {}), persona_addon_states: nextStates }
-                useStore.getState().setActiveChatMetadata(chat.metadata)
-                chatsApi.patchMetadata(chatId, { persona_addon_states: nextStates }).catch(() => {})
+              // Apply the binding's add-on snapshot so the bound selections take
+              // effect and are visible in this chat. Seed only when the chat has
+              // no per-chat states for the persona yet, so a fresh chat picks up
+              // the binding while later in-chat tweaks are never clobbered.
+              if (
+                resolvedPersona.addonStates &&
+                Object.keys(resolvedPersona.addonStates).length > 0
+              ) {
+                const existing = (chat.metadata?.persona_addon_states ?? {}) as Record<string, Record<string, boolean>>
+                if (!existing[resolvedChatPersona.id]) {
+                  const nextStates = { ...existing, [resolvedChatPersona.id]: { ...resolvedPersona.addonStates } }
+                  // Fold into chat.metadata and re-publish the snapshot (the
+                  // canonical publish already happened alongside setMessages);
+                  // persist for future opens.
+                  chat.metadata = { ...(chat.metadata ?? {}), persona_addon_states: nextStates }
+                  useStore.getState().setActiveChatMetadata(chat.metadata)
+                  chatsApi.patchMetadata(chatId, { persona_addon_states: nextStates }).catch(() => {})
+                }
               }
             }
           }
+          stopPersonaResolution = useStore.subscribe(resolvePersona)
+          resolvePersona()
         }
 
         // Auto-apply loadout if a binding exists for this chat/character
@@ -930,6 +947,7 @@ export default function ChatView() {
 
     return () => {
       cancelled = true
+      stopPersonaResolution()
     }
   }, [chatId, setActiveChat, setMessages, t])
 
@@ -1052,10 +1070,11 @@ export default function ChatView() {
   }, [bubbleDisableHover, bubbleHideAvatarBg, bubbleOpacity])
 
   useLayoutEffect(() => {
+    const chatBody = chatBodyRef.current
     const chatColumnInner = chatColumnInnerRef.current
     const chatColumnTop = chatColumnTopRef.current
     const chatTopDock = chatTopDockRef.current
-    if (!chatColumnInner || !chatColumnTop || !chatTopDock) return
+    if (!chatBody || !chatColumnInner || !chatColumnTop || !chatTopDock) return
 
     const syncComposerAnchor = () => {
       const composerAbove = chatColumnInner.querySelector<HTMLSpanElement>(
@@ -1080,9 +1099,14 @@ export default function ChatView() {
       if (child && childRequest !== null && child.getAttribute('data-dock-request') !== childRequest) child.setAttribute('data-dock-request', childRequest)
     }
 
+    // The fill dock is `position: fixed`, and the half-editor host is a sibling of
+    // `.chatColumn` under `.body`. Publishing the measured rail height on the shared
+    // body is what lets both the fill-only padding and the desktop half-editor
+    // z-index rung read the real strip height; on `.chatColumnInner` the sibling
+    // subtree cannot see the variable at all.
     const syncTopDockHeight = () => {
       const height = measureLayoutHeight(chatTopDock)
-      chatColumnInner.style.setProperty('--lcs-top-dock-height', `${height}px`)
+      chatBody.style.setProperty('--lcs-top-dock-height', `${height}px`)
     }
 
     const sync = () => {
@@ -1126,7 +1150,7 @@ export default function ChatView() {
       chatColumnTop.removeAttribute('data-dock-request')
       chatTopDock.removeAttribute('data-dock-request')
       chatComposerAboveRef.current?.removeAttribute('data-dock-request')
-      chatColumnInner.style.removeProperty('--lcs-top-dock-height')
+      chatBody.style.removeProperty('--lcs-top-dock-height')
       chatComposerAboveRef.current = null
     }
   }, [chatId, dockQuickToolbar, keepFloatingDockHost, quickToolbarSettings])
@@ -1170,7 +1194,7 @@ export default function ChatView() {
         }}
       />
       <div className={clsx(styles.wallpaperTransitionLayer, wallpaperTransitioning && !sceneBackground && styles.wallpaperTransitionLayerActive)} />
-      <div className={styles.body} data-lumiverse-surface="chat-body" data-chat-width-mode={chatWidthMode} {...(chatWidthMode !== 'full' ? { 'data-chat-constrained': '' } : {})}>
+      <div ref={chatBodyRef} className={styles.body} data-lumiverse-surface="chat-body" data-chat-width-mode={chatWidthMode} {...(chatWidthMode !== 'full' ? { 'data-chat-constrained': '' } : {})}>
         <div data-spindle-mount="chat_sidebar_left" data-spindle-scope={`chat:${chatId}:sidebar-left`} style={{ display: 'contents' }} />
         {!portraitSurfaceOccupied && portraitPanelSide !== 'none' && portraitPanelSide === 'left' && (
           <div className={clsx(styles.portraitSide, styles.portraitSideLeft, portraitPanelOpen && styles.portraitSideOpen)}>
@@ -1186,7 +1210,7 @@ export default function ChatView() {
           </div>
         )}
 
-        <div className={styles.chatColumn} data-lumiverse-surface="chat-column">
+        <div className={clsx(styles.chatColumn, centerChatWithSidebar && styles.chatColumnCentered)} data-lumiverse-surface="chat-column">
           {(spindleNotice || visibleCortexNotice) && (
             <div className={styles.noticeDock} aria-live="polite" aria-atomic="true">
               {spindleNotice && (

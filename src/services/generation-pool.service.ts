@@ -18,6 +18,7 @@ import { EventType } from "../ws/events";
 export type PoolStatus = "assembling" | "council" | "waiting" | "reasoning" | "streaming" | "completed" | "stopped" | "error";
 
 export interface PooledTokensEntry {
+  frontendSessionId?: string;
   generationId: string;
   userId: string;
   chatId: string;
@@ -67,8 +68,9 @@ export interface PooledTokensEntry {
   streamingStartedAt?: number;
   /** Timestamp (ms) when the first token (content or reasoning) arrived from the provider */
   firstTokenAt?: number;
-  /** Timestamp (ms) when the first content token arrived (excluding reasoning) */
+  /** Timestamp (ms) when the first non-whitespace response token arrived (excluding reasoning) */
   firstContentTokenAt?: number;
+  responseStoppedAt?: number;
   /** Whether this generation used streaming mode */
   wasStreaming?: boolean;
 }
@@ -105,6 +107,7 @@ const SWEEP_INTERVAL_MS = 60 * 1000; // 60 seconds
 // ── CRUD ─────────────────────────────────────────────────────────────────────
 
 export function createPoolEntry(opts: {
+  frontendSessionId?: string;
   generationId: string;
   userId: string;
   chatId: string;
@@ -117,6 +120,7 @@ export function createPoolEntry(opts: {
   targetSwipeId?: number;
 }): void {
   const entry: PooledTokensEntry = {
+    frontendSessionId: opts.frontendSessionId,
     generationId: opts.generationId,
     userId: opts.userId,
     chatId: opts.chatId,
@@ -173,8 +177,6 @@ export function appendPoolContent(generationId: string, text: string): PoolAppen
   if (entry.reasoningStartedAt && !entry.reasoningDurationMs) {
     entry.reasoningDurationMs = now - entry.reasoningStartedAt;
   }
-  if (!entry.firstTokenAt) entry.firstTokenAt = now;
-  if (!entry.firstContentTokenAt) entry.firstContentTokenAt = now;
   if (entry.status === "assembling" || entry.status === "council" || entry.status === "waiting" || entry.status === "reasoning") {
     setPoolStatus(generationId, "streaming");
     eventBus.emit(EventType.GENERATION_PHASE_CHANGED, { generationId, chatId: entry.chatId, phase: "streaming" }, entry.userId);
@@ -195,7 +197,6 @@ export function appendPoolReasoning(generationId: string, text: string): PoolApp
   if (!entry) return { seq: 0, offset: 0 };
   const now = Date.now();
   if (!entry.reasoningStartedAt) entry.reasoningStartedAt = now;
-  if (!entry.firstTokenAt) entry.firstTokenAt = now;
   if (entry.status === "assembling" || entry.status === "council" || entry.status === "waiting") {
     setPoolStatus(generationId, "reasoning");
     eventBus.emit(EventType.GENERATION_PHASE_CHANGED, { generationId, chatId: entry.chatId, phase: "reasoning" }, entry.userId);
@@ -370,6 +371,7 @@ function sweep(): void {
       {
         generationId: entry.generationId,
         chatId: entry.chatId,
+        frontendSessionId: entry.frontendSessionId,
         error: message,
         ...failure,
       },

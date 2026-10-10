@@ -62,7 +62,7 @@ All commands below assume you have already cloned the repo and are working from 
 
 The launcher will:
 1. Install Bun if not found
-2. Upgrade unsupported Bun versions to the latest stable release (minimum 1.4.0)
+2. Upgrade unsupported Bun versions to the latest stable release (minimum 1.4.2)
 3. Run the **first-time setup wizard** (admin account, port, extension storage, optional SMART disk monitoring)
 4. Install backend dependencies and serve the existing frontend build if one is available
 5. Start the backend with the runner and IPC bridge when launched interactively
@@ -120,7 +120,7 @@ In your Space's **Settings → Persistent storage**, attach a storage bucket and
 In the **Files** tab of your Space, create a file named `Dockerfile` with the following contents:
 
 ```dockerfile
-FROM oven/bun:1.4.0-slim@sha256:e0ee68d16ccb9927bf02aa7dd8fd4bf3369ee6d46da04faa72b05ce8bfd135f6
+FROM oven/bun:1.4.2-slim@sha256:cb3bbbb08e13a4a2ff400f24c7a2a1d5efa83f6ef8544d52d95a519631e2fc61
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -282,6 +282,17 @@ Configuration is managed through `.env` (see `.env.example` for all options). Se
 | `TRUSTED_PROXIES` | No | — | Proxy IPs/CIDRs allowed to supply external host/protocol headers for dynamic auth origins and client-IP headers. Host/protocol forwarding requires this explicit list. |
 
 Owner password is stored hashed in `data/owner.credentials` (created by the setup wizard). To reset: `bun run reset-password`.
+
+## CharacterLibrary migration
+
+Import a CharacterLibrary **Full bundle (.zip)** into a running Lumiverse instance:
+
+```sh
+bun run migrate:cl --bundle ~/Downloads/cl-bundle.zip --dry-run
+bun run migrate:cl --bundle ~/Downloads/cl-bundle.zip --report ./cl-report.json
+```
+
+The CLI prompts for your account and password, reviews the inventory, and uploads to the authenticated `/api/v1/cl-migration` API. Add `--url` for a remote server; `--resume JOB_ID` continues an existing job. Original archives and per-item reports are retained. Current v1 exports omit expressions and external script files; imported regex is disabled unless you opt in. See [the migration guide](user-docs/docs/data-portability/character-library.md) for authentication, retry semantics, limits, and cleanup.
 
 ## Architecture
 

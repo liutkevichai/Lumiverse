@@ -13,9 +13,10 @@
 import { existsSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { join } from "node:path";
+import { resolveWindowsMsvc } from "./windows-msvc";
 
 /** Minimum Bun the desktop build requires (see desktop/README.md). */
-export const MIN_BUN_VERSION = "1.4.0";
+export const MIN_BUN_VERSION = "1.4.2";
 
 export type CheckStatus = "ok" | "missing" | "unverified";
 
@@ -173,69 +174,85 @@ async function checkMacosPrerequisites(): Promise<ToolchainCheck[]> {
 }
 
 async function checkLinuxPrerequisites(): Promise<ToolchainCheck[]> {
-  const remedy = [
+  const nativeRemedy = [
     "Install the GTK/WebKitGTK and AppIndicator development packages.",
     "The exact package names for Debian, Fedora and Arch are listed in",
     "desktop/README.md under Prerequisites.",
   ];
+  const checks: ToolchainCheck[] = [];
 
   const pkgConfig = await probe(["pkg-config", "--version"]);
   if (!pkgConfig.ok) {
     // Without pkg-config there is no reliable way to ask about the libraries,
     // and guessing package state from the filesystem is worse than admitting
     // the check could not run.
-    return [
-      {
-        id: "webkitgtk",
-        label: "WebKitGTK / AppIndicator",
-        status: "unverified",
-        detail: "pkg-config is not installed, so the libraries could not be checked",
-        remedy,
-      },
-    ];
+    checks.push({
+      id: "webkitgtk",
+      label: "WebKitGTK / AppIndicator",
+      status: "unverified",
+      detail: "pkg-config is not installed, so the libraries could not be checked",
+      remedy: nativeRemedy,
+    });
+  } else {
+    for (const [id, label, packages] of [
+      ["webkitgtk", "WebKitGTK 4.1", ["webkit2gtk-4.1"]],
+      // Either implementation satisfies the build. desktop/README.md installs
+      // the Ayatana package on Debian and libappindicator-gtk3 on Fedora and
+      // Arch, and the two register different pkg-config names.
+      ["appindicator", "AppIndicator", ["ayatana-appindicator3-0.1", "appindicator3-0.1"]],
+    ] as const) {
+      let found: string | null = null;
+      for (const pkg of packages) {
+        if ((await probe(["pkg-config", "--exists", pkg])).ok) {
+          found = pkg;
+          break;
+        }
+      }
+      checks.push({
+        id,
+        label,
+        status: found ? "ok" : "missing",
+        detail: found ? `${found} found` : `${packages.join(" / ")} not found`,
+        remedy: found ? [] : nativeRemedy,
+      });
+    }
   }
 
-  const checks: ToolchainCheck[] = [];
-  for (const [id, label, packages] of [
-    ["webkitgtk", "WebKitGTK 4.1", ["webkit2gtk-4.1"]],
-    // Either implementation satisfies the build. desktop/README.md installs
-    // the Ayatana package on Debian and libappindicator-gtk3 on Fedora and
-    // Arch, and the two register different pkg-config names.
-    ["appindicator", "AppIndicator", ["ayatana-appindicator3-0.1", "appindicator3-0.1"]],
-  ] as const) {
-    let found: string | null = null;
-    for (const pkg of packages) {
-      if ((await probe(["pkg-config", "--exists", pkg])).ok) {
-        found = pkg;
-        break;
-      }
-    }
-    checks.push({
-      id,
-      label,
-      status: found ? "ok" : "missing",
-      detail: found ? `${found} found` : `${packages.join(" / ")} not found`,
-      remedy: found ? [] : remedy,
-    });
+  const requiredAudioElements = ["appsrc", "autoaudiosink", "mpg123audiodec", "pulsesink"];
+  const missingAudioElements: string[] = [];
+  for (const element of requiredAudioElements) {
+    if (!(await probe(["gst-inspect-1.0", element])).ok) missingAudioElements.push(element);
   }
+  checks.push({
+    id: "gstreamer-audio",
+    label: "GStreamer audio plugins",
+    status: missingAudioElements.length === 0 ? "ok" : "missing",
+    detail: missingAudioElements.length === 0
+      ? "AppImage audio factories found"
+      : `missing ${missingAudioElements.join(", ")}`,
+    remedy: missingAudioElements.length === 0
+      ? []
+      : [
+          "Install GStreamer tools plus the base and good plugin sets.",
+          "The platform-specific commands are listed in desktop/README.md",
+          "under Prerequisites.",
+        ],
+  });
   return checks;
 }
 
-function checkWindowsPrerequisites(): ToolchainCheck[] {
-  // Both of these can be present in forms this probe would not recognise: the
-  // MSVC linker only appears on PATH inside a Developer Command Prompt, and
-  // WebView2 ships preinstalled on Windows 11. Reporting them as missing would
-  // send people to reinstall software they already have, so surface them as
-  // requirements to confirm rather than as failures.
+async function checkWindowsPrerequisites(): Promise<ToolchainCheck[]> {
+  const msvc = await resolveWindowsMsvc();
   return [
     {
       id: "msvc",
       label: "MSVC build tools",
-      status: "unverified",
-      detail: "cannot be detected reliably outside a Developer Command Prompt",
-      remedy: [
-        "If the build fails at the link step, install the Visual Studio",
-        "Build Tools with the C++ workload.",
+      status: msvc.ready ? "ok" : "missing",
+      detail: msvc.detail,
+      remedy: msvc.ready ? [] : [
+        "In Visual Studio Installer, modify Build Tools and select Desktop development with C++",
+        "with MSVC C++ build tools and a Windows SDK, then retry.",
+        "Or use the x64 Native Tools Command Prompt and verify: where link.exe",
       ],
     },
     {
@@ -263,7 +280,7 @@ export async function inspectDesktopToolchain(): Promise<DesktopToolchainReport>
       checks.push(...(await checkLinuxPrerequisites()));
       break;
     case "windows":
-      checks.push(...checkWindowsPrerequisites());
+      checks.push(...(await checkWindowsPrerequisites()));
       break;
     default:
       break;
@@ -277,6 +294,8 @@ export async function inspectDesktopToolchain(): Promise<DesktopToolchainReport>
 }
 
 /** The command that builds the desktop app on the current platform. */
-export function desktopBuildCommand(): string {
-  return "cd desktop && bun install && bun run tauri:finalized build";
+export function desktopBuildCommand(target: DesktopPlatform = currentDesktopPlatform()): string {
+  return target === "windows"
+    ? ".\\start.ps1 -InstallDesktop"
+    : "cd desktop && bun install && bun run tauri:finalized build";
 }
