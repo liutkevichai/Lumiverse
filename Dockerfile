@@ -1,5 +1,6 @@
 # =============================================================================
 # Lumiverse Backend — Multi-stage Docker Build
+# Deploy trigger: rebuild after upstream/staging merge (2026-11-01).
 # =============================================================================
 # Base: Debian slim (not Alpine — LanceDB requires glibc, no musl bindings)
 # Bun is pinned to a stable multi-platform manifest digest. Do not use the
