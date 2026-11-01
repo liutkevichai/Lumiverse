@@ -1,5 +1,5 @@
 -- Lumiverse Database Baseline Schema
--- Generated from migrations 001 through 112.
+-- Includes schema changes through migration 133.
 -- Fresh databases bootstrap from this file instead of replaying the full
 -- migration stack. All squashed migration names are recorded in _migrations
 -- so the runner treats them as already applied.
@@ -8,7 +8,6 @@ CREATE TABLE "account" (
   id TEXT PRIMARY KEY NOT NULL,
   accountId TEXT NOT NULL,
   providerId TEXT NOT NULL,
-  issuer TEXT NOT NULL,
   userId TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
   accessToken TEXT,
   refreshToken TEXT,
@@ -829,7 +828,8 @@ CREATE TABLE "session" (
   updatedAt INTEGER NOT NULL DEFAULT (unixepoch()),
   ipAddress TEXT,
   userAgent TEXT,
-  userId TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE
+  userId TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  impersonatedBy TEXT
 );
 
 CREATE TABLE "settings" (
@@ -1114,8 +1114,8 @@ CREATE TABLE world_books (
 CREATE INDEX idx_account_provider_account
   ON account(providerId, accountId);
 
-CREATE UNIQUE INDEX account_issuer_accountId_uidx
-  ON account(issuer, accountId);
+CREATE UNIQUE INDEX account_provider_accountId_uidx
+  ON "account"(providerId, accountId);
 
 CREATE INDEX idx_account_userId ON "account"(userId);
 
@@ -1765,4 +1765,337 @@ CREATE TABLE cl_migration_items (
   destination_id TEXT NOT NULL,
   completed_at INTEGER NOT NULL,
   PRIMARY KEY (user_id, source_id, kind, source_key)
+);
+
+-- 124: Decision provider connections.
+CREATE TABLE IF NOT EXISTS decision_connections (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  api_url TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
+  is_default INTEGER NOT NULL DEFAULT 0,
+  has_api_key INTEGER NOT NULL DEFAULT 0,
+  default_parameters TEXT NOT NULL DEFAULT '{}',
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_decision_connections_user ON decision_connections(user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_decision_connections_default ON decision_connections(user_id) WHERE is_default = 1;
+
+-- 125: Durable completion receipts for background deletions.
+CREATE TABLE IF NOT EXISTS deletion_operations (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  entity TEXT NOT NULL,
+  entity_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('accepted', 'completed', 'failed', 'unknown')),
+  error TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_deletion_operations_entity ON deletion_operations(user_id, entity, entity_id);
+CREATE INDEX IF NOT EXISTS idx_deletion_operations_updated ON deletion_operations(status, updated_at);
+
+-- 126: Durable reverse image references, populated incrementally by the DB subprocess.
+-- Native triggers record invalidations for all writers, including imports and extensions.
+-- Do not trust negative lookups until every source is backfilled and dirty rows are refreshed.
+CREATE TABLE image_references (
+  source_type TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  image_id TEXT NOT NULL,
+  PRIMARY KEY (source_type, source_id, image_id)
+) WITHOUT ROWID;
+CREATE INDEX idx_image_references_lookup ON image_references(user_id, image_id);
+CREATE TABLE image_reference_dirty (
+  source_type TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  PRIMARY KEY (source_type, source_id)
+) WITHOUT ROWID;
+CREATE INDEX idx_image_reference_dirty_user ON image_reference_dirty(user_id);
+CREATE TABLE image_reference_index_state (
+  source_type TEXT PRIMARY KEY,
+  last_id TEXT,
+  last_user_id TEXT,
+  completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0, 1))
+);
+INSERT INTO image_reference_index_state(source_type) VALUES
+  ('characters'), ('personas'), ('presets'), ('chats'), ('messages'), ('settings');
+CREATE INDEX idx_character_gallery_image_reference ON character_gallery(user_id, image_id);
+CREATE INDEX idx_characters_image_reference ON characters(user_id, image_id) WHERE deleting = 0;
+CREATE INDEX idx_personas_image_reference ON personas(user_id, image_id);
+CREATE INDEX idx_theme_assets_image_reference ON theme_assets(user_id, image_id);
+
+CREATE TRIGGER image_refs_characters_insert AFTER INSERT ON characters
+BEGIN
+  DELETE FROM image_references WHERE source_type = 'characters' AND source_id = NEW.id;
+  INSERT INTO image_reference_dirty(source_type, source_id, user_id)
+    VALUES ('characters', NEW.id, COALESCE(NEW.user_id, ''))
+    ON CONFLICT(source_type, source_id) DO UPDATE SET user_id = excluded.user_id;
+END;
+CREATE TRIGGER image_refs_characters_update AFTER UPDATE OF id, user_id, deleting, extensions, description, personality, scenario, first_mes, mes_example, creator_notes, system_prompt, post_history_instructions, alternate_greetings ON characters
+WHEN NEW.id IS NOT OLD.id OR NEW.user_id IS NOT OLD.user_id OR NEW.deleting IS NOT OLD.deleting OR NEW.extensions IS NOT OLD.extensions OR NEW.description IS NOT OLD.description OR NEW.personality IS NOT OLD.personality OR NEW.scenario IS NOT OLD.scenario OR NEW.first_mes IS NOT OLD.first_mes OR NEW.mes_example IS NOT OLD.mes_example OR NEW.creator_notes IS NOT OLD.creator_notes OR NEW.system_prompt IS NOT OLD.system_prompt OR NEW.post_history_instructions IS NOT OLD.post_history_instructions OR NEW.alternate_greetings IS NOT OLD.alternate_greetings
+BEGIN
+  DELETE FROM image_references WHERE source_type = 'characters' AND source_id = OLD.id;
+  DELETE FROM image_reference_dirty WHERE source_type = 'characters' AND source_id = OLD.id;
+  INSERT INTO image_reference_dirty(source_type, source_id, user_id)
+    VALUES ('characters', NEW.id, COALESCE(NEW.user_id, ''))
+    ON CONFLICT(source_type, source_id) DO UPDATE SET user_id = excluded.user_id;
+END;
+CREATE TRIGGER image_refs_characters_delete AFTER DELETE ON characters
+BEGIN
+  DELETE FROM image_references WHERE source_type = 'characters' AND source_id = OLD.id;
+  DELETE FROM image_reference_dirty WHERE source_type = 'characters' AND source_id = OLD.id;
+END;
+
+CREATE TRIGGER image_refs_personas_insert AFTER INSERT ON personas
+BEGIN
+  DELETE FROM image_references WHERE source_type = 'personas' AND source_id = NEW.id;
+  INSERT INTO image_reference_dirty(source_type, source_id, user_id)
+    VALUES ('personas', NEW.id, COALESCE(NEW.user_id, ''))
+    ON CONFLICT(source_type, source_id) DO UPDATE SET user_id = excluded.user_id;
+END;
+CREATE TRIGGER image_refs_personas_update AFTER UPDATE OF id, user_id, metadata ON personas
+WHEN NEW.id IS NOT OLD.id OR NEW.user_id IS NOT OLD.user_id OR NEW.metadata IS NOT OLD.metadata
+BEGIN
+  DELETE FROM image_references WHERE source_type = 'personas' AND source_id = OLD.id;
+  DELETE FROM image_reference_dirty WHERE source_type = 'personas' AND source_id = OLD.id;
+  INSERT INTO image_reference_dirty(source_type, source_id, user_id)
+    VALUES ('personas', NEW.id, COALESCE(NEW.user_id, ''))
+    ON CONFLICT(source_type, source_id) DO UPDATE SET user_id = excluded.user_id;
+END;
+CREATE TRIGGER image_refs_personas_delete AFTER DELETE ON personas
+BEGIN
+  DELETE FROM image_references WHERE source_type = 'personas' AND source_id = OLD.id;
+  DELETE FROM image_reference_dirty WHERE source_type = 'personas' AND source_id = OLD.id;
+END;
+
+CREATE TRIGGER image_refs_presets_insert AFTER INSERT ON presets
+BEGIN
+  DELETE FROM image_references WHERE source_type = 'presets' AND source_id = NEW.id;
+  INSERT INTO image_reference_dirty(source_type, source_id, user_id)
+    VALUES ('presets', NEW.id, COALESCE(NEW.user_id, ''))
+    ON CONFLICT(source_type, source_id) DO UPDATE SET user_id = excluded.user_id;
+END;
+CREATE TRIGGER image_refs_presets_update AFTER UPDATE OF id, user_id, metadata ON presets
+WHEN NEW.id IS NOT OLD.id OR NEW.user_id IS NOT OLD.user_id OR NEW.metadata IS NOT OLD.metadata
+BEGIN
+  DELETE FROM image_references WHERE source_type = 'presets' AND source_id = OLD.id;
+  DELETE FROM image_reference_dirty WHERE source_type = 'presets' AND source_id = OLD.id;
+  INSERT INTO image_reference_dirty(source_type, source_id, user_id)
+    VALUES ('presets', NEW.id, COALESCE(NEW.user_id, ''))
+    ON CONFLICT(source_type, source_id) DO UPDATE SET user_id = excluded.user_id;
+END;
+CREATE TRIGGER image_refs_presets_delete AFTER DELETE ON presets
+BEGIN
+  DELETE FROM image_references WHERE source_type = 'presets' AND source_id = OLD.id;
+  DELETE FROM image_reference_dirty WHERE source_type = 'presets' AND source_id = OLD.id;
+END;
+
+CREATE TRIGGER image_refs_chats_insert AFTER INSERT ON chats
+BEGIN
+  DELETE FROM image_references WHERE source_type = 'chats' AND source_id = NEW.id;
+  INSERT INTO image_reference_dirty(source_type, source_id, user_id)
+    VALUES ('chats', NEW.id, COALESCE(NEW.user_id, ''))
+    ON CONFLICT(source_type, source_id) DO UPDATE SET user_id = excluded.user_id;
+  INSERT INTO image_reference_dirty(source_type, source_id, user_id)
+    SELECT 'messages', id, COALESCE(NEW.user_id, '') FROM messages WHERE chat_id = NEW.id
+    ON CONFLICT(source_type, source_id) DO UPDATE SET user_id = excluded.user_id;
+END;
+CREATE TRIGGER image_refs_chats_update AFTER UPDATE OF id, user_id, metadata ON chats
+WHEN NEW.id IS NOT OLD.id OR NEW.user_id IS NOT OLD.user_id OR NEW.metadata IS NOT OLD.metadata
+BEGIN
+  DELETE FROM image_references WHERE source_type = 'chats' AND source_id = OLD.id;
+  DELETE FROM image_reference_dirty WHERE source_type = 'chats' AND source_id = OLD.id;
+  INSERT INTO image_reference_dirty(source_type, source_id, user_id)
+    VALUES ('chats', NEW.id, COALESCE(NEW.user_id, ''))
+    ON CONFLICT(source_type, source_id) DO UPDATE SET user_id = excluded.user_id;
+  INSERT INTO image_reference_dirty(source_type, source_id, user_id)
+    SELECT 'messages', id, COALESCE(NEW.user_id, '') FROM messages
+    WHERE chat_id IN (OLD.id, NEW.id) AND (NEW.user_id IS NOT OLD.user_id OR NEW.id IS NOT OLD.id)
+    ON CONFLICT(source_type, source_id) DO UPDATE SET user_id = excluded.user_id;
+END;
+CREATE TRIGGER image_refs_chats_delete AFTER DELETE ON chats
+BEGIN
+  DELETE FROM image_references WHERE source_type = 'chats' AND source_id = OLD.id;
+  DELETE FROM image_reference_dirty WHERE source_type = 'chats' AND source_id = OLD.id;
+END;
+
+CREATE TRIGGER image_refs_messages_insert AFTER INSERT ON messages
+BEGIN
+  DELETE FROM image_references WHERE source_type = 'messages' AND source_id = NEW.id;
+  INSERT INTO image_reference_dirty(source_type, source_id, user_id)
+    VALUES ('messages', NEW.id, COALESCE((SELECT user_id FROM chats WHERE id = NEW.chat_id), ''))
+    ON CONFLICT(source_type, source_id) DO UPDATE SET user_id = excluded.user_id;
+END;
+CREATE TRIGGER image_refs_messages_update AFTER UPDATE OF id, chat_id, extra, swipes, content ON messages
+WHEN NEW.id IS NOT OLD.id OR NEW.chat_id IS NOT OLD.chat_id OR NEW.extra IS NOT OLD.extra OR NEW.swipes IS NOT OLD.swipes OR NEW.content IS NOT OLD.content
+BEGIN
+  DELETE FROM image_references WHERE source_type = 'messages' AND source_id = OLD.id;
+  DELETE FROM image_reference_dirty WHERE source_type = 'messages' AND source_id = OLD.id;
+  INSERT INTO image_reference_dirty(source_type, source_id, user_id)
+    VALUES ('messages', NEW.id, COALESCE((SELECT user_id FROM chats WHERE id = NEW.chat_id), ''))
+    ON CONFLICT(source_type, source_id) DO UPDATE SET user_id = excluded.user_id;
+END;
+CREATE TRIGGER image_refs_messages_delete AFTER DELETE ON messages
+BEGIN
+  DELETE FROM image_references WHERE source_type = 'messages' AND source_id = OLD.id;
+  DELETE FROM image_reference_dirty WHERE source_type = 'messages' AND source_id = OLD.id;
+END;
+
+CREATE TRIGGER image_refs_settings_insert AFTER INSERT ON settings
+BEGIN
+  DELETE FROM image_references WHERE source_type = 'settings' AND source_id = json_array(NEW.key, NEW.user_id);
+  INSERT INTO image_reference_dirty(source_type, source_id, user_id)
+    VALUES ('settings', json_array(NEW.key, NEW.user_id), COALESCE(NEW.user_id, ''))
+    ON CONFLICT(source_type, source_id) DO UPDATE SET user_id = excluded.user_id;
+END;
+CREATE TRIGGER image_refs_settings_update AFTER UPDATE OF key, user_id, value ON settings
+WHEN NEW.key IS NOT OLD.key OR NEW.user_id IS NOT OLD.user_id OR NEW.value IS NOT OLD.value
+BEGIN
+  DELETE FROM image_references WHERE source_type = 'settings' AND source_id = json_array(OLD.key, OLD.user_id);
+  DELETE FROM image_reference_dirty WHERE source_type = 'settings' AND source_id = json_array(OLD.key, OLD.user_id);
+  INSERT INTO image_reference_dirty(source_type, source_id, user_id)
+    VALUES ('settings', json_array(NEW.key, NEW.user_id), COALESCE(NEW.user_id, ''))
+    ON CONFLICT(source_type, source_id) DO UPDATE SET user_id = excluded.user_id;
+END;
+CREATE TRIGGER image_refs_settings_delete AFTER DELETE ON settings
+BEGIN
+  DELETE FROM image_references WHERE source_type = 'settings' AND source_id = json_array(OLD.key, OLD.user_id);
+  DELETE FROM image_reference_dirty WHERE source_type = 'settings' AND source_id = json_array(OLD.key, OLD.user_id);
+END;
+
+-- Android FCM destinations
+CREATE TABLE IF NOT EXISTS android_push_destinations (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  device_id TEXT NOT NULL UNIQUE,
+  transport TEXT NOT NULL CHECK (transport IN ('local', 'fcm')),
+  device_token TEXT,
+  project_id TEXT,
+  server_origin TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  label TEXT NOT NULL DEFAULT 'Lumiverse Android',
+  user_agent TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  registered_at INTEGER NOT NULL,
+  delivery_mode TEXT NOT NULL DEFAULT 'direct' CHECK(delivery_mode IN ('direct','relay')),
+  package_name TEXT NOT NULL DEFAULT 'chat.lumiverse.prototype',
+  enrollment_id TEXT,
+  relay_url TEXT,
+  relay_credential TEXT,
+  encryption_key TEXT,
+  encryption_key_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_android_push_user ON android_push_destinations(user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_android_push_token ON android_push_destinations(device_token) WHERE device_token IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_android_push_enrollment ON android_push_destinations(enrollment_id) WHERE enrollment_id IS NOT NULL;
+
+-- iOS APNs destinations
+CREATE TABLE IF NOT EXISTS ios_push_destinations (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  device_id TEXT NOT NULL,
+  device_token TEXT NOT NULL,
+  bundle_id TEXT NOT NULL,
+  environment TEXT NOT NULL CHECK (environment IN ('development', 'production')),
+  server_origin TEXT NOT NULL,
+  label TEXT NOT NULL DEFAULT 'Lumiverse iOS',
+  user_agent TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  registered_at INTEGER NOT NULL,
+  delivery_mode TEXT NOT NULL DEFAULT 'direct' CHECK(delivery_mode IN ('direct', 'relay')),
+  relay_credential TEXT,
+  encryption_key TEXT,
+  encryption_key_id TEXT,
+  UNIQUE (device_token, bundle_id, environment),
+  UNIQUE (user_id, device_id, bundle_id, environment)
+);
+CREATE INDEX IF NOT EXISTS idx_ios_push_user ON ios_push_destinations(user_id);
+
+-- iOS Live Activities (including the persisted stage-sound high-water mark)
+CREATE TABLE ios_live_activities (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+  generation_id TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  bundle_id TEXT NOT NULL,
+  environment TEXT NOT NULL CHECK (environment IN ('development', 'production')),
+  server_origin TEXT NOT NULL,
+  credential_hash TEXT NOT NULL,
+  activity_id TEXT,
+  push_token TEXT,
+  token_registered_at INTEGER NOT NULL DEFAULT 0,
+  expires_at INTEGER NOT NULL,
+  desired_phase TEXT NOT NULL,
+  delivered_phase TEXT,
+  last_timestamp INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at INTEGER NOT NULL DEFAULT 0,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  ended_at INTEGER,
+  delivered_stage INTEGER NOT NULL DEFAULT -1,
+  delivery_mode TEXT NOT NULL DEFAULT 'direct' CHECK(delivery_mode IN ('direct', 'relay')),
+  relay_credential TEXT,
+  UNIQUE(user_id, device_id, bundle_id, environment, generation_id)
+);
+CREATE INDEX idx_ios_live_activities_generation ON ios_live_activities(user_id, generation_id);
+CREATE INDEX idx_ios_live_activities_expiry ON ios_live_activities(expires_at);
+
+-- Removing/transferring an alert destination also revokes activities on that installation.
+CREATE TRIGGER revoke_ios_destination_activities AFTER DELETE ON ios_push_destinations BEGIN
+  DELETE FROM ios_live_activities WHERE user_id = OLD.user_id AND device_id = OLD.device_id
+    AND bundle_id = OLD.bundle_id AND environment = OLD.environment;
+END;
+
+-- iOS widget registrations
+CREATE TABLE ios_widget_registrations (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  device_id TEXT NOT NULL,
+  credential_hash TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  UNIQUE(user_id, device_id)
+);
+CREATE INDEX idx_ios_widget_registrations_expiry ON ios_widget_registrations(expires_at);
+
+CREATE TABLE spindle_live_activities (
+  id TEXT PRIMARY KEY,
+  extension_id TEXT REFERENCES extensions(id) ON DELETE SET NULL,
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  activity_key TEXT NOT NULL,
+  extension_name TEXT NOT NULL,
+  content_json TEXT NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 1,
+  expires_at INTEGER NOT NULL,
+  ended_at INTEGER,
+  UNIQUE(extension_id, user_id, activity_key)
+);
+CREATE INDEX idx_spindle_live_activities_user ON spindle_live_activities(user_id, expires_at);
+CREATE TABLE spindle_live_activity_clients (
+  destination_id TEXT PRIMARY KEY REFERENCES ios_push_destinations(id) ON DELETE CASCADE,
+  seen_at INTEGER NOT NULL
+);
+CREATE TABLE spindle_live_activity_devices (
+  id TEXT PRIMARY KEY,
+  activity_id TEXT NOT NULL REFERENCES spindle_live_activities(id) ON DELETE CASCADE,
+  destination_id TEXT NOT NULL REFERENCES ios_push_destinations(id) ON DELETE CASCADE,
+  credential_hash TEXT NOT NULL,
+  native_activity_id TEXT,
+  token_epoch TEXT NOT NULL DEFAULT '',
+  token_registered_at INTEGER NOT NULL DEFAULT 0,
+  push_token TEXT,
+  relay_credential TEXT,
+  delivered_revision INTEGER NOT NULL DEFAULT 0,
+  last_timestamp INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at INTEGER NOT NULL DEFAULT 0,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  dismissed INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(activity_id, destination_id)
 );

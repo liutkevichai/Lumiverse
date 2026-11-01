@@ -219,6 +219,22 @@ function validateProductivitySurfacePayload(surfaceId: string, props: HostSurfac
 
 const HOST_SURFACE_ROWS: readonly HostSurfaceRow[] = Object.freeze([
   {
+    id: 'message_preview',
+    schema: {
+      chatId: { kind: 'string', required: true, max: 128 },
+      messageId: { kind: 'string', required: true, max: 128 },
+      swipeIndex: { kind: 'number', min: 0, max: Number.MAX_SAFE_INTEGER, int: true },
+      start: { kind: 'number', min: 0, max: Number.MAX_SAFE_INTEGER, int: true },
+      end: { kind: 'number', min: 0, max: Number.MAX_SAFE_INTEGER, int: true },
+    },
+    propsSchema: '{ chatId: string, messageId: string, swipeIndex?: number, start?: number, end?: number }',
+    validate(props) {
+      if (!props.chatId || !props.messageId || (typeof props.start === 'number' && typeof props.end === 'number' && props.end < props.start)) {
+        throw new Error('HOST_SURFACE_PROPS_INVALID:message_preview: invalid identity or range')
+      }
+    },
+  },
+  {
     id: 'provider_icon',
     schema: {
       provider: { kind: 'string', required: true, max: 64, pattern: IDENTIFIER_PATTERN },
@@ -487,11 +503,17 @@ export function hostSurfacePermission(surfaceId: string): string | null {
   return frontendAuthorityRow('host_surface', surfaceId).permission
 }
 
-export function registerHostSurfaceRenderer(id: string, renderer: HostSurfaceRenderer): void {
+export function registerHostSurfaceRenderer(id: string, renderer: HostSurfaceRenderer): () => void {
   if (!HOST_SURFACE_ROWS_BY_ID.has(id)) throw new Error(`HOST_SURFACE_UNKNOWN:${id}`)
   if (typeof renderer !== 'function') throw new Error(`HOST_SURFACE_RENDERER_INVALID:${id}`)
   if (HOST_SURFACE_RENDERERS.has(id)) throw new Error(`HOST_SURFACE_DUPLICATE_RENDERER:${id}`)
   HOST_SURFACE_RENDERERS.set(id, renderer)
+  let active = true
+  return () => {
+    if (!active) return
+    active = false
+    if (HOST_SURFACE_RENDERERS.get(id) === renderer) HOST_SURFACE_RENDERERS.delete(id)
+  }
 }
 
 export function getHostSurfaceRenderer(id: string): HostSurfaceRenderer | undefined {

@@ -1,6 +1,8 @@
 import { Hono } from "hono";
 import { cpus, totalmem, freemem, platform, arch, release, hostname } from "os";
 import { join } from "path";
+import { statfsSync } from "node:fs";
+import { env } from "../env";
 import { getGitMetadata } from "../utils/git-metadata";
 
 const app = new Hono();
@@ -22,8 +24,7 @@ function getGitInfo(): { branch: string; commit: string } {
 
 function getDiskUsage(): { total: number; used: number } | null {
   try {
-    const { statfsSync } = require("fs");
-    const stat = statfsSync("/");
+    const stat = statfsSync(env.dataDir);
     const total = stat.blocks * stat.bsize;
     const free = stat.bavail * stat.bsize;
     return { total, used: total - free };
@@ -61,6 +62,7 @@ app.get("/info", async (c) => {
     backend: {
       version: await getBackendVersion(),
       runtime: `Bun ${Bun.version}`,
+      distribution: process.env.LUMIVERSE_BUNDLE_ID ? "bundled" : "source",
     },
     git: privileged ? getGitInfo() : { branch: "", commit: "" },
   });

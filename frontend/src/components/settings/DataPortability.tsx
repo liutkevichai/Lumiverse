@@ -4,10 +4,15 @@ import { Download, Upload, X, KeyRound, ShieldAlert } from 'lucide-react'
 import { Button } from '@/components/shared/FormComponents'
 import { wsClient } from '@/ws/client'
 import { EventType } from '@/ws/events'
+import { refreshAppDataAfterImport } from '@/hooks/useAppInit'
+import { flushSettingsNow } from '@/store/slices/settings'
+import { useStore } from '@/store'
+import { pendingImportJob, trackImportJob } from '@/lib/import-recovery'
 import {
   userDataApi,
   type DecryptionTicket,
   type ImportJobStatus,
+  type ImportJobProgress,
   type TicketSubmissionResponse,
 } from '@/api/user-data'
 import styles from './DataPortability.module.css'
@@ -19,12 +24,8 @@ interface ExportProgress {
   total?: number
 }
 
-interface ImportProgress {
+interface ImportProgress extends ImportJobProgress {
   jobId: string
-  phase: string
-  table?: string
-  processed?: number
-  total?: number
 }
 
 type ImportSummary = ImportJobStatus['summary']
@@ -44,13 +45,21 @@ export default function DataPortability() {
 
   // ── Import state ──────────────────────────────────────────────────────
   const [file, setFile] = useState<File | null>(null)
-  const [importing, setImporting] = useState(false)
+  const [importing, setImporting] = useState(() => {
+    const userId = useStore.getState().user?.id
+    return Boolean(userId && pendingImportJob(userId))
+  })
   const [importProgress, setImportProgress] = useState<ImportProgress | null>(null)
   const [importUploadPct, setImportUploadPct] = useState<number | null>(null)
-  const [importJobId, setImportJobId] = useState<string | null>(null)
+  const [importJobId, setImportJobId] = useState<string | null>(() => {
+    const userId = useStore.getState().user?.id
+    return userId ? pendingImportJob(userId) : null
+  })
   const [importSummary, setImportSummary] = useState<ImportSummary | null>(null)
   const [importFileSummary, setImportFileSummary] = useState<FileSummary | null>(null)
   const [importError, setImportError] = useState<string | null>(null)
+  const [interruptedJobId, setInterruptedJobId] = useState<string | null>(null)
+  const importRequestStarted = useRef(false)
   const [importSuccess, setImportSuccess] = useState<string | null>(null)
   // Secret-ticket UX state
   const [awaitingTicket, setAwaitingTicket] = useState<{
@@ -59,6 +68,20 @@ export default function DataPortability() {
   } | null>(null)
   const [ticketSubmitting, setTicketSubmitting] = useState(false)
   const [ticketReuseWarning, setTicketReuseWarning] = useState<TicketSubmissionResponse | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    const userId = useStore.getState().user?.id
+    if (!userId) return
+    void userDataApi.getImportJobs().then(({ jobs }) => {
+      if (cancelled || importRequestStarted.current || !jobs.length) return
+      const job = jobs[0]
+      trackImportJob(userId, job.jobId)
+      setImportJobId(job.jobId)
+      setImporting(true)
+    }).catch(() => {})
+    return () => { cancelled = true }
+  }, [])
 
   // ── WebSocket wiring ──────────────────────────────────────────────────
   useEffect(() => {
@@ -97,7 +120,10 @@ export default function DataPortability() {
           setImportFileSummary(payload.fileSummary)
           setImporting(false)
           setImportProgress(null)
+          setAwaitingTicket(null)
           setImportSuccess(t('dataPortability.importComplete'))
+          void refreshAppDataAfterImport(payload.jobId)
+            .catch((error) => setImportError(error.message))
         },
       ),
     )
@@ -107,6 +133,7 @@ export default function DataPortability() {
         (payload: { error?: string; cancelled?: boolean }) => {
           setImporting(false)
           setImportProgress(null)
+          setAwaitingTicket(null)
           if (payload.cancelled) {
             setImportError(t('dataPortability.importCancelled'))
           } else {
@@ -119,6 +146,54 @@ export default function DataPortability() {
       for (const u of unsubs) u()
     }
   }, [t])
+
+  // File pickers/backgrounding can interrupt Android's WebSocket. Continue
+  // polling until a terminal state, including while waiting for a ticket.
+  useEffect(() => {
+    if (!importing || !importJobId) return
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout>
+    const poll = async () => {
+      try {
+        const status = await userDataApi.getImportStatus(importJobId)
+        if (cancelled) return
+        if (status.progress) setImportProgress({ ...status.progress, jobId: status.jobId })
+        if (status.status === 'interrupted') {
+          setInterruptedJobId(status.jobId)
+          setImporting(false)
+          setAwaitingTicket(null)
+          setImportError(t('dataPortability.importInterrupted'))
+          return
+        }
+        if (status.status === 'complete') {
+          setImportSummary(status.summary)
+          setImportFileSummary(status.fileSummary)
+          setImporting(false)
+          setImportProgress(null)
+          setAwaitingTicket(null)
+          setImportSuccess(t('dataPortability.importComplete'))
+          void refreshAppDataAfterImport(status.jobId)
+            .catch((error) => { if (!cancelled) setImportError(error.message) })
+          return
+        }
+        if (status.status === 'failed' || status.status === 'cancelled') {
+          setImporting(false)
+          setImportProgress(null)
+          setAwaitingTicket(null)
+          setImportError(status.error || t(status.status === 'cancelled' ? 'dataPortability.importCancelled' : 'dataPortability.importFailed'))
+          return
+        }
+        if (status.status === 'awaiting_ticket') {
+          setAwaitingTicket({ jobId: status.jobId, secretsCount: status.manifest?.secretsCount ?? 0 })
+        } else {
+          setAwaitingTicket(null)
+        }
+      } catch { /* Reconnect on the next poll. */ }
+      if (!cancelled) timer = setTimeout(poll, 1000)
+    }
+    timer = setTimeout(poll, 1000)
+    return () => { cancelled = true; clearTimeout(timer) }
+  }, [importing, importJobId, t])
 
   // ── Export action ─────────────────────────────────────────────────────
   const handleExport = async () => {
@@ -173,14 +248,20 @@ export default function DataPortability() {
   // ── Import action ─────────────────────────────────────────────────────
   const handleImport = async () => {
     if (!file) return
+    importRequestStarted.current = true
+    setInterruptedJobId(null)
     setImportError(null)
     setImportSuccess(null)
     setImportSummary(null)
     setImportFileSummary(null)
     setImportProgress(null)
     setImportUploadPct(0)
+    setImportJobId(null)
+    setAwaitingTicket(null)
     setImporting(true)
     try {
+      const userId = useStore.getState().user?.id
+      await flushSettingsNow()
       const { jobId } = await userDataApi.startImport(file, (pct) => {
         setImportUploadPct(pct)
         // Once bytes are on the wire, the server is verifying the archive
@@ -192,26 +273,36 @@ export default function DataPortability() {
         }
       })
       setImportJobId(jobId)
+      // The start event can arrive before the upload response or be missed
+      // during a WebSocket reconnect. Leave the upload label immediately.
+      setImportProgress((previous) => previous?.phase === 'verifying' || !previous
+        ? { jobId, phase: 'start' }
+        : previous)
+      if (userId) trackImportJob(userId, jobId)
       setImportUploadPct(null)
-      // From here, progress is delivered over the WebSocket. As a fallback,
-      // poll once after a short delay in case the WS subscription is slow.
-      setTimeout(() => {
-        userDataApi
-          .getImportStatus(jobId)
-          .then((status) => {
-            if (status.status === 'complete' && !importSummary) {
-              setImportSummary(status.summary)
-              setImportFileSummary(status.fileSummary)
-              setImporting(false)
-              setImportSuccess(t('dataPortability.importComplete'))
-            }
-          })
-          .catch(() => {/* ignore */})
-      }, 1500)
     } catch (err: any) {
       setImporting(false)
       setImportUploadPct(null)
       setImportError(err?.message || t('dataPortability.uploadFailed'))
+    }
+  }
+
+  const handleResumeImport = async () => {
+    if (!interruptedJobId) return
+    importRequestStarted.current = true
+    setImporting(true)
+    setImportError(null)
+    try {
+      await flushSettingsNow()
+      const { jobId } = await userDataApi.resumeImport(interruptedJobId)
+      const userId = useStore.getState().user?.id
+      if (userId) trackImportJob(userId, jobId)
+      setImportJobId(jobId)
+      setInterruptedJobId(null)
+      setImportProgress({ jobId, phase: 'start' })
+    } catch (error: any) {
+      setImporting(false)
+      setImportError(error?.body?.error || error?.message || t('dataPortability.importFailed'))
     }
   }
 
@@ -296,6 +387,12 @@ export default function DataPortability() {
     const phase = importProgress.phase
     if (phase === 'verifying') return t('dataPortability.verifying')
     if (phase === 'start') return t('dataPortability.importQueued')
+    if (phase === 'extracting') {
+      return t('dataPortability.extracting', {
+        done: ((importProgress.bytesProcessed ?? 0) / (1024 ** 3)).toFixed(2),
+        total: ((importProgress.bytesTotal ?? 0) / (1024 ** 3)).toFixed(2),
+      })
+    }
     if (phase === 'awaiting_ticket') return t('dataPortability.awaitingTicket')
     if (phase === 'ticket_accepted') return t('dataPortability.ticketAccepted')
     if (phase === 'ticket_skipped') return t('dataPortability.ticketSkipped')
@@ -428,6 +525,12 @@ export default function DataPortability() {
             </Button>
           )}
         </div>
+        {interruptedJobId && !importing && (
+          <div className={styles.warning}>
+            <p>{t('dataPortability.resumeHint')}</p>
+            <Button variant="primary" onClick={handleResumeImport}>{t('dataPortability.resumeImport')}</Button>
+          </div>
+        )}
         {awaitingTicket && (
           <div className={styles.progress}>
             <div className={styles.progressLabel}>
@@ -478,7 +581,9 @@ export default function DataPortability() {
               ) : null}
             </div>
             <div className={styles.progressBar}>
-              {importUploadPct !== null ? (
+              {importProgress?.phase === 'extracting' && (importProgress.bytesTotal ?? 0) > 0 ? (
+                <div className={styles.progressFill} style={{ width: `${Math.min(100, 100 * (importProgress.bytesProcessed ?? 0) / importProgress.bytesTotal!)}%` }} />
+              ) : importUploadPct !== null ? (
                 <div className={styles.progressFill} style={{ width: `${importUploadPct}%` }} />
               ) : (
                 <div className={styles.progressFillIndeterminate} />

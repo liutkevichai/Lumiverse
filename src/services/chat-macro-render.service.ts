@@ -1,11 +1,68 @@
 import { cloneEnv, evaluate, initMacros, registry, type MacroEnv } from "../macros";
 import { withJsonBlocksProtected } from "../macros/json-blocks";
 import { captureMessageLiterals, shieldMessageLiterals, withMessageLiteralExtra } from "../macros/message-literals";
-import type { Message } from "../types/message";
+import type { DisplayMessageSource, Message } from "../types/message";
 import { healFormattingArtifacts } from "../utils/format-healing";
 import * as chatsSvc from "./chats.service";
+import { contentHasMacroHints } from "./vectorization-content.service";
+import { createWorldInfoEntriesLoaderForChat, getActivatedWorldInfoEntriesForChat, resolveWorldInfoOutlets } from "./prompt-assembly.service";
+import { getPreset } from "./presets.service";
+import { applyMessagePresetContext } from "./message-preset-context.service";
+import { readMessagePresetContext, type MessagePresetContext } from "../types/preset-context";
 
 const HAS_MACRO_RE = /\{\{|<(?:user|char|bot)>/i;
+const OUTLET_MACRO_RE = /\{\{(?:outlet|persona_outlet|personaoutlet)::/i;
+
+/** Request-local read snapshots. Each message still gets independent mutable macro state. */
+export function createDisplayRenderContext(userId: string, chatId: string) {
+  let seed: MacroEnv | null | undefined;
+  const presets = new Map<string, ReturnType<typeof getPreset>>();
+  return {
+    getEnv: () => {
+      if (seed === undefined) seed = chatsSvc.buildMacroEnvForChat(userId, chatId);
+      if (!seed) return null;
+      const env = cloneEnv(seed);
+      env.extra = structuredClone(seed.extra);
+      if (seed.character.alternateGreetings) env.character.alternateGreetings = [...seed.character.alternateGreetings];
+      return env;
+    },
+    getPreset: (ownerId: string, id: string) => {
+      if (!presets.has(id)) presets.set(id, getPreset(ownerId, id));
+      return presets.get(id)!;
+    },
+    getWorldInfoEntries: createWorldInfoEntriesLoaderForChat(userId, chatId),
+  };
+}
+
+export type DisplayRenderContext = ReturnType<typeof createDisplayRenderContext>;
+
+/** Share the displayed body with server-side verification of rendered choices. */
+export async function resolveDisplayMessageBody(
+  userId: string,
+  chatId: string,
+  content: string,
+  message?: DisplayMessageSource,
+  swipeIndex = message?.swipe_id ?? 0,
+  signal?: AbortSignal,
+  presetContextOverride?: MessagePresetContext,
+  context?: DisplayRenderContext,
+): Promise<string> {
+  const source = message?.chat_id === chatId ? message : undefined;
+  const presetContext = presetContextOverride ?? readMessagePresetContext(source?.extra, swipeIndex);
+  if (source) content = shieldMessageLiterals(content, source);
+  if (!contentHasMacroHints(content)) return content;
+  const env = context ? context.getEnv() : chatsSvc.buildMacroEnvForChat(userId, chatId);
+  if (!env || (presetContext && !applyMessagePresetContext(env, userId, presetContext, context?.getPreset))) return content;
+  if (OUTLET_MACRO_RE.test(content)) {
+    try {
+      const entries = await (context ? context.getWorldInfoEntries() : getActivatedWorldInfoEntriesForChat(userId, chatId));
+      await resolveWorldInfoOutlets(entries, env, signal);
+    } catch {
+      // Leave outlets unresolved; other display macros can still resolve.
+    }
+  }
+  return resolveRenderedMessageContent(content, env, true);
+}
 
 interface ReconcileChatMessageMacrosInput {
   userId: string;
@@ -119,6 +176,31 @@ export function persistMacroVariableState(
   });
 }
 
+export async function persistMacroVariableStateAsync(
+  userId: string,
+  chatId: string,
+  env: MacroEnv,
+  source?: { messageId: string; stateId: string },
+): Promise<void> {
+  await mergeMacroVariables(userId, chatId, Object.fromEntries(env.variables.global), Object.fromEntries(env.variables.chat), source);
+}
+
+async function mergeMacroVariables(
+  userId: string,
+  chatId: string,
+  globalVariables: Record<string, string>,
+  chatVariables: Record<string, string>,
+  source?: { messageId: string; stateId: string },
+): Promise<void> {
+  // Read and merge in the child transaction so concurrent extension keys survive.
+  await chatsSvc.mergeChatMetadataAsync(userId, chatId, {
+    macro_variables: { global: globalVariables },
+    chat_variables: chatVariables,
+  }, { mergeObjectPaths: [["macro_variables", "global"], ["chat_variables"]],
+    ...(source ? { variableSource: { ...source, values: { global: globalVariables, chat: chatVariables }, replaceScopes: ["global", "chat"] } } : {}),
+  });
+}
+
 export async function reconcileChatMessageMacros(
   input: ReconcileChatMessageMacrosInput,
 ): Promise<Map<string, string>> {
@@ -147,14 +229,7 @@ export async function reconcileChatMessageMacros(
   }
 
   if (input.persistVariables !== false && globalVariables && chatVariables) {
-    const chat = chatsSvc.getChat(input.userId, input.chatId);
-    // Env values win on collision but concurrent extension writes survive.
-    const existingMacroVars = (chat?.metadata?.macro_variables as Record<string, unknown> | undefined) ?? {};
-    const existingChatVars = (chat?.metadata?.chat_variables as Record<string, string> | undefined) ?? {};
-    chatsSvc.mergeChatMetadata(input.userId, input.chatId, {
-      macro_variables: buildPersistedMacroVariables(existingMacroVars, globalVariables),
-      chat_variables: { ...existingChatVars, ...chatVariables },
-    });
+    await mergeMacroVariables(input.userId, input.chatId, globalVariables, chatVariables);
   }
 
   return resolvedById;

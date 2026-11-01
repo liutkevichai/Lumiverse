@@ -1,8 +1,10 @@
-import { upgradeWebSocket } from "hono/bun";
+import { upgradeWebSocket } from "@hono/bun";
 import { Buffer } from "node:buffer";
 import { eventBus } from "./bus";
 import { EventType } from "./events";
 import { auth } from "../auth";
+import { approvedAuthRequest } from "../auth/request-origin";
+import { isConnectionFromExplicitTrustedProxy } from "../utils/client-ip";
 import { consumeDesktopNotificationTicket, consumeTicket } from "./tickets";
 import { getWorkerHost } from "../spindle/lifecycle";
 import { readFrontendSessionId, registerFrontendSession, frontendPresenceKey } from '../spindle/frontend-session';
@@ -10,6 +12,7 @@ import * as managerSvc from "../spindle/manager.service";
 import { getFirstUserId } from "../auth/seed";
 import { validateRoomCredential } from "../services/room-auth";
 import * as multiplayerSvc from "../services/multiplayer.service";
+import { queuedWebSocketEvents } from "./receive-queue";
 
 const WS_MESSAGE_SIZE_LIMIT_DEFAULT = 1024 * 1024;
 const WS_MESSAGE_SIZE_LIMIT_SPINDLE_BACKEND_MSG = 4 * 1024 * 1024;
@@ -28,7 +31,7 @@ export const wsHandler = upgradeWebSocket((c) => {
   // inbound room_* messages NEVER trust a participantId from the payload.
   let roomAuth: { roomId: string; participantId: string } | null = null;
 
-  return {
+  return queuedWebSocketEvents({
     async onOpen(_event, ws) {
       console.log("[WS] onOpen fired");
 
@@ -77,6 +80,7 @@ export const wsHandler = upgradeWebSocket((c) => {
         const roomToken = url.searchParams.get("roomToken");
         if (roomToken) {
           const credential = await validateRoomCredential({ roomToken });
+          if (ws.raw?.readyState !== 1) return;
           if (!credential) {
             ws.send(JSON.stringify({
               event: "AUTH_ERROR",
@@ -134,6 +138,7 @@ export const wsHandler = upgradeWebSocket((c) => {
           userId = ticketUserId;
           // Ticket auth doesn't carry role/session — fetch from DB
           const { getDb } = await import("../db/connection");
+          if (ws.raw?.readyState !== 1) return;
           const row = getDb()
             .query('SELECT id, role FROM "user" WHERE id = ?')
             .get(ticketUserId) as { id: string; role: string } | null;
@@ -141,9 +146,13 @@ export const wsHandler = upgradeWebSocket((c) => {
           sessionId = `ticket-${crypto.randomUUID()}`;
         } else {
           // Auth path 2: cookie-based session (original path)
+          const request = approvedAuthRequest(c.req.raw, isConnectionFromExplicitTrustedProxy(c));
           const session = await auth.api.getSession({
-            headers: c.req.raw.headers,
+            request,
+            headers: request.headers,
+            asResponse: false,
           });
+          if (ws.raw?.readyState !== 1) return;
 
           if (!session) {
             console.warn("[WS] Auth failed — no session found");
@@ -164,6 +173,7 @@ export const wsHandler = upgradeWebSocket((c) => {
           // Same as requireAuth: if BetterAuth omitted the role, read from DB
           if (!userRole) {
             const { getDb } = await import("../db/connection");
+            if (ws.raw?.readyState !== 1) return;
             const row = getDb()
               .query('SELECT role FROM "user" WHERE id = ?')
               .get(userId) as { role: string } | null;
@@ -181,15 +191,15 @@ export const wsHandler = upgradeWebSocket((c) => {
           return;
         }
 
-        if (ws.readyState !== 1) return;
+        if (ws.raw?.readyState !== 1) return;
         try {
           frontendSessionId = readFrontendSessionId(url.searchParams.get('frontend_session') ?? undefined);
           if (frontendSessionId && userId) {
             const owner = userId, documentId = frontendSessionId;
             unregisterFrontendSession = registerFrontendSession(owner, documentId, {
               executionOwner: url.searchParams.get("frontend_runtime") !== "widget",
-              send: value => { if (ws.readyState !== 1) throw new Error('Frontend session disconnected'); ws.send(value); },
-              close: () => { if (ws.readyState < 2) ws.close(1000, 'Frontend session reconnected'); },
+              send: value => { if (ws.raw?.readyState !== 1) throw new Error('Frontend session disconnected'); ws.send(value); },
+              close: () => { if (ws.raw && ws.raw.readyState < 2) ws.close(1000, 'Frontend session reconnected'); },
               closed: () => eventBus.emit(EventType.FRONTEND_SESSION_CLOSED, { frontendSessionId: documentId }, owner),
             });
           }
@@ -203,6 +213,7 @@ export const wsHandler = upgradeWebSocket((c) => {
           const cachedFirstId = getFirstUserId();
           if (cachedFirstId && cachedFirstId === userId) {
             const { getDb } = await import("../db/connection");
+            if (ws.raw?.readyState !== 1) return;
             getDb().run('UPDATE "user" SET role = ? WHERE id = ?', ["owner", userId]);
             userRole = "owner";
             console.log(`[WS] Self-healed owner role for first user ${userId}`);
@@ -219,15 +230,25 @@ export const wsHandler = upgradeWebSocket((c) => {
           console.warn("[WS] Could not extract raw Bun WebSocket — events will not reach this client");
         }
 
+        // A newly opened frontend missed registrations from already-running workers.
+        // Match live command broadcasts: personal commands belong only to their owner.
+        const extensions = await managerSvc.listForUser(userId!, userRole);
+        if (ws.raw?.readyState !== 1) return;
+        const extensionCommands = extensions.flatMap(extension => {
+          if (!extension.enabled || (extension.metadata?.install_scope === 'user' && extension.metadata.installed_by_user_id !== userId)) return [];
+          const commands = getWorkerHost(extension.id)?.getRegisteredCommands() ?? [];
+          return commands.length ? [{ extensionId: extension.id, extensionName: extension.name, commands }] : [];
+        });
         ws.send(
           JSON.stringify({
             event: EventType.CONNECTED,
-            payload: { message: "Connected to Lumiverse event bus", userId, role: userRole },
+            payload: { message: "Connected to Lumiverse event bus", userId, role: userRole, extensionCommands },
             timestamp: Date.now(),
           })
         );
       } catch (err) {
         console.error("[WS] onOpen error:", err);
+        ws.close(1011, "WebSocket authentication failed");
       }
     },
     async onMessage(event, ws) {
@@ -422,6 +443,7 @@ export const wsHandler = upgradeWebSocket((c) => {
           if (!userId) return;
 
           const ext = await managerSvc.getExtensionForUser(extensionId, userId, userRole);
+          if (ws.raw?.readyState !== 1) return;
           if (!ext) {
             return;
           }
@@ -451,6 +473,7 @@ export const wsHandler = upgradeWebSocket((c) => {
           if (!extensionId || !processId || !processEvent || !userId) return;
 
           const ext = await managerSvc.getExtensionForUser(extensionId, userId, userRole);
+          if (ws.raw?.readyState !== 1) return;
           if (!ext) return;
 
           const host = getWorkerHost(extensionId);
@@ -481,6 +504,7 @@ export const wsHandler = upgradeWebSocket((c) => {
           if (!extensionId || !processId || !userId) return;
 
           const ext = await managerSvc.getExtensionForUser(extensionId, userId, userRole);
+          if (ws.raw?.readyState !== 1) return;
           if (!ext) return;
 
           const host = getWorkerHost(extensionId);
@@ -493,6 +517,7 @@ export const wsHandler = upgradeWebSocket((c) => {
         if (data.type === "SPINDLE_UI_REGISTRY_SYNC") {
           if (userId) {
             const { setUserExtensionDrawerTabs } = await import("../spindle/ui-frontend-state.service");
+            if (ws.raw?.readyState !== 1) return;
             setUserExtensionDrawerTabs(userId, data.drawerTabs);
           }
           return;
@@ -504,12 +529,13 @@ export const wsHandler = upgradeWebSocket((c) => {
           if (!extensionId || !commandId || !userId) return;
 
           const ext = await managerSvc.getExtensionForUser(extensionId, userId, userRole);
+          if (ws.raw?.readyState !== 1) return;
           if (!ext) return;
 
           const host = getWorkerHost(extensionId);
           if (!host) return;
 
-          host.invokeCommand(commandId, data.context ?? {}, userId);
+          host.invokeCommand(commandId, data.context ?? {}, userId, frontendSessionId);
         }
       } catch (err) {
         // Malformed JSON is the common case — drop those silently. Any other
@@ -533,5 +559,5 @@ export const wsHandler = upgradeWebSocket((c) => {
         roomAuth = null;
       }
     },
-  };
+  });
 });

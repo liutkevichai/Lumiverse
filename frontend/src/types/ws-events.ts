@@ -1,9 +1,13 @@
 export enum EventType {
   CONNECTED = 'CONNECTED',
+  DECISION_CONNECTION_CHANGED = 'DECISION_CONNECTION_CHANGED',
   SETTINGS_UPDATED = 'SETTINGS_UPDATED',
   CHARACTER_CREATED = 'CHARACTER_CREATED',
   CHARACTER_EDITED = 'CHARACTER_EDITED',
   CHARACTER_DELETED = 'CHARACTER_DELETED',
+  CHARACTER_GALLERY_ITEM_REMOVED = 'CHARACTER_GALLERY_ITEM_REMOVED',
+  DELETION_OPERATION_CHANGED = 'DELETION_OPERATION_CHANGED',
+  IMAGE_DELETED = 'IMAGE_DELETED',
   CHARACTER_LIBRARY_CHANGED = 'CHARACTER_LIBRARY_CHANGED',
   PERSONA_CHANGED = 'PERSONA_CHANGED',
   MESSAGE_SENT = 'MESSAGE_SENT',
@@ -59,6 +63,8 @@ export enum EventType {
   WORLD_INFO_ACTIVATED = 'WORLD_INFO_ACTIVATED',
   CONNECTION_PROFILE_LOADED = 'CONNECTION_PROFILE_LOADED',
   PRESET_PROFILE_CHANGED = 'PRESET_PROFILE_CHANGED',
+  PRESET_CHANGED = 'PRESET_CHANGED',
+  PRESET_DELETED = 'PRESET_DELETED',
 
   // World Books (lorebook editor live-sync — mirror src/ws/events.ts)
   WORLD_BOOK_CHANGED = 'WORLD_BOOK_CHANGED',
@@ -167,7 +173,11 @@ export enum EventType {
 
   // Memory Cortex
   CORTEX_REBUILD_PROGRESS = 'CORTEX_REBUILD_PROGRESS',
+  CORTEX_ACTIVITY = 'CORTEX_ACTIVITY',
   CORTEX_INGESTION_PROGRESS = 'CORTEX_INGESTION_PROGRESS',
+
+  // Local inference scheduling
+  INFERENCE_SCHEDULER_STATE = 'INFERENCE_SCHEDULER_STATE',
 
   // MCP Servers
   MCP_SERVER_CONNECTED = 'MCP_SERVER_CONNECTED',
@@ -357,6 +367,8 @@ export interface GenerationStartedPayload {
   targetMessageId?: string
   /** Swipe index the generation streams into (for swipe-gated streaming display). */
   targetSwipeId?: number
+  renderMode?: "persisted-message"
+  backgroundSwipe?: boolean
   generationType?: string
   characterId?: string
   characterName?: string
@@ -532,6 +544,8 @@ export interface RoomHydrationGeneration {
   generationType?: string
   targetMessageId?: string
   targetSwipeId?: number
+  renderMode?: "persisted-message"
+  backgroundSwipe?: boolean
   characterName?: string
   characterId?: string
   reasoningStartedAt?: number

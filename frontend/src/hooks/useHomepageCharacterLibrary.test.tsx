@@ -2,6 +2,7 @@ import { afterAll, afterEach, describe, expect, jest, mock, test } from 'bun:tes
 import { JSDOM } from 'jsdom'
 import { act, createElement } from 'react'
 import type { Root } from 'react-dom/client'
+import { publishImportedDataRefresh } from '@/lib/import-data-events'
 
 const listSummaries = jest.fn()
 const listTags = jest.fn(async () => [])
@@ -116,12 +117,12 @@ function summary(index: number) {
 const firstPage = Array.from({ length: 80 }, (_, index) => summary(index))
 const secondPage = Array.from({ length: 80 }, (_, index) => summary(index + 80))
 
-/* eslint-disable react-compiler/react-compiler */
+/* eslint-disable react-hooks/globals */
 function HookHarness() {
   hookSurface = useHomepageCharacterLibrary()
   return null
 }
-/* eslint-enable react-compiler/react-compiler */
+/* eslint-enable react-hooks/globals */
 
 async function flush(): Promise<void> {
   for (let index = 0; index < 5; index += 1) await Promise.resolve()
@@ -207,6 +208,14 @@ describe('useHomepageCharacterLibrary websocket invalidation', () => {
       expect(listSummaries).toHaveBeenCalledTimes(callsBefore + 1)
       expect(listSummaries.mock.calls.at(-1)?.[0]).toMatchObject({ offset: 0, sort: 'recent' })
     }
+
+    const beforeImportRefresh = listSummaries.mock.calls.length
+    await act(async () => {
+      publishImportedDataRefresh()
+      await flush()
+    })
+    expect(listSummaries).toHaveBeenCalledTimes(beforeImportRefresh + 1)
+    expect(listSummaries.mock.calls.at(-1)?.[0]).toMatchObject({ offset: 0, sort: 'recent' })
 
     await act(async () => {
       mountedRoot?.unmount()

@@ -1,5 +1,5 @@
 import WorldBookColumnHandle from './WorldBookColumnHandle'
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { createPortal } from 'react-dom'
 import { useWorldBookEntryLabels } from '@/lib/i18n/worldBookEntryLabels'
@@ -36,11 +36,10 @@ import {
   MouseSensor,
   TouchSensor,
   KeyboardSensor,
-  DragOverlay,
   closestCenter,
   useSensor,
   useSensors,
-  type DragStartEvent,
+  useDndContext,
   type DragEndEvent,
   type DraggableAttributes,
 } from '@dnd-kit/core'
@@ -48,10 +47,10 @@ import {
   SortableContext,
   arrayMove,
   sortableKeyboardCoordinates,
-  useSortable,
   verticalListSortingStrategy,
 } from '@dnd-kit/sortable'
-import { DndContext, useScaledSortableStyle } from '@/lib/dndUiScale'
+import { DndContext, useScaledSortable } from '@/lib/dndUiScale'
+import SortableDragOverlay from './SortableDragOverlay'
 import { useScrollGate } from '@/hooks/useScrollGate'
 import useIsMobile from '@/hooks/useIsMobile'
 import { useEntryWorkspace } from './useEntryWorkspace'
@@ -73,6 +72,7 @@ import { ModalPresentation } from '@/components/shared/ModalPresentation'
 import SearchableSelect from '@/components/shared/SearchableSelect'
 import { FormField, Select, TextInput, Button } from '@/components/shared/FormComponents'
 import Pagination from '@/components/shared/Pagination'
+import NumericInput from '@/components/shared/NumericInput'
 import EntryOrganizationControls, { EntryFolderList, type EntryOrganizationHandle } from './EntryOrganizationControls'
 import { useStore } from '@/store'
 import type {
@@ -179,8 +179,12 @@ const SELF_ECHO_WINDOW_MS = 2_000
 function isEditableEntryField(target: EventTarget | null): target is HTMLElement {
   if (!(target instanceof HTMLElement)) return false
   if (!target.closest('[data-world-book-entry-editor="true"]')) return false
-  if (target.isContentEditable) return true
-  if (target instanceof HTMLTextAreaElement) return !target.disabled && !target.readOnly
+  // Multiline editors reveal their caret through the shared iOS PWA controller
+  // or native browser scrolling, just like preset content fields. Revealing
+  // their whole box here can alternate top/bottom alignment during keyboard
+  // resizing and move an already-visible caret again on every input event.
+  if (target instanceof HTMLTextAreaElement || target.isContentEditable ||
+      target.hasAttribute('data-keyboard-caret-managed')) return false
   if (target instanceof HTMLSelectElement) return !target.disabled
   if (!(target instanceof HTMLInputElement) || target.disabled || target.readOnly) return false
 
@@ -401,8 +405,9 @@ interface EntryRowProps {
   inlineEditor?: boolean
   workspaceMode?: boolean
   workspaceOpen?: boolean
-  mobile?: boolean
   showTokens?: boolean
+  typeMenuOpen: boolean
+  positionMenuOpen: boolean
   entry: WorldBookEntry
   expanded: boolean
   dragEnabled: boolean
@@ -428,15 +433,16 @@ interface EntryRowContentProps extends EntryRowProps {
   isDragging?: boolean
 }
 
-function EntryRowContent({
+const EntryRowContent = memo(function EntryRowContent({
   entry,
   bookId,
   editorDensity,
   inlineEditor = true,
   workspaceMode = false,
   workspaceOpen = false,
-  mobile = false,
   showTokens = true,
+  typeMenuOpen,
+  positionMenuOpen,
   expanded,
   dragEnabled,
   selectMode,
@@ -507,12 +513,12 @@ function EntryRowContent({
               type="button"
               className={styles.dragHandle}
               title={dragEnabled ? t('dragReorder') : t('dragUnavailable')}
-              aria-label={t('dragHandle')}
-              tabIndex={-1}
               {...dragHandleAttributes}
               {...dragHandleListeners}
+              aria-label={`${t('dragHandle')}: ${entry.comment || entry.uid}`}
+              tabIndex={0}
             >
-              <GripVertical size={13} />
+              <GripVertical size={13} aria-hidden="true" />
             </button>}
           </div>
 
@@ -527,7 +533,6 @@ function EntryRowContent({
                 {(entry.folder || entry.tags?.length > 0) && <small title={[entry.folder, ...(entry.tags ?? [])].filter(Boolean).join(' · ')}> · {[entry.folder, ...(entry.tags ?? [])].filter(Boolean).join(' · ')}</small>}
               </span>
               <div className={styles.entryMeta}>
-                {mobile ? <span className={styles.entryMetaItem}>{labels.entryTypeLabel(entry)} · {labels.positionLabel(entry.position)}</span> : <>
                 <button
                   type="button"
                   className={clsx(
@@ -542,10 +547,11 @@ function EntryRowContent({
                   }}
                   onPointerDown={(e) => e.stopPropagation()}
                   title={t('changeEntryType')}
-                  aria-label={t('changeEntryTypeFrom', { type: getEntryType(entry) })}
+                  aria-expanded={typeMenuOpen}
+                  aria-label={`${t('changeEntryTypeFrom', { type: getEntryType(entry) })}: ${entry.comment || entry.uid}`}
                 >
                   <span>{labels.entryTypeLabel(entry)}</span>
-                  <ChevronDown size={11} />
+                  <ChevronDown size={11} aria-hidden="true" />
                 </button>
                 <button
                   type="button"
@@ -557,19 +563,28 @@ function EntryRowContent({
                   }}
                   onPointerDown={(e) => e.stopPropagation()}
                   title={t('changeEntryPosition')}
-                  aria-label={t('changeEntryPositionFrom', { position: labels.positionLabel(entry.position) })}
+                  aria-expanded={positionMenuOpen}
+                  aria-label={`${t('changeEntryPositionFrom', { position: labels.positionLabel(entry.position) })}: ${entry.comment || entry.uid}`}
                 >
                   <span>{entry.position === 7 && entry.wi_marker ? `${labels.positionLabel(entry.position)} · ${markerLabel(entry.wi_marker)}` : labels.positionLabel(entry.position)}</span>
-                  <ChevronDown size={11} />
+                  <ChevronDown size={11} aria-hidden="true" />
                 </button>
-                </>}
                 <span
                   className={clsx(styles.entryMetaItem, styles.orderBadge)}
                   title={`${tEntryFields('order')}: ${entry.order_value.toLocaleString()}`}
                   {...controlWrapProps}
                 >
                   <Hash size={10} aria-hidden="true" />
-                  <span>{entry.order_value.toLocaleString()}</span>
+                  <NumericInput
+                    className={styles.orderInput}
+                    step="1"
+                    value={entry.order_value}
+                    integer
+                    commitOnBlur
+                    aria-label={`${tEntryFields('order')}: ${entry.comment || entry.uid}`}
+                    onKeyDown={(event) => event.stopPropagation()}
+                    onChange={(order_value) => onUpdate(entry.id, { order_value })}
+                  />
                 </span>
                 {showTokens && <EntryTokenCell bookId={bookId} entry={entry} selected={selected || expanded} />}
               </div>
@@ -617,6 +632,7 @@ function EntryRowContent({
                 onOpenMenu(entry.id, { x: rect.right, y: rect.bottom + 4 })
               }}
               title={t('moreActions')}
+              aria-label={`${t('moreActions')}: ${entry.comment || entry.uid}`}
             >
               <MoreVertical size={13} />
             </button>
@@ -639,22 +655,31 @@ function EntryRowContent({
       )}
     </div>
   )
+})
+
+function EntryDragOverlay() {
+  const { active } = useDndContext()
+  const rowProps = active?.data.current?.entryRowProps as EntryRowProps | undefined
+  return (
+    <SortableDragOverlay>
+      {rowProps && <div data-lorebook-drag-preview>
+        <div className={rowProps.workspaceMode ? styles.workspaceList : undefined} style={{ display: 'contents' }}>
+          <EntryRowContent {...rowProps} expanded={false} inlineEditor={false} isDragging />
+        </div>
+      </div>}
+    </SortableDragOverlay>
+  )
 }
 
 function SortableEntryRow(props: EntryRowProps) {
-  const { attributes, listeners, setNodeRef: setSortableRef, transform, transition, isDragging } = useSortable({
+  const { attributes, listeners, setNodeRef, style, isDragging } = useScaledSortable({
     id: props.entry.id,
+    data: { entryRowProps: props },
     disabled: !props.dragEnabled,
-  })
-  const { setNodeRef, style } = useScaledSortableStyle({
-    setNodeRef: setSortableRef,
-    transform,
-    transition,
-    isDragging,
   })
 
   return (
-    <div ref={setNodeRef} style={style}>
+    <div ref={setNodeRef} style={{ ...style, opacity: isDragging ? 0 : undefined, pointerEvents: isDragging ? 'none' : undefined }}>
       <EntryRowContent
         {...props}
         dragHandleAttributes={attributes}
@@ -813,7 +838,6 @@ export default function WorldBookEntriesSection({
   const focusedEntryFieldRef = useRef<HTMLElement | null>(null)
   const focusRevealFrameRef = useRef(0)
   const focusRevealTimersRef = useRef<number[]>([])
-  const [activeDragId, setActiveDragId] = useState<string | null>(null)
   const activeScrollRef = presentation === 'workspace' ? selectedEntryId && isMobile && !mobileBrowsing ? detailViewportRef : listViewportRef : scrollContainerRef ?? localScrollRef
   const usesSharedScroll = scrollContainerRef != null
   useScrollGate(activeScrollRef)
@@ -954,10 +978,11 @@ export default function WorldBookEntriesSection({
   const liveRefetchRef = useRef<() => void>(() => {})
   const liveRefetchTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
 
-  const pageSize = entryPageSize === 'all' ? DEFAULT_PAGE_SIZE : entryPageSize
+  const pageSize = entryPageSize === 'all' ? null : entryPageSize
   // Search ranks the complete organization/type scope before slicing a page.
-  // Ordinary browsing keeps its server pagination and selected sort.
+  // Ordinary browsing stays paginated; All entries explicitly loads the full scope.
   const searchCorpusMode = entrySearchFilter.trim().length > 0
+  const fullCorpusMode = searchCorpusMode || entryPageSize === 'all'
   const entrySearchResults = useMemo(
     () => searchEntriesByQuery(entries, entrySearchFilter, entrySearchIndex),
     [entries, entrySearchFilter, entrySearchIndex],
@@ -973,7 +998,7 @@ export default function WorldBookEntriesSection({
     return counts
   }, [queryEntries])
   const filteredEntries = useMemo(
-    () => searchCorpusMode
+    () => searchCorpusMode && pageSize !== null
       ? queryEntries.slice((entryPage - 1) * pageSize, entryPage * pageSize)
       : queryEntries,
     [searchCorpusMode, queryEntries, entryPage, pageSize],
@@ -1152,11 +1177,11 @@ export default function WorldBookEntriesSection({
     if (!silent && isCurrent()) setLoadingEntries(true)
     try {
       const paginatedPageSize = entryPageSize === 'all' ? DEFAULT_PAGE_SIZE : entryPageSize
-      const [res, summary] = await Promise.all([searchCorpusMode
+      const [res, summary] = await Promise.all([fullCorpusMode
         ? loadLorebookSearchEntries(pagination => worldBooksApi.listEntries(bookId, {
             ...pagination,
-            sort_by: 'order',
-            sort_dir: 'asc',
+            sort_by: searchCorpusMode ? 'order' : mapSortForApi(entrySortBy),
+            sort_dir: searchCorpusMode || entrySortBy === 'custom' ? 'asc' : entrySortDir,
             folder: entryFolder,
             tag: entryTags,
             type: entryTypeFilter === 'all' ? undefined : entryTypeFilter,
@@ -1186,7 +1211,7 @@ export default function WorldBookEntriesSection({
       loadedSearchScopeRef.current = searchCorpusMode ? searchScope : null
       setOrganization(summary)
       setEntriesError('')
-      if (!searchCorpusMode && (entryPage - 1) * paginatedPageSize >= res.total) setEntryPage(Math.max(1, Math.ceil(res.total / paginatedPageSize)))
+      if (!fullCorpusMode && (entryPage - 1) * paginatedPageSize >= res.total) setEntryPage(Math.max(1, Math.ceil(res.total / paginatedPageSize)))
     } catch (error) {
       if (!controller.signal.aborted) { if (isCurrent() && entriesAbortRef.current === controller) setEntriesError('Could not load entries. Retry Refresh.'); throw error }
       if (opts?.force) throw error
@@ -1195,7 +1220,7 @@ export default function WorldBookEntriesSection({
       if (ownsRequest) entriesAbortRef.current = null
       if (!silent && ownsRequest && isCurrent()) setLoadingEntries(false)
     }
-  }, [entryFolder, entryTags, searchCorpusMode, entryTypeFilter, entryPage, entryPageSize, entrySortBy, entrySortDir, active, setEntries])
+  }, [entryFolder, entryTags, searchCorpusMode, fullCorpusMode, entryTypeFilter, entryPage, entryPageSize, entrySortBy, entrySortDir, active, setEntries])
 
   const selectedBookViewPreference = worldBookEntryViewPrefs[selectedBookId]
   const resolvedSelectedBookViewPreference = useMemo(
@@ -1207,7 +1232,7 @@ export default function WorldBookEntriesSection({
     const pref = resolvedSelectedBookViewPreference
     setEntrySortBy(pref.sortBy)
     setEntrySortDir(pref.sortDir)
-    setEntryPageSize(pref.pageSize === 'all' ? DEFAULT_PAGE_SIZE : pref.pageSize || DEFAULT_PAGE_SIZE)
+    setEntryPageSize(pref.pageSize || DEFAULT_PAGE_SIZE)
   }, [selectedBookId, resolvedSelectedBookViewPreference])
 
   useEffect(() => {
@@ -1342,7 +1367,7 @@ export default function WorldBookEntriesSection({
     await loadEntries(selectedBookId, { force: true })
   }, [selectedBookId, loadEntries])
 
-  const persistEntryUpdate = useCallback(async (entryId: string, intent: EntryIntent) => {
+  const persistEntryUpdate = useCallback(async function persistEntryUpdate(entryId: string, intent: EntryIntent) {
     const generation = requestGenerationRef.current
     const expected_revision = entriesRef.current.find((entry) => entry.id === entryId)?.revision
     try {
@@ -1687,12 +1712,7 @@ export default function WorldBookEntriesSection({
     })
   }, [entrySortBy, entrySortDir, persistViewPref, selectedBookId])
 
-  const handleDragStart = useCallback(({ active }: DragStartEvent) => {
-    setActiveDragId(String(active.id))
-  }, [])
-
   const handleDragEnd = useCallback(async ({ active, over }: DragEndEvent) => {
-    setActiveDragId(null)
     if (!dragEnabled || !over || active.id === over.id) return
     const generation = requestGenerationRef.current
     const oldIndex = entries.findIndex((entry) => entry.id === active.id)
@@ -1706,7 +1726,7 @@ export default function WorldBookEntriesSection({
         ordered_ids: orderedIds,
         expected_revisions: expectedRevisionsFor(orderedIds),
       })
-      await refetchCurrentPage()
+      await loadEntries(selectedBookId, { force: true, silent: true })
     } catch (error) {
       const classified = recordMutationIssue(orderedIds, error, async () => {
         setEntries(nextEntries)
@@ -1714,11 +1734,11 @@ export default function WorldBookEntriesSection({
           ordered_ids: orderedIds,
           expected_revisions: expectedRevisionsFor(orderedIds),
         })
-        await refetchCurrentPage()
+        await loadEntries(selectedBookId, { force: true, silent: true })
       }, selectedBookId, generation)
-      if (!classified) await refetchCurrentPage()
+      if (!classified) await loadEntries(selectedBookId, { force: true, silent: true })
     }
-  }, [dragEnabled, entries, expectedRevisionsFor, recordMutationIssue, selectedBookId, refetchCurrentPage, setEntries])
+  }, [dragEnabled, entries, expectedRevisionsFor, recordMutationIssue, selectedBookId, loadEntries, setEntries])
 
   const detailEntry = (presentation === 'workspace' ? workspaceEntries : entries).find(entry => entry.id === selectedEntryId) ?? null
   const editingDetail = presentation === 'workspace' && !!detailEntry && !mobileBrowsing
@@ -1753,7 +1773,6 @@ export default function WorldBookEntriesSection({
   const selectedEntry = contextMenu ? entriesRef.current.find((entry) => entry.id === contextMenu.entryId) ?? null : null
   const selectedTypeEntry = typeMenu ? entries.find((entry) => entry.id === typeMenu.entryId) ?? null : null
   const selectedPositionEntry = positionMenu ? entries.find((entry) => entry.id === positionMenu.entryId) ?? null : null
-  const activeDragEntry = activeDragId ? entries.find((entry) => entry.id === activeDragId) ?? null : null
   const contextMenuItems: ContextMenuEntry[] = selectedEntry
     ? [
         {
@@ -2069,8 +2088,9 @@ export default function WorldBookEntriesSection({
             value={String(entryPageSize)}
             onChange={(e) => handlePageSizeChange(e.target.value)}
             title={te('perPage')}
+            aria-label={te('perPage')}
           >
-            {labels.pageSizeOptions.filter(option => option.value !== 'all').map((option) => (
+            {labels.pageSizeOptions.map((option) => (
               <option key={String(option.value)} value={String(option.value)}>{option.label}</option>
             ))}
           </select>
@@ -2146,7 +2166,7 @@ export default function WorldBookEntriesSection({
         <div className={styles.emptyState}>{te('loading')}</div>
       ) : (
         <>
-          <DndContext sensors={sensors} collisionDetection={closestCenter} onDragStart={handleDragStart} onDragEnd={handleDragEnd}>
+          <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
             <SortableContext items={renderedEntries.map((entry) => entry.id)} strategy={verticalListSortingStrategy}>
               <div
                 ref={usesSharedScroll ? undefined : localScrollRef}
@@ -2203,8 +2223,9 @@ export default function WorldBookEntriesSection({
                           inlineEditor={!presentation}
                           workspaceMode={presentation === 'workspace'}
                           workspaceOpen={openIds.includes(entry.id)}
-                          mobile={isMobile || presentation === 'workspace'}
                           showTokens={showTokens}
+                          typeMenuOpen={typeMenu?.entryId === entry.id}
+                          positionMenuOpen={positionMenu?.entryId === entry.id}
                           onToggleSelect={() => handleToggleSelect(entry.id)}
                           onUpdate={updateEntry}
                           onDebouncedUpdate={debouncedUpdateEntry}
@@ -2221,30 +2242,7 @@ export default function WorldBookEntriesSection({
                 </div>
               </div>
             </SortableContext>
-            <DragOverlay dropAnimation={null}>
-              {activeDragEntry && (
-                <EntryRowContent
-                  bookId={selectedBookId}
-                  editorDensity={editorDensity}
-                  entry={activeDragEntry}
-                  expanded={selectedEntryId === activeDragEntry.id}
-                  dragEnabled={dragEnabled}
-                  selectMode={selectMode}
-                  selected={selectedIds.includes(activeDragEntry.id)}
-                  onToggleExpand={() => setSelectedEntryId((current) => (current === activeDragEntry.id ? null : activeDragEntry.id))}
-                  onToggleSelect={() => handleToggleSelect(activeDragEntry.id)}
-                  onUpdate={updateEntry}
-                  onDebouncedUpdate={debouncedUpdateEntry}
-                  onOpenMenu={(entryId, position) => setContextMenu({ entryId, position })}
-                  onOpenTypeMenu={(entryId, position) => setTypeMenu({ entryId, position })}
-                  onOpenPositionMenu={(entryId, position) => setPositionMenu({ entryId, position })}
-                  conflict={entryConflicts[activeDragEntry.id]}
-                  onRetryConflict={() => retryConflict(activeDragEntry.id)}
-                  onUseServerConflict={() => acceptServerConflict(activeDragEntry.id)}
-                  isDragging
-                />
-              )}
-            </DragOverlay>
+            <EntryDragOverlay />
           </DndContext>
 
           {pagination}

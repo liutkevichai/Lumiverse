@@ -5,6 +5,7 @@ import { marked } from 'marked'
 import { highlightCode } from '@/lib/codeHighlight'
 import { ISLAND_BLANK_LINE_RE, processMarkdownInHtmlIsland } from './htmlIslandMarkdown'
 import { resolveGalleryImageId, resolveGalleryImageSourcesInHtml } from '@/lib/galleryImageReference'
+import { replaceHtmlImageSources } from '@/lib/htmlImageSources'
 import { parseOOC } from '@/lib/oocParser'
 import { createEmphasisAwareRenderer } from '@/lib/markedEmphasisRenderer'
 import { createStrictTildeTokenizer } from '@/lib/markedTokenizer'
@@ -14,6 +15,7 @@ import { normalizeLegacyFontTags } from '@/lib/legacyFontTags'
 import { resolveDisplayMacros } from '@/lib/resolveDisplayMacros'
 import { copyTextToClipboard } from '@/lib/clipboard'
 import { sanitizeHtmlIsland, sanitizeRichHtml } from '@/lib/richHtmlSanitizer'
+import { createMessageHtmlTree, reconcileMessageHtml } from '@/lib/reconcileMessageHtml'
 import {
   dispatchCollapsibleToggleLayoutEvent,
   findDetailsToggleLayoutTarget,
@@ -29,6 +31,7 @@ import {
   dispatchMessageContentLayout,
   MESSAGE_CONTENT_LAYOUT_EVENT,
 } from '@/lib/message-content-layout'
+import { chatImagePresentationStyle, DEFAULT_CHAT_IMAGE_TARGETS } from '@/lib/chatImagePresentation'
 import { useStore } from '@/store'
 import i18n from '@/i18n'
 import { useDisplayRegexState } from '@/hooks/useDisplayRegex'
@@ -47,6 +50,7 @@ import {
   type ResolvedRegexActionPayload,
 } from '@/lib/regex/actionBus'
 import { attachRegexActionLongPress } from '@/lib/regex/actionLongPress'
+import { regexActionSignature } from '../../../../src/utils/regex-action-signature'
 import { toast } from '@/lib/toast'
 import { OOCBlock as OOCBlockComponent, OOCIrcChatRoom } from './ooc'
 import type { IrcEntry } from './ooc'
@@ -56,16 +60,20 @@ import styles from './MessageContent.module.css'
 import clsx from 'clsx'
 
 interface MessageContentProps {
+  presetContext?: import('@/types/regex').MessagePresetContext
   content: string
   isUser: boolean
   userName: string
   isStreaming?: boolean
   messageId?: string
+  swipeIndex?: number
   chatId?: string
   depth?: number
   characterNameOverride?: string
   risuAssetMapOverride?: Record<string, string> | null
   disableInterceptors?: boolean
+  /** Display-only preview: no tag delivery, regex actions, widgets or shared collapse state. */
+  readOnly?: boolean
   findQuery?: string
 }
 
@@ -146,16 +154,25 @@ function normalizeQuotesInHTML(html: string): string {
 const BLOCK_CLOSE_RE = /^<\/(p|div|li|blockquote|h[1-6]|pre|table|tr|td|th)\b/i
 const SKIP_OPEN_RE = /^<(pre|code)\b/i
 const SKIP_CLOSE_RE = /^<\/(pre|code)\b/i
+const FEET_INCHES_QUOTE_RE = /(?<=\d(?:'|&#(?:0*39|x0*27);|&apos;)\d+)/iy
 
 function isFeetInchesQuote(text: string, quoteIndex: number): boolean {
-  const beforeQuote = text.slice(0, quoteIndex)
-    .replace(/&#(?:0*39|x0*27);|&apos;/gi, "'")
-
-  return /\d'\d+$/.test(beforeQuote)
+  FEET_INCHES_QUOTE_RE.lastIndex = quoteIndex
+  return FEET_INCHES_QUOTE_RE.test(text)
 }
 
-function colorizeDialogue(html: string): string {
-  const parts = html.split(/(<[^>]*>)/)
+export function colorizeDialogue(html: string): string {
+  const parts: string[] = []
+  let position = 0
+  while (position < html.length) {
+    const start = html.indexOf('<', position)
+    if (start === -1) break
+    const end = html.indexOf('>', start + 1)
+    if (end === -1) break
+    parts.push(html.slice(position, start), html.slice(start, end + 1))
+    position = end + 1
+  }
+  parts.push(html.slice(position))
   let result = ''
   let inQuote = false
   let skipDepth = 0
@@ -218,8 +235,17 @@ function colorizeDialogue(html: string): string {
   return result
 }
 
-function addLazyLoadingToImages(html: string): string {
-  return html.replace(/<img\b(?![^>]*\bloading=)/gi, '<img loading="lazy"')
+export function addLazyLoadingToImages(html: string): string {
+  return html.replace(/<img\b(?:(?![^>]*\bloading=)[^>]*|(?=[^>]*<img\b)[^>]*)/gi, (tag) => {
+    if (!tag.includes('<', 1)) {
+      return '<img loading="lazy"' + tag.slice(4)
+    }
+    let lastLoading = -1
+    for (const attribute of tag.matchAll(/\bloading=/gi)) lastLoading = attribute.index
+    return tag.replace(/<img\b/gi, (match, offset: number) => (
+      offset < lastLoading ? match : '<img loading="lazy"'
+    ))
+  })
 }
 
 interface MarkdownFence {
@@ -1175,11 +1201,12 @@ function extractTrustedYouTubeEmbed(iframeHtml: string): TrustedYouTubeEmbed | n
   return { src, title }
 }
 
-function extractTrustedYouTubeEmbeds(raw: string): { content: string; embeds: TrustedYouTubeEmbed[] } {
+export function extractTrustedYouTubeEmbeds(raw: string): { content: string; embeds: TrustedYouTubeEmbed[] } {
   if (!/<iframe\b/i.test(raw)) return { content: raw, embeds: [] }
 
   const embeds: TrustedYouTubeEmbed[] = []
-  const content = raw.replace(/<iframe\b[\s\S]*?<\/iframe\s*>/gi, (match) => {
+  const content = raw.replace(/<iframe\b[\s\S]*?(<\/iframe\s*>|$)/gi, (match, close: string) => {
+    if (!close) return match
     const embed = extractTrustedYouTubeEmbed(match)
     if (!embed) return match
     const idx = embeds.length
@@ -1194,9 +1221,9 @@ function extractTrustedYouTubeEmbeds(raw: string): { content: string; embeds: Tr
 // sanitize pipeline emit a structure where the in-progress block briefly takes
 // up real vertical space. Pre-closing any unbalanced tags keeps the rendered
 // tree stable and avoids a visible height spike followed by a snap back.
-const STREAMING_DETAILS_TAG_RE = /<\/?(details|summary)\b[^>]*>/gi
+const STREAMING_DETAILS_TAG_RE = /<\/?(details|summary)\b[^>]*(>|$)/gi
 
-function balanceStreamingDetails(raw: string): string {
+export function balanceStreamingDetails(raw: string): string {
   if (!raw.includes('<')) return raw
   const fences = getMarkdownFenceRanges(raw)
   let openDetails = 0
@@ -1205,6 +1232,7 @@ function balanceStreamingDetails(raw: string): string {
   STREAMING_DETAILS_TAG_RE.lastIndex = 0
   let match: RegExpExecArray | null
   while ((match = STREAMING_DETAILS_TAG_RE.exec(raw)) !== null) {
+    if (!match[2]) break
     const pos = match.index
     while (fenceIdx < fences.length && fences[fenceIdx][1] <= pos) fenceIdx++
     if (fenceIdx < fences.length && pos >= fences[fenceIdx][0] && pos < fences[fenceIdx][1]) continue
@@ -1298,61 +1326,76 @@ function notifyMessageContentLayout(el: HTMLElement): void {
   dispatchMessageContentLayout(el)
 }
 
-function replaceHtmlPreservingImages(root: HTMLElement | ShadowRoot, html: string): void {
-  const stableImgs = new Map<string, HTMLImageElement>()
-  for (const img of root.querySelectorAll<HTMLImageElement>('img[src]')) {
-    const src = img.getAttribute('src')
-    if (src && !stableImgs.has(src)) stableImgs.set(src, img)
-  }
-
-  root.innerHTML = html
-
-  for (const newImg of root.querySelectorAll<HTMLImageElement>('img[src]')) {
-    const src = newImg.getAttribute('src')
-    if (!src) continue
-    const preserved = stableImgs.get(src)
-    if (preserved && newImg.parentNode) {
-      // Reuse the decoded image, but keep the current render's layout and metadata.
-      if (!preserved.isEqualNode(newImg)) {
-        const oldAttributes = preserved.attributes
-        for (let i = oldAttributes.length - 1; i >= 0; i--) {
-          const attribute = oldAttributes[i]
-          const value = newImg.getAttribute(attribute.name)
-          if (value === null) preserved.removeAttribute(attribute.name)
-          else if (attribute.value !== value) attribute.value = value
-        }
-        const newAttributes = newImg.attributes
-        if (oldAttributes.length !== newAttributes.length) {
-          for (let i = 0; i < newAttributes.length; i++) {
-            const { name, value } = newAttributes[i]
-            if (!preserved.hasAttribute(name)) preserved.setAttribute(name, value)
-          }
-        }
-      }
-      newImg.replaceWith(preserved)
-      stableImgs.delete(src)
-    }
-  }
+const ISLAND_IMAGE_PRESENTATION_CSS = `
+:host([data-chat-image-presentation][data-chat-image-targets~="markdown"]) p:has(img.${styles.proseImage}),
+:host([data-chat-image-presentation][data-chat-image-targets~="html"]) p:has(img:not(.${styles.proseImage})) {
+  width: 100%;
+  max-width: 100%;
+  clear: both;
 }
-export function IsolatedHtml({ html, isStreaming }: { html: string; isStreaming: boolean }) {
+
+:host([data-chat-image-presentation][data-chat-image-targets~="markdown"]) span:has(> img.${styles.proseImage}),
+:host([data-chat-image-presentation][data-chat-image-targets~="markdown"]) a:has(img.${styles.proseImage}),
+:host([data-chat-image-presentation][data-chat-image-targets~="html"]) span:has(> img:not(.${styles.proseImage})),
+:host([data-chat-image-presentation][data-chat-image-targets~="html"]) a:has(img:not(.${styles.proseImage})) {
+  display: block !important;
+  width: 100% !important;
+  max-width: 100% !important;
+  height: auto !important;
+  max-height: none !important;
+  overflow: visible !important;
+}
+
+:host([data-chat-image-presentation][data-chat-image-targets~="markdown"]) img.${styles.proseImage},
+:host([data-chat-image-presentation][data-chat-image-targets~="html"]) img:not(.${styles.proseImage}) {
+  display: block !important;
+  float: none !important;
+  margin-left: var(--chat-image-margin-left, 0) !important;
+  margin-right: var(--chat-image-margin-right, auto) !important;
+  object-position: var(--chat-image-object-position, left) !important;
+}
+
+:host([data-chat-image-presentation][data-chat-image-targets~="markdown"]) .${styles.proseImage} {
+  max-width: min(100%, var(--prose-image-max-width, 240px));
+}
+
+:host([data-chat-image-presentation][data-chat-image-targets~="markdown"][data-chat-image-size]) img.${styles.proseImage},
+:host([data-chat-image-presentation][data-chat-image-targets~="html"][data-chat-image-size]) img:not(.${styles.proseImage}) {
+  width: var(--chat-image-width) !important;
+  max-width: 100% !important;
+  height: auto !important;
+  max-height: var(--chat-image-max-height) !important;
+  object-fit: contain !important;
+}
+`
+
+export function IsolatedHtml({ html, isStreaming, imagePresentation, imageSize, imageTargets }: { html: string; isStreaming: boolean; imagePresentation?: boolean; imageSize?: string; imageTargets?: string }) {
   const ref = useRef<HTMLDivElement>(null)
 
   useLayoutEffect(() => {
     const el = ref.current
     if (!el) return
     const shadow = el.shadowRoot ?? el.attachShadow({ mode: 'open' })
-    replaceHtmlPreservingImages(shadow, `<style data-lumi-island-base>${ISLAND_BASE_CSS}</style>${html}`)
-    for (const actionEl of shadow.querySelectorAll<HTMLElement>('[data-lumiverse-regex-action]')) {
+    clearChatFindHighlights(shadow)
+    const next = createMessageHtmlTree(`<style data-lumi-island-base>${ISLAND_BASE_CSS}</style>${html}<style data-lumi-image-presentation>${ISLAND_IMAGE_PRESENTATION_CSS}</style>`)
+    for (const actionEl of next.querySelectorAll<HTMLElement>('[data-lumiverse-regex-action]')) {
       actionEl.style.cursor = 'pointer'
     }
     if (
       el.classList.contains('not-prose')
       || el.classList.contains('not-island-prose')
-      || shadow.querySelector('.not-prose, .not-island-prose')
+      || next.querySelector('.not-prose, .not-island-prose')
     ) {
-      shadow.querySelector('style[data-lumi-island-base]')?.remove()
+      next.querySelector('style[data-lumi-island-base]')?.remove()
     }
+    reconcileMessageHtml(shadow, next)
     notifyMessageContentLayout(el)
+  }, [html])
+
+  useLayoutEffect(() => {
+    const el = ref.current
+    const shadow = el?.shadowRoot
+    if (!el || !shadow) return
 
     let pendingRaf = 0
     const scheduleLayoutNotify = () => {
@@ -1385,9 +1428,9 @@ export function IsolatedHtml({ html, isStreaming }: { html: string; isStreaming:
       shadow.removeEventListener('error', scheduleLayoutNotify, true)
       if (pendingRaf) cancelAnimationFrame(pendingRaf)
     }
-  }, [html, isStreaming])
+  }, [isStreaming])
 
-  return <div ref={ref} className={styles.htmlIsland} data-lumiverse-html-island />
+  return <div ref={ref} className={styles.htmlIsland} data-lumiverse-html-island data-chat-image-targets={imageTargets} data-chat-image-presentation={imagePresentation || undefined} data-chat-image-size={imageSize} />
 }
 
 const CHAT_FIND_HIGHLIGHT_ATTR = 'data-chat-find-highlight'
@@ -1545,7 +1588,7 @@ function restoreInlineHtmlCardSpacing(root: HTMLElement, html: string): void {
   for (const card of cards) {
     const parent = card.parentNode
     if (!parent) continue
-    const shell = document.createElement('div')
+    const shell = root.ownerDocument.createElement('div')
     shell.className = styles.inlineHtmlCard
     shell.setAttribute(INLINE_HTML_CARD_ATTR, '')
     parent.insertBefore(shell, card)
@@ -1554,9 +1597,8 @@ function restoreInlineHtmlCardSpacing(root: HTMLElement, html: string): void {
 }
 
 /**
- * dangerouslySetInnerHTML wrapper that preserves IMG element identity by
- * src across innerHTML replacements, so images don't redo the cache lookup,
- * decode, paint cycle on every chat re-render.
+ * Update only changed DOM nodes so streamed text leaves media and animation
+ * containers connected, including their browser-managed interaction state.
  */
 export function ProseHtml({ html, className, skipInlineCardWrapping = false }: { html: string; className?: string; skipInlineCardWrapping?: boolean }) {
   const ref = useRef<HTMLDivElement>(null)
@@ -1568,13 +1610,12 @@ export function ProseHtml({ html, className, skipInlineCardWrapping = false }: {
     if (!el) return
     if (lastHtmlRef.current === html && lastWrappingRef.current === skipInlineCardWrapping) return
 
-    replaceHtmlPreservingImages(el, html)
-    if (skipInlineCardWrapping) {
-      el.classList.remove(styles.inlineHtmlCard)
-      el.removeAttribute(INLINE_HTML_CARD_ATTR)
-    } else {
-      restoreInlineHtmlCardSpacing(el, html)
-    }
+    clearChatFindHighlights(el)
+    const next = createMessageHtmlTree(html)
+    if (!skipInlineCardWrapping) restoreInlineHtmlCardSpacing(next, html)
+    reconcileMessageHtml(el, next)
+    el.classList.toggle(styles.inlineHtmlCard, next.classList.contains(styles.inlineHtmlCard))
+    el.toggleAttribute(INLINE_HTML_CARD_ATTR, next.hasAttribute(INLINE_HTML_CARD_ATTR))
     lastHtmlRef.current = html
     lastWrappingRef.current = skipInlineCardWrapping
     notifyMessageContentLayout(el)
@@ -1600,12 +1641,6 @@ function TrustedYouTubeEmbed({ embed }: { embed: TrustedYouTubeEmbed }) {
 
 // Risu <img="AssetName"> tag pattern — resolved at display time using character's asset map
 const RISU_IMG_TAG_RE = /<img="([^"]+)">/gi
-
-// Standard <img src="AssetName"> where src is a relative asset reference (not a URL)
-const IMG_SRC_ASSET_RE = /<img\b([^>]*)\bsrc=["']([^"']+)["']([^>]*)>/gi
-
-// Markdown ![alt](src) where src is a relative asset reference (not a URL)
-const MARKDOWN_IMG_RE = /!\[([^\]]*)\]\(([^)]+)\)/g
 
 /** Strip path prefix and file extension to get the asset stem. */
 function assetStem(name: string): string {
@@ -1638,13 +1673,12 @@ function resolveRisuAssetTags(text: string, assetMap: Record<string, string>): s
  *  Unresolved asset refs are converted to markdown images so they go through the same
  *  custom renderer (proseImageWrap, lightbox) as Risu <img="..."> tags.
  *  Already-resolved URLs (absolute paths, http, data:) are left as raw HTML. */
-function resolveImgSrcAssetTags(text: string, assetMap: Record<string, string>): string {
+export function resolveImgSrcAssetTags(text: string, assetMap: Record<string, string>): string {
   // Gallery sources retain their original HTML tag so display-regex styling
   // and wrapper behavior survive. Other legacy asset references continue to
   // use the standard Markdown image renderer below.
   text = resolveGalleryImageSourcesInHtml(text, assetMap)
-  IMG_SRC_ASSET_RE.lastIndex = 0
-  return text.replace(IMG_SRC_ASSET_RE, (match, before: string, src: string, after: string) => {
+  return replaceHtmlImageSources(text, 'asset', (match, _before, _quote, src) => {
     // Skip already-resolved URLs — these are valid img tags that should render as-is
     if (/^(?:https?:\/\/|\/|data:)/i.test(src)) return match
     const imageId = resolveAssetId(src, assetMap)
@@ -1660,18 +1694,30 @@ function resolveImgSrcAssetTags(text: string, assetMap: Record<string, string>):
  *  Handles the common AI-generated pattern of referencing Risu assets by relative
  *  filename (including extensions like .webp/.png/.jpg). Already-resolved URLs are
  *  left as-is. Strips a trailing markdown title ("...") before lookup. */
-function resolveMarkdownImgTags(text: string, assetMap: Record<string, string>): string {
-  if (!text.includes('![')) return text
-  MARKDOWN_IMG_RE.lastIndex = 0
-  return text.replace(MARKDOWN_IMG_RE, (match, alt: string, rawSrc: string) => {
-    // Strip trailing markdown title: ![alt](src "title") → src
-    const src = rawSrc.trim().replace(/\s+["'][^"']*["']\s*$/, '').trim()
-    if (!src) return match
-    if (/^(?:https?:\/\/|\/|data:)/i.test(src)) return match
-    const imageId = resolveAssetId(src, assetMap)
-    if (imageId) return `![${alt}](/api/v1/images/${imageId})`
-    return match
-  })
+export function resolveMarkdownImgTags(text: string, assetMap: Record<string, string>): string {
+  let copied = 0
+  let cursor = 0
+  const output: string[] = []
+  while ((cursor = text.indexOf('![', cursor)) !== -1) {
+    const labelEnd = text.indexOf(']', cursor + 2)
+    if (labelEnd === -1) break
+    if (text[labelEnd + 1] !== '(') { cursor = labelEnd + 1; continue }
+    const sourceEnd = text.indexOf(')', labelEnd + 2)
+    if (sourceEnd === -1) break
+    if (sourceEnd === labelEnd + 2) { cursor = labelEnd + 1; continue }
+    const rawSrc = text.slice(labelEnd + 2, sourceEnd)
+    const src = rawSrc.trim().replace(/(?<!\s)\s+["'][^"']*["']\s*$/, '').trim()
+    if (src && !/^(?:https?:\/\/|\/|data:)/i.test(src)) {
+      const imageId = resolveAssetId(src, assetMap)
+      if (imageId) {
+        const alt = text.slice(cursor + 2, labelEnd)
+        output.push(text.slice(copied, cursor), `![${alt}](/api/v1/images/${imageId})`)
+        copied = sourceEnd + 1
+      }
+    }
+    cursor = sourceEnd + 1
+  }
+  return output.length ? output.join('') + text.slice(copied) : text
 }
 
 export default function MessageContent({
@@ -1680,11 +1726,14 @@ export default function MessageContent({
   userName,
   isStreaming = false,
   messageId,
+  swipeIndex,
+  presetContext,
   chatId,
   depth = 0,
   characterNameOverride,
   risuAssetMapOverride,
   disableInterceptors = false,
+  readOnly = false,
   findQuery = '',
 }: MessageContentProps) {
   const { t } = useTranslation('chat')
@@ -1692,8 +1741,14 @@ export default function MessageContent({
   const skipFormattingHealing = useSyncExternalStore(subscribeDisplayFormatting, getFormattingSnapshot, getFormattingSnapshot)
   const getWrappingSnapshot = useCallback(() => shouldSkipInlineCardWrapping(chatId), [chatId])
   const skipInlineCardWrapping = useSyncExternalStore(subscribeDisplayFormatting, getWrappingSnapshot, getWrappingSnapshot)
+  const chatImageSize = useStore((s) => s.chatImageSize ?? 'default')
+  const chatImageAlignment = useStore((s) => s.chatImageAlignment ?? 'left')
+  const targets = useStore(s => s.chatImageTargets ?? DEFAULT_CHAT_IMAGE_TARGETS)
+  const imageTargets = [targets.markdown && 'markdown', targets.html && 'html'].filter(Boolean).join(' ')
+  const imagePresentation = !!imageTargets && !!chatId && !!messageId && (chatImageSize !== 'default' || chatImageAlignment !== 'left')
+  const imageSize = imagePresentation && chatImageSize !== 'default' ? chatImageSize : undefined
   const activeCharacterId = useStore((s) => s.activeCharacterId)
-  const regexScripts = useStore((s) => s.regexScripts)
+  const configuredRegexScripts = useStore((s) => s.regexScripts)
   const actionUsage = useStore((s) => {
     if (!messageId) return undefined
     return s.messages.find((message) => message.id === messageId)?.extra?.associative_regex_action_usage
@@ -1739,30 +1794,31 @@ export default function MessageContent({
     () => {
       // interceptorRegistryVersion is the external-store invalidation trigger.
       void interceptorRegistryVersion
-      return disableInterceptors
+      return disableInterceptors || readOnly
         ? { content, intercepts: [] }
         : stripMessageTags(content, { messageId, chatId, isUser, isStreaming })
     },
-    [content, messageId, chatId, isUser, isStreaming, interceptorRegistryVersion, disableInterceptors],
+    [content, messageId, chatId, isUser, isStreaming, interceptorRegistryVersion, disableInterceptors, readOnly],
   )
 
   useLayoutEffect(() => {
-    if (disableInterceptors || interceptedMessageTags.intercepts.length === 0) return
+    if (disableInterceptors || readOnly || interceptedMessageTags.intercepts.length === 0) return
     dispatchMessageTagIntercepts(interceptedMessageTags.intercepts, deliveredTagInterceptsRef.current)
-  }, [interceptedMessageTags.intercepts, disableInterceptors])
+  }, [interceptedMessageTags.intercepts, disableInterceptors, readOnly])
 
   const interceptorCleanedContent = interceptedMessageTags.content
 
   const macroCtx = useMemo(() => ({ charName, userName }), [charName, userName])
   const preprocessOpts = useMemo(
     () => (messageId
-      ? { messageId, chatId, role: (isUser ? 'user' : 'assistant') as 'user' | 'assistant' }
+      ? { messageId, chatId, swipeIndex, presetContext, role: (isUser ? 'user' : 'assistant') as 'user' | 'assistant' }
       : undefined),
-    [messageId, chatId, isUser],
+    [messageId, chatId, swipeIndex, presetContext, isUser],
   )
-  const { content: regexAppliedContent, pending: displayPending } = useDisplayRegexState(
+  const { content: regexAppliedContent, pending: displayPending, scripts: routedRegexScripts } = useDisplayRegexState(
     interceptorCleanedContent, isUser, depth, macroCtx, preprocessOpts, isStreaming,
   )
+  const regexScripts = routedRegexScripts ?? configuredRegexScripts
 
   const risuResolvedContent = useMemo(
     () => {
@@ -1780,8 +1836,15 @@ export default function MessageContent({
     [risuResolvedContent, charName, userName],
   )
   const deferredResolvedContent = useDeferredValue(resolvedContent)
-  const renderContent = isStreaming ? balanceStreamingDetails(deferredResolvedContent) : resolvedContent
+  // Cold rows already reserve their estimated height in MessageList. Do not
+  // parse/mount provisional Markdown or HTML that will immediately be replaced:
+  // apart from the extra work, WebKit can briefly rasterize that source while
+  // the row's visibility and measured position are being committed.
+  const renderContent = isStreaming
+    ? balanceStreamingDetails(deferredResolvedContent)
+    : displayPending ? '' : resolvedContent
   const previousRenderContentRef = useRef<string | null>(null)
+  const previousDisplayPendingRef = useRef(displayPending)
   const blocks = useMemo(() => parseOOC(renderContent), [renderContent])
   const oocEnabled = useStore((s) => s.oocEnabled)
   const lumiaOOCStyle = useStore((s) => s.lumiaOOCStyle)
@@ -1795,7 +1858,7 @@ export default function MessageContent({
   ))
   const setLongMessageExpanded = useStore((s) => s.setLongMessageExpanded)
   const longMessageEligible = isLongMessageCollapseEligible({
-    enabled: longMessageCollapseEnabled,
+    enabled: longMessageCollapseEnabled && !readOnly,
     isUser,
     depth,
     collapseDepth: longMessageCollapseDepth,
@@ -1808,7 +1871,6 @@ export default function MessageContent({
   )
   const containerRef = useRef<HTMLDivElement>(null)
   const contentBodyRef = useRef<HTMLDivElement>(null)
-  const prevTextLenRef = useRef(0)
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null)
   const [regexSelectionVersion, setRegexSelectionVersion] = useState(0)
   const [longMessageOverflowing, setLongMessageOverflowing] = useState(false)
@@ -1838,13 +1900,15 @@ export default function MessageContent({
   // scrollDirection value. Initial mounts deliberately remain unmarked.
   useLayoutEffect(() => {
     const previous = previousRenderContentRef.current
+    const displayReady = previousDisplayPendingRef.current && !displayPending && !isStreaming
     previousRenderContentRef.current = renderContent
-    if (previous === null || previous === renderContent) return
+    previousDisplayPendingRef.current = displayPending
+    if (previous === null || (previous === renderContent && !displayReady)) return
 
     const container = containerRef.current
     if (!container) return
-    dispatchMessageContentLayout(container, { preserveScrollAnchor: true })
-  }, [renderContent])
+    dispatchMessageContentLayout(container, { preserveScrollAnchor: true, displayReady })
+  }, [renderContent, displayPending, isStreaming])
 
   const handleLightboxClose = useCallback(() => setLightboxSrc(null), [])
 
@@ -1865,7 +1929,7 @@ export default function MessageContent({
   // island's shadow root. composedPath() finds the authored target in both.
   useEffect(() => {
     const container = containerRef.current
-    if (!container || isStreaming || !chatId) return
+    if (!container || isStreaming || !chatId || readOnly) return
 
     const findActionTarget = (event: Event): Element | null => (
       event.composedPath().find((node): node is Element => (
@@ -1932,6 +1996,7 @@ export default function MessageContent({
         chatId,
         messageId,
         ...(configured.effects?.length ? { effects: configured.effects } : {}),
+        actionSignature: regexActionSignature(payload),
         ...(queue ? { queue: true } : {}),
       })
     }
@@ -2005,13 +2070,13 @@ export default function MessageContent({
       container.removeEventListener('contextmenu', activate)
       longPress.destroy()
     }
-  }, [chatId, messageId, isUser, isStreaming, regexScripts, actionUsage, regexActionsSuperseded, t, regexSelectionVersion])
+  }, [chatId, messageId, isUser, isStreaming, regexScripts, actionUsage, regexActionsSuperseded, t, regexSelectionVersion, readOnly])
 
   useLayoutEffect(() => {
     const container = containerRef.current
     if (!container) return
     const elements: Element[] = Array.from(container.querySelectorAll('[data-lumiverse-regex-action]'))
-    for (const island of container.querySelectorAll<HTMLElement>(`.${styles.htmlIsland}`)) {
+    for (const island of container.querySelectorAll<HTMLElement>('[data-lumiverse-html-island]')) {
       if (island.shadowRoot) {
         elements.push(...Array.from(island.shadowRoot.querySelectorAll('[data-lumiverse-regex-action]')))
       }
@@ -2060,7 +2125,7 @@ export default function MessageContent({
         if (configured.multi_select) element.setAttribute('aria-pressed', selected ? 'true' : 'false')
         else element.removeAttribute('aria-pressed')
         const stateEffectBlocked = isUser && !!configured.effects?.length
-        const disabled = used || regexActionsSuperseded || stateEffectBlocked
+        const disabled = readOnly || used || regexActionsSuperseded || stateEffectBlocked
         element.toggleAttribute('data-lumiverse-regex-action-superseded', regexActionsSuperseded)
         element.toggleAttribute('data-lumiverse-regex-action-state-blocked', stateEffectBlocked)
         if (disabled) {
@@ -2098,7 +2163,7 @@ export default function MessageContent({
         }
       } catch {}
     }
-  }, [actionUsage, regexActionsSuperseded, regexScripts, renderContent, regexSelectionVersion, chatId, isUser, messageId])
+  }, [actionUsage, regexActionsSuperseded, regexScripts, renderContent, regexSelectionVersion, chatId, isUser, messageId, readOnly])
 
   // Attach click handler for code copy buttons
   useEffect(() => {
@@ -2269,7 +2334,7 @@ export default function MessageContent({
             const piece = pieces[p]
             elements.push(
               piece.type === 'island'
-                ? <IsolatedHtml key={`${i}-island-${p}`} html={piece.content} isStreaming={isStreaming} />
+                ? <IsolatedHtml key={`${i}-island-${p}`} html={piece.content} isStreaming={isStreaming} imagePresentation={imagePresentation} imageSize={imageSize} imageTargets={imageTargets} />
                 : piece.type === 'youtubeEmbed'
                   ? <TrustedYouTubeEmbed key={`${i}-youtube-${p}`} embed={piece.embed} />
                 : <ProseHtml key={`${i}-${p}`} className={styles.prose} html={piece.content} skipInlineCardWrapping={skipInlineCardWrapping} />
@@ -2292,7 +2357,7 @@ export default function MessageContent({
             const piece = pieces[p]
             elements.push(
               piece.type === 'island'
-                ? <IsolatedHtml key={`${i}-island-${p}`} html={piece.content} isStreaming={isStreaming} />
+                ? <IsolatedHtml key={`${i}-island-${p}`} html={piece.content} isStreaming={isStreaming} imagePresentation={imagePresentation} imageSize={imageSize} imageTargets={imageTargets} />
                 : piece.type === 'youtubeEmbed'
                   ? <TrustedYouTubeEmbed key={`${i}-youtube-${p}`} embed={piece.embed} />
                 : <ProseHtml key={`${i}-${p}`} className={styles.prose} html={piece.content} skipInlineCardWrapping={skipInlineCardWrapping} />
@@ -2303,7 +2368,7 @@ export default function MessageContent({
     }
 
     return elements
-  }, [blocks, oocEnabled, lumiaOOCStyle, isStreaming, skipFormattingHealing, skipInlineCardWrapping])
+  }, [blocks, oocEnabled, lumiaOOCStyle, isStreaming, skipFormattingHealing, skipInlineCardWrapping, imagePresentation, imageSize, imageTargets])
 
   useLayoutEffect(() => {
     measureLongMessageOverflow()
@@ -2344,65 +2409,14 @@ export default function MessageContent({
     }
   }, [findQuery, renderedBlocks])
 
-  // Chunk fade animation for streaming tokens
-  useLayoutEffect(() => {
-    if (!isStreaming || !containerRef.current) {
-      prevTextLenRef.current = content.length
-      return
-    }
-
-    const container = containerRef.current
-    const currentLen = content.length
-    const prevLen = prevTextLenRef.current
-
-    if (currentLen <= prevLen) {
-      prevTextLenRef.current = currentLen
-      return
-    }
-
-    // Walk text nodes and wrap new content
-    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT)
-    let charCount = 0
-    const nodesToWrap: { node: Text; start: number; end: number }[] = []
-
-    while (walker.nextNode()) {
-      const textNode = walker.currentNode as Text
-      const nodeLen = textNode.length
-      const nodeStart = charCount
-      const nodeEnd = charCount + nodeLen
-
-      if (nodeEnd > prevLen) {
-        const start = Math.max(0, prevLen - nodeStart)
-        nodesToWrap.push({ node: textNode, start, end: nodeLen })
-      }
-
-      charCount += nodeLen
-    }
-
-    for (const { node, start, end } of nodesToWrap) {
-      if (start === 0 && end === node.length) {
-        // Wrap entire node
-        const span = document.createElement('span')
-        span.className = styles.chunkFade
-        node.parentNode?.insertBefore(span, node)
-        span.appendChild(node)
-      } else if (start < end) {
-        // Split and wrap only new portion
-        const newPart = node.splitText(start)
-        const span = document.createElement('span')
-        span.className = styles.chunkFade
-        newPart.parentNode?.insertBefore(span, newPart)
-        span.appendChild(newPart)
-      }
-    }
-
-    prevTextLenRef.current = currentLen
-  }, [content, isStreaming])
-
   return (
     <>
       <div
         data-component="MessageContent"
+        data-chat-image-presentation={imagePresentation || undefined}
+        data-chat-image-size={imageSize}
+        data-chat-image-targets={imageTargets}
+        style={imagePresentation ? chatImagePresentationStyle(chatImageSize, chatImageAlignment) : undefined}
         data-display-pending={!isStreaming && displayPending || undefined}
         ref={containerRef}
         className={clsx(styles.content, isUser ? styles.contentUser : styles.contentChar)}
@@ -2418,7 +2432,7 @@ export default function MessageContent({
         >
           <div ref={contentBodyRef} className={styles.longMessageBody}>
             {renderedBlocks}
-      <SpindleMessageWidgets messageId={messageId} chatId={chatId} />
+      {!readOnly && <SpindleMessageWidgets messageId={messageId} chatId={chatId} />}
           </div>
         </div>
         {longMessageEligible && longMessageOverflowing && (

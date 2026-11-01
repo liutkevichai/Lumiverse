@@ -191,7 +191,7 @@ export function resolveNanoGptSubscriptionUsageUrl(profile: { api_url?: string |
 export async function resolvePollinationsAppKey(userId: string): Promise<string> {
   const envKey = env.pollinationsAppKey.trim();
   const stored = await secretsSvc.getSecretForStatus(userId, POLLINATIONS_APP_KEY_SECRET);
-  const setting = settingsSvc.getSetting(userId, LEGACY_POLLINATIONS_APP_KEY_SETTING);
+  const setting = await settingsSvc.getSettingAsync(userId, LEGACY_POLLINATIONS_APP_KEY_SETTING);
   const legacy = typeof setting?.value === "string" ? setting.value.trim() : "";
 
   if (setting) {
@@ -200,7 +200,7 @@ export async function resolvePollinationsAppKey(userId: string): Promise<string>
     if (legacy && !stored) {
       await secretsSvc.putSecret(userId, POLLINATIONS_APP_KEY_SECRET, legacy);
     }
-    settingsSvc.deleteSetting(userId, LEGACY_POLLINATIONS_APP_KEY_SETTING);
+    await settingsSvc.deleteSettingAsync(userId, LEGACY_POLLINATIONS_APP_KEY_SETTING);
   }
 
   return envKey || stored || legacy;
@@ -231,7 +231,7 @@ export async function migrateLegacyPollinationsAppKeys(): Promise<number> {
       await secretsSvc.putSecret(row.user_id, POLLINATIONS_APP_KEY_SECRET, legacy);
       migrated++;
     }
-    settingsSvc.deleteSetting(row.user_id, LEGACY_POLLINATIONS_APP_KEY_SETTING);
+    await settingsSvc.deleteSettingAsync(row.user_id, LEGACY_POLLINATIONS_APP_KEY_SETTING);
   }
 
   return migrated;
@@ -484,6 +484,7 @@ export async function createConnection(userId: string, input: CreateConnectionPr
       now, now
     );
 
+  eventBus.emit(EventType.CONNECTION_ORGANIZATION_CHANGED, { kind: 'llm' }, userId);
   return getConnection(userId, id)!;
 }
 
@@ -574,9 +575,10 @@ export async function duplicateConnection(userId: string, id: string): Promise<C
 export async function deleteConnection(userId: string, id: string): Promise<boolean> {
   const deleted = getDb().query("DELETE FROM connection_profiles WHERE id = ? AND user_id = ?").run(id, userId).changes > 0;
   if (deleted) {
+    eventBus.emit(EventType.CONNECTION_ORGANIZATION_CHANGED, { kind: 'llm' }, userId);
     // Cleanup the connection's secret
     secretsSvc.deleteSecret(userId, connectionSecretKey(id));
-    settingsSvc.deleteSetting(userId, `presetProfile:connection:${id}`);
+    await settingsSvc.deleteSettingAsync(userId, `presetProfile:connection:${id}`);
     eventBus.emit(EventType.PRESET_PROFILE_CHANGED, { key: `presetProfile:connection:${id}`, binding: null }, userId);
   }
   return deleted;
@@ -766,6 +768,7 @@ export async function fetchNanoGptSubscriptionUsage(userId: string, id: string):
       headers: {
         Authorization: `Bearer ${apiKey}`,
       },
+      signal: AbortSignal.timeout(DEFAULT_CONNECTION_TEST_TIMEOUT_MS),
     });
     if (!res.ok) return null;
 

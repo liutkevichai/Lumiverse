@@ -1,9 +1,10 @@
+import { DatabaseExecutionError, isDatabaseUnavailable } from "./db/execution";
 import { Hono, type Handler } from "hono";
 import { cors } from "hono/cors";
 import { compress } from "./middleware/compress";
 import { bodyLimit } from "hono/body-limit";
-import { serveStatic } from "hono/bun";
-import { websocket } from "hono/bun";
+import { serveStatic } from "@hono/bun";
+import { websocket } from "./ws/transport";
 import { env } from "./env";
 import { auth } from "./auth";
 import { rewriteLegacySsoCallbackPath } from "./auth/callback-compat";
@@ -27,6 +28,7 @@ import { providersRoutes } from "./routes/providers.routes";
 import { macrosRoutes } from "./routes/macros.routes";
 import { spindleRoutes } from "./routes/spindle.routes";
 import { uploadsRoutes } from "./routes/uploads.routes";
+import { spindleFilesRoutes } from "./routes/spindle-files.routes";
 import { usersRoutes } from "./routes/users.routes";
 import { ssoProvidersRoutes } from "./routes/sso-providers.routes";
 import { packsRoutes } from "./routes/packs.routes";
@@ -53,13 +55,22 @@ import { regexScriptsRoutes } from "./routes/regex-scripts.routes";
 import { expressionsRoutes } from "./routes/expressions.routes";
 import { pushRoutes } from "./routes/push.routes";
 import { desktopNotificationTransportRoutes } from "./routes/desktop-notifications.routes";
+import { androidNotificationTransportRoutes } from "./routes/android-notifications.routes";
+import { iosNotificationMediaRoutes } from "./routes/ios-notifications.routes";
+import { spindleLiveActivityRoutes, spindleLiveActivityTransportRoutes } from "./routes/spindle-live-activities.routes";
+import { iosLiveActivityRoutes, iosLiveActivityTransportRoutes } from "./routes/ios-live-activities.routes";
+import { iosWidgetRoutes, iosWidgetTransportRoutes } from "./routes/ios-widgets.routes";
 import { desktopApiRoutes } from "./routes/desktop-api.routes";
 import { memoryCortexRoutes } from "./routes/memory-cortex.routes";
+import { inferenceSchedulerRoutes } from "./routes/inference-scheduler.routes";
+import "./services/inference-scheduler/notifier";
 import { operatorRoutes } from "./routes/operator.routes";
 import { openrouterRoutes } from "./routes/openrouter.routes";
 import { nanogptRoutes } from "./routes/nanogpt.routes";
 import { ttsConnectionsRoutes } from "./routes/tts-connections.routes";
 import { sttConnectionsRoutes } from "./routes/stt-connections.routes";
+import { decisionConnectionsRoutes } from "./routes/decision-connections.routes";
+import { decisionsRoutes } from "./routes/decisions.routes";
 import { ttsRoutes } from "./routes/tts.routes";
 import { sttRoutes } from "./routes/stt.routes";
 import { mcpServersRoutes } from "./routes/mcp-servers.routes";
@@ -108,11 +119,11 @@ app.use("*", compress());
 // Body size limit — 10 MB default for API routes.
 // Import routes (migrate/*, characters/import, characters/import-bulk) are excluded
 // here to support charx uploads up to 100 MB; the Bun server-level maxRequestBodySize
-// (512 MB in index.ts) covers them.
+// in main.ts permits streaming account archives without a fixed size quota.
 // Public/unauthenticated POST surfaces (auth, OAuth callbacks, etc.) never
 // need a multi-megabyte body. Apply a tight 1 MB cap before the broader 10 MB
-// rule below so a client without credentials cannot drive the server-level
-// 1 GB limit by hitting an unauthenticated endpoint with a giant payload.
+// rule below so unauthenticated endpoints cannot consume the archive upload
+// allowance with giant payloads.
 const PUBLIC_POST_PREFIXES = [
   "/api/auth/",
   "/api/spindle-oauth/",
@@ -120,6 +131,7 @@ const PUBLIC_POST_PREFIXES = [
   "/api/v1/openrouter/oauth-landing",
   "/api/v1/nanogpt/oauth-landing",
   "/api/desktop-notifications/v1",
+  "/api/android-notifications/v1",
 ];
 app.use("/api/*", async (c, next) => {
   const clientId = getClientIp(c);
@@ -388,6 +400,11 @@ app.route("/api/integrations/stream-deck/v1", streamDeckIntegrationRoutes);
 // browser-session auth so a desktop rebuild or WebView cookie loss does not
 // silently unregister the native destination.
 app.route("/api/desktop-notifications/v1", desktopNotificationTransportRoutes);
+app.route("/api/android-notifications/v1", androidNotificationTransportRoutes);
+app.route("/api/ios-notifications/v1", iosNotificationMediaRoutes);
+app.route("/api/spindle-activities/v1", spindleLiveActivityTransportRoutes);
+app.route("/api/ios-activities/v1", iosLiveActivityTransportRoutes);
+app.route("/api/ios-widgets/v1", iosWidgetTransportRoutes);
 // OAuth-protected, read-only desktop API. It performs scope and live role
 // checks independently of the browser-session API below.
 app.route("/api/desktop/v1", desktopApiRoutes);
@@ -407,6 +424,7 @@ app.get("/api/v1/runtime-config", (c) => {
 app.use("/api/v1/*", requireAuth);
 
 app.route("/api/v1/settings", settingsRoutes);
+app.route("/api/v1/ios-widgets", iosWidgetRoutes);
 app.route("/api/v1/docs", docsRoutes);
 app.route("/api/v1/characters", charactersRoutes);
 app.route("/api/v1/chats", chatsRoutes);
@@ -429,6 +447,7 @@ app.route("/api/v1/providers", providersRoutes);
 app.route("/api/v1/macros", macrosRoutes);
 app.route("/api/v1/spindle", spindleRoutes);
 app.route("/api/v1/spindle-uploads", uploadsRoutes);
+app.route("/api/v1/spindle-files", spindleFilesRoutes);
 app.route("/api/v1/users", usersRoutes);
 app.route("/api/v1/sso-providers", ssoProvidersRoutes);
 app.route("/api/v1/packs", packsRoutes);
@@ -450,12 +469,17 @@ app.route("/api/v1/loadouts", loadoutsRoutes);
 app.route("/api/v1/regex-scripts", regexScriptsRoutes);
 app.route("/api/v1/characters/:characterId/expressions", expressionsRoutes);
 app.route("/api/v1/push", pushRoutes);
+app.route("/api/v1/push/ios/spindle-activities", spindleLiveActivityRoutes);
+app.route("/api/v1/push/ios/activities", iosLiveActivityRoutes);
 app.route("/api/v1/lumihub", lumihubRoutes);
 app.route("/api/v1/illarin", illarinRoutes);
 app.route("/api/v1/memory-cortex", memoryCortexRoutes);
+app.route("/api/v1/inference-scheduler", inferenceSchedulerRoutes);
 app.route("/api/v1/operator", operatorRoutes);
 app.route("/api/v1/tts-connections", ttsConnectionsRoutes);
 app.route("/api/v1/stt-connections", sttConnectionsRoutes);
+app.route("/api/v1/decision-connections", decisionConnectionsRoutes);
+app.route("/api/v1/decisions", decisionsRoutes);
 app.route("/api/v1/tts", ttsRoutes);
 app.route("/api/v1/stt", sttRoutes);
 app.route("/api/v1/mcp-servers", mcpServersRoutes);
@@ -514,6 +538,11 @@ app.notFound((c) => c.json({ error: "Not found" }, 404));
 
 app.onError((err, c) => {
   const path = `${c.req.method} ${c.req.path}`;
+  if (isDatabaseUnavailable(err)) {
+    const outcome = err instanceof DatabaseExecutionError ? err.outcome : "unknown";
+    console.warn(`[db] ${path}: ${err.message} (${err.code}, ${outcome})`);
+    return c.json({ error: "Database temporarily unavailable", code: err.code, outcome }, 503);
+  }
   // DOMException has an empty stack, so a raw console.error(err) prints a
   // contextless object dump. Demote client-disconnect aborts to a warn line
   // tagged with the route so they're traceable, and surface real errors with

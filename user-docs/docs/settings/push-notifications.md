@@ -27,6 +27,33 @@ Each device must be subscribed individually. You can manage all your registered 
 
 Lumiverse Desktop registers as a native destination. Its device identity and revocable enrollment credential are stored in the operating system's per-app configuration directory, so rebuilding or updating the desktop bundle does not require you to sign in again just to keep receiving notifications. The credential is pinned to that server's origin and identity; removing the destination in Settings revokes it.
 
+The iOS app uses Apple's native push service (APNs), so it does not require
+browser Push API support. It needs an IPA signed with the Push Notifications
+capability. The official app uses the Lumiverse notification relay, automatically
+verifies the device, and encrypts notification previews between your backend and
+your iPhone. A one-time connection alert may appear while enabling notifications.
+Self-built IPAs can use their owner's Apple provider credentials on the backend. Free
+Personal Team signing cannot enable APNs; the iOS notification settings show
+missing app or server configuration. Once configured, notifications can arrive
+while the app is backgrounded or closed.
+
+If iOS cannot decrypt a preview, it shows a generic Lumiverse alert. The relay
+sees delivery metadata and generic Live Activity progress. Enable notifications
+on this iPhone before using Live Activities through the relay.
+
+The Android app also registers a native destination. Completion alerts can show
+the character's avatar; failure alerts show the connection and error details.
+Tapping an alert opens its chat on the enrolled server. Android 13 and later ask
+for notification permission, and Android's app settings offer separate channels
+for completion and error alerts.
+
+When hosting on the phone, native notifications work while the embedded backend
+is running. When connected to a remote server, both the APK and server need
+matching Firebase configuration. Settings reports missing configuration before
+enrollment. Force-stopping the app prevents remote delivery until it is reopened;
+notifications do not keep an on-device generation running after Android stops the
+backend. Changing servers or signing out clears the app's native enrollment.
+
 ---
 
 ## Notification Events

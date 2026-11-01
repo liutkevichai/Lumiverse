@@ -32,6 +32,8 @@ export interface CharacterPerspectiveLayer {
   intensity: number;
 }
 
+export type CharacterIndexItem = Pick<Character, 'id' | 'name' | 'avatar_path' | 'image_id' | 'creator' | 'folder' | 'library_scope' | 'tags' | 'created_at' | 'updated_at'> & { avatar_crop_image_id?: string | null };
+
 export interface CreateCharacterInput {
   name: string;
   description?: string;
@@ -476,6 +478,38 @@ export interface ImageGenProviderInfo {
   capabilities: ImageGenProviderCapabilities;
 }
 
+// ---- Decision Connection ----
+export type DecisionConnectionProfile = import('lumiverse-spindle-types').DecisionConnectionProfileDTO;
+
+export interface CreateDecisionConnectionInput {
+  name: string;
+  provider: string;
+  api_url?: string;
+  model?: string;
+  is_default?: boolean;
+  default_parameters?: Record<string, any>;
+  metadata?: Record<string, any>;
+  api_key?: string;
+}
+
+export type UpdateDecisionConnectionInput = Partial<CreateDecisionConnectionInput>;
+
+export interface DecisionConnectionTestResult {
+  success: boolean;
+  message: string;
+  provider: string;
+}
+
+export interface DecisionConnectionModelsResult {
+  models: DecisionModelInfo[];
+  provider: string;
+  error?: string;
+}
+
+export type DecisionProviderInfo = import('lumiverse-spindle-types').DecisionProviderDTO;
+export type DecisionProviderCapabilities = DecisionProviderInfo['capabilities'];
+export type DecisionModelInfo = import('lumiverse-spindle-types').DecisionModelDTO;
+
 // ---- STT Connection ----
 export interface SttConnectionProfile {
   id: string;
@@ -586,6 +620,32 @@ export interface TtsConnectionVoicesResult {
   error?: string;
 }
 
+export interface TtsLibraryVoice extends TtsVoice {
+  accent?: string;
+  age?: string;
+  useCase?: string;
+  rate?: number;
+  noticePeriod?: number;
+  liveModeration?: boolean;
+}
+
+export interface TtsVoiceLibraryOptions {
+  page?: number;
+  page_size?: number;
+  search?: string;
+  language?: string;
+  gender?: 'male' | 'female' | 'neutral';
+  sort?: 'trending' | 'created_date' | 'cloned_by_count' | 'usage_character_count_1y';
+}
+
+export interface TtsVoiceLibraryResult {
+  voices: TtsLibraryVoice[];
+  has_more: boolean;
+  total_count?: number;
+  provider: string;
+  error?: string;
+}
+
 export interface TtsConnectionVoicesPreviewInput {
   connection_id?: string;
   provider: string;
@@ -630,17 +690,18 @@ export interface QwenCustomVoiceDeleteResult {
  * (voiceSettings.narrationVoice).
  *
  * `voice` is the provider-side voice id (empty string falls back to the
- * connection's default voice). `parameters.speed` is optional and overrides
+ * connection's default voice). `parameters` holds synthesis overrides; speed overrides
  * the global speed for this voice when set.
  */
 export interface VoiceRef {
   connectionId: string
   voice: string
-  parameters?: { speed?: number }
+  parameters?: Record<string, unknown> & { speed?: number }
 }
 
 export interface TtsParameterSchema {
   type: 'number' | 'integer' | 'boolean' | 'string' | 'select';
+  label?: string;
   default?: any;
   min?: number;
   max?: number;
@@ -649,6 +710,8 @@ export interface TtsParameterSchema {
   required?: boolean;
   options?: Array<{ id: string; label: string }>;
   group?: string;
+  models?: string[];
+  formats?: string[];
 }
 
 export interface TtsProviderCapabilities {
@@ -656,6 +719,7 @@ export interface TtsProviderCapabilities {
   apiKeyRequired: boolean;
   voiceListStyle: 'static' | 'dynamic';
   staticVoices?: TtsVoice[];
+  supportsVoiceLibrary?: boolean;
   modelListStyle: 'static' | 'dynamic';
   staticModels?: Array<{ id: string; label: string }>;
   supportsStreaming: boolean;
@@ -787,6 +851,7 @@ export type UpdatePresetInput = Partial<CreatePresetInput> & {
 };
 
 export interface PresetRegistryItem {
+  cache_revision?: number;
   id: string;
   name: string;
   provider: string;

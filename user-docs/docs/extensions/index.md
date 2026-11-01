@@ -18,6 +18,7 @@ Lumiverse supports extensions through **Spindle**, an isolated extension runtime
 - Access the LLM generation pipeline (raw, batch, streaming, dry-run, observe)
 - Register embedding, text-to-speech, speech-to-text, and sidecar providers that appear in Lumiverse's native settings
 - Use the host speech-to-text API, including bundled on-device Whistle, with the `media` permission
+- Speak text or chat messages through your TTS connections with the `media` permission
 - Register **council tools** that show up in the Lumia Council
 - Register **command palette** entries scoped to global, chat, character, or landing contexts
 - Open **modal dialogs** (confirm, text input, custom) using Lumiverse's shared component library
@@ -69,6 +70,12 @@ From the Spindle Panel:
 - **Update** — Pull the latest source and rebuild
 - **Uninstall** — Remove the extension, its storage, and its grants
 
+Use **All**, **Active**, **Inactive**, and **Updates** above the installed list to filter extensions. Active and Inactive follow the enable toggle, including enabled extensions whose workers are stopped or have errors. Counts cover the installed list before search; search and sorting apply within the selected filter in both card and list views.
+
+**Updates** shows notices from the existing update monitor. Automatic detection currently checks enabled, git-sourced extensions only, excluding development-mode extensions. Disabling an extension clears its notice, and enabling it schedules a new check. Disabled extensions can still be updated with **Update** or **Update All**.
+
+Manual dragging is available when **All** is selected and search is empty. **Show all extensions** in an empty result clears both controls and restores the full list.
+
 ---
 
 ## Permissions
@@ -105,7 +112,7 @@ These can read sensitive data, modify pipeline behavior, or reach outside the sa
 | `push_notification` | Send push notifications to the user |
 | `image_gen` | Drive the image-generation pipeline |
 | `images` | Read and write the user's stored images |
-| `media` | Use media conversion and host speech-to-text; recording also requires microphone permission |
+| `media` | Use media conversion, host speech-to-text and text-to-speech; recording also requires microphone permission |
 | `web_search` | Read the user's configured web-search provider |
 | `characters` | Read and write character cards |
 | `chats` | Read and write chats and chat metadata |

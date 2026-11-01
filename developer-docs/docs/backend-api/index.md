@@ -22,6 +22,8 @@ declare const spindle: import('lumiverse-spindle-types').SpindleAPI
 | [Message Content Processor](message-content-processor.md) | `chat_mutation` | Transform message content before it is written to the database |
 | [LLM Tools](llm-tools.md) | `tools` | Register function-calling tools + Council-eligible tools |
 | [Generation](generation.md) | `generation` | Fire LLM generations + inspect connections |
+| [Decision Models](decisions.md) | `decisions` | Evaluate typed questions using saved Decision connections |
+| [Embeddings](embeddings.md) | `embeddings` | Embed text with the user's embedding connections |
 | [Image Generation](image-generation.md) | `image_gen` | Generate images via image gen connection profiles |
 | [Images](images.md) | `images` | Read, upload, filter, and delete stored image/video assets |
 | [Media](media.md) | `media` | Convert audio/video, transcode with custom parameters, mux tracks, and compose still-image videos |
@@ -33,6 +35,7 @@ declare const spindle: import('lumiverse-spindle-types').SpindleAPI
 | [Runtime State](runtime-state.md) | Per operation | Read combined chat state and correlate mutation acknowledgements with events |
 | [Tokens](tokens.md) | Free | Count text, message arrays, or stored chats against an explicit model or the main/sidecar model |
 | [Uploads](uploads.md) | Free | Receive large files via a resumable tus endpoint, then read them in the worker by id |
+| [Large Files and Archives](file-transfers.md) | `cors_proxy` for downloads; local operations free | Stage binary downloads, consume ZIP64 archives, and stream exports to the browser |
 | [Characters](characters.md) | `characters` | CRUD on character cards |
 | [Chats](chats.md) | `chats` | CRUD on chat sessions + active chat |
 | [Presets](presets.md) | `presets` | CRUD on user presets, prompt blocks, and category groups |
@@ -61,3 +64,4 @@ declare const spindle: import('lumiverse-spindle-types').SpindleAPI
 | [Commands](commands.md) | Free | Register custom commands in the command palette (Cmd/Ctrl+K) |
 | [UI Automation](ui-automation.md) | Free | Enumerate drawer / settings tabs and navigate the user to a specific surface |
 | [Version](version.md) | Free | Read the backend and frontend semantic versions |
+| [UUIDs](uuid.md) | Free | Generate UUID v4 or v7 strings through the backend |

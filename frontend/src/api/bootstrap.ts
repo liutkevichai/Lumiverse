@@ -1,7 +1,9 @@
 import { get } from './client'
+import { shareRead, sharedReadScope } from '@/lib/shared-read'
 import type {
   ConnectionProfile, ProviderInfo,
   SttConnectionProfile, SttProviderInfo,
+  DecisionConnectionProfile, DecisionProviderInfo,
   TtsConnectionProfile, TtsProviderInfo,
   ImageGenConnectionProfile, ImageGenProviderInfo,
   Pack, Persona, PaginatedResult, GroupedRecentChat,
@@ -21,6 +23,7 @@ export interface BootstrapPayload {
     connections: PaginatedResult<ConnectionProfile>
     providers: ProviderInfo[]
   }
+  decision?: { connections: PaginatedResult<DecisionConnectionProfile>; providers: DecisionProviderInfo[] }
   stt: {
     connections: PaginatedResult<SttConnectionProfile>
     providers: SttProviderInfo[]
@@ -66,7 +69,21 @@ export interface LandingBootstrapResponse {
   errors: Record<string, string>
 }
 
+let landingFlight: { scope: number; request: Promise<LandingBootstrapResponse> } | null = null
+
 export const bootstrapApi = {
   fetch: () => get<BootstrapResponse>('/bootstrap'),
-  fetchLanding: () => get<LandingBootstrapResponse>('/bootstrap/landing'),
+  fetchLanding: () => {
+    const scope = sharedReadScope()
+    const request = shareRead('landing-bootstrap', () => get<LandingBootstrapResponse>('/bootstrap/landing')).then(response => {
+      if (scope !== sharedReadScope()) throw new Error('Landing data changed while bootstrap was loading')
+      return response
+    })
+    const flight = { scope, request }
+    landingFlight = flight
+    const release = () => { if (landingFlight === flight) landingFlight = null }
+    void request.then(release, release)
+    return request
+  },
+  pendingLanding: () => landingFlight?.scope === sharedReadScope() ? landingFlight.request : null,
 }

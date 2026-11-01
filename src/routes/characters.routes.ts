@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { isDatabaseUnavailable } from "../db/execution";
 import * as svc from "../services/characters.service";
 import * as files from "../services/files.service";
 import * as images from "../services/images.service";
@@ -366,10 +367,10 @@ async function fetchChubCharacter(chubPath: string, userId: string, libraryScope
 
   // Stamp install source so LumiHub manifest can track this card for updates
   try {
-    const freshChar = svc.getCharacter(userId, character.id);
+    const freshChar = await svc.getCharacterAsync(userId, character.id);
     if (freshChar) {
       const slug = buildSlug(freshChar.creator, freshChar.name);
-      svc.updateCharacter(userId, character.id, {
+      await svc.updateCharacterAsync(userId, character.id, {
         extensions: {
           ...(freshChar.extensions || {}),
           _lumiverse_install_source: "chub",
@@ -402,7 +403,7 @@ async function fetchChubCharacter(chubPath: string, userId: string, libraryScope
     }
   }
 
-  return svc.getCharacter(userId, character.id)!;
+  return (await svc.getCharacterAsync(userId, character.id))!;
 }
 
 // ─── JannyAI character fetcher ────────────────────────────────────────────
@@ -449,7 +450,7 @@ async function fetchJannyCharacter(uuid: string, userId: string, libraryScope: C
   svc.setCharacterAvatar(userId, character.id, image.filename);
 
   autoImportEmbeddedWorldbook(userId, character.id);
-  return svc.getCharacter(userId, character.id)!;
+  return (await svc.getCharacterAsync(userId, character.id))!;
 }
 
 // ─── Generic URL fetcher (PNG or JSON) ────────────────────────────────────
@@ -495,7 +496,7 @@ async function fetchGenericCharacter(url: string, userId: string, libraryScope: 
     svc.setCharacterAvatar(userId, character.id, image.filename);
 
     autoImportEmbeddedWorldbook(userId, character.id);
-    return svc.getCharacter(userId, character.id)!;
+    return (await svc.getCharacterAsync(userId, character.id))!;
   }
 
   if (sniffed === "zip" || contentType.includes("application/zip") || url.toLowerCase().endsWith(".charx")) {
@@ -503,7 +504,7 @@ async function fetchGenericCharacter(url: string, userId: string, libraryScope: 
     const charxResult = await cardSvc.extractCardFromCharx(file);
     const character = svc.createCharacter(userId, { ...charxResult.card, library_scope: libraryScope });
     await applyCharxModulesAndAssets(userId, character, charxResult);
-    return svc.getCharacter(userId, character.id)!;
+    return (await svc.getCharacterAsync(userId, character.id))!;
   }
 
   // Assume JSON
@@ -518,7 +519,7 @@ async function fetchGenericCharacter(url: string, userId: string, libraryScope: 
   const cardInput = cardSvc.parseCardJson(json);
   const character = svc.createCharacter(userId, { ...cardInput, library_scope: libraryScope });
   autoImportEmbeddedWorldbook(userId, character.id);
-  return svc.getCharacter(userId, character.id)!;
+  return (await svc.getCharacterAsync(userId, character.id))!;
 }
 
 app.get("/", (c) => {
@@ -536,6 +537,17 @@ app.get("/", (c) => {
 });
 
 // ─── Lightweight summary endpoint for character browser ───────────────────
+app.get("/index", (c) => c.json(svc.listCharacterIndex(c.get('userId'), parsePagination(c.req.query('limit'), c.req.query('offset')))));
+
+app.get("/details", async (c) => {
+  const ids = [...new Set((c.req.query('ids') ?? '').split(',').filter(Boolean))];
+  if (ids.length === 0 || ids.length > 100 || ids.some(id => id.length > 128)) {
+    return c.json({ error: 'Supply between 1 and 100 character ids' }, 400);
+  }
+  const characters = await svc.getCharactersByIdsAsync(c.get('userId'), ids, { excludeDeleting: true });
+  return c.json(ids.flatMap(id => characters.has(id) ? [characters.get(id)!] : []));
+});
+
 app.get("/summary", (c) => {
   const userId = c.get("userId");
   const rawScope = c.req.query("scope");
@@ -586,13 +598,14 @@ app.post("/bulk-tags", async (c) => {
     return c.json({ error: "ids must be a non-empty array with at most 1000 items" }, 400);
   }
   try {
-    const result = svc.bulkUpdateCharacterTags(userId, {
+    const result = await svc.bulkUpdateCharacterTagsAsync(userId, {
       ids: Array.isArray(body?.ids) ? body.ids : [],
       operation: body?.operation,
       tags: Array.isArray(body?.tags) ? body.tags : [],
     });
     return c.json(result);
   } catch (err) {
+    if (isDatabaseUnavailable(err)) throw err;
     const message = err instanceof Error ? err.message : "Failed to update tags";
     return c.json({ error: message }, 400);
   }
@@ -606,7 +619,7 @@ app.post("/folders/rename", async (c) => {
   if (!oldName) return c.json({ error: "old_name is required" }, 400);
   if (!newName) return c.json({ error: "new_name is required" }, 400);
 
-  const updated = svc.renameCharacterFolder(userId, oldName, newName);
+  const updated = await svc.renameCharacterFolderAsync(userId, oldName, newName);
   if (updated.length === 0) return c.json({ error: "Folder not found" }, 404);
   return c.json({ updated, count: updated.length });
 });
@@ -617,7 +630,7 @@ app.post("/folders/delete", async (c) => {
   const name = body.name?.trim() || "";
   if (!name) return c.json({ error: "name is required" }, 400);
 
-  const updated = svc.deleteCharacterFolder(userId, name);
+  const updated = await svc.deleteCharacterFolderAsync(userId, name);
   return c.json({ updated, count: updated.length });
 });
 
@@ -631,7 +644,7 @@ app.post("/bulk-update", async (c) => {
   if (ids.length === 0) return c.json({ error: "ids must contain character ids" }, 400);
   if (typeof body.folder !== "string") return c.json({ error: "folder must be a string" }, 400);
 
-  const updated = svc.bulkUpdateCharacterFolders(userId, ids, body.folder);
+  const updated = await svc.bulkUpdateCharacterFoldersAsync(userId, ids, body.folder);
   return c.json({ updated, count: updated.length });
 });
 
@@ -715,7 +728,7 @@ app.post("/import-url", async (c) => {
 app.post("/:id/replace-card", async (c) => {
   const userId = c.get("userId");
   const characterId = c.req.param("id");
-  const existing = svc.getCharacter(userId, characterId);
+  const existing = await svc.getCharacterAsync(userId, characterId);
   if (!existing) return c.json({ error: "Not found" }, 404);
 
   try {
@@ -741,7 +754,7 @@ app.post("/:id/replace-card", async (c) => {
       return c.json({ error: "Only JSON and PNG character cards can replace card data" }, 400);
     }
 
-    const updated = svc.updateCharacter(userId, characterId, buildCardReplacementInput(existing, cardInput));
+    const updated = await svc.updateCharacterAsync(userId, characterId, buildCardReplacementInput(existing, cardInput));
     // The character was checked above, but preserve the normal 404 contract
     // should it be deleted between parsing and the update.
     if (!updated) return c.json({ error: "Not found" }, 404);
@@ -796,7 +809,7 @@ app.get("/chub-expression-candidates", (c) => {
 app.post("/:id/chub-expressions", async (c) => {
   const userId = c.get("userId");
   const characterId = c.req.param("id");
-  const character = svc.getCharacter(userId, characterId);
+  const character = await svc.getCharacterAsync(userId, characterId);
   if (!character) return c.json({ error: "Not found" }, 404);
 
   const slug = readChubFullPath(character.extensions);
@@ -844,9 +857,9 @@ app.post("/:id/chub-expressions", async (c) => {
   }
 });
 
-app.get("/:id", (c) => {
+app.get("/:id", async (c) => {
   const userId = c.get("userId");
-  const char = svc.getCharacter(userId, c.req.param("id"));
+  const char = await svc.getCharacterAsync(userId, c.req.param("id"));
   if (!char) return c.json({ error: "Not found" }, 404);
   return c.json(char);
 });
@@ -861,17 +874,32 @@ app.put("/:id", async (c) => {
   const userId = c.get("userId");
   const body = await c.req.json();
   try {
-    const char = svc.updateCharacter(userId, c.req.param("id"), body);
+    const char = await svc.updateCharacterAsync(userId, c.req.param("id"), body);
     if (!char) return c.json({ error: "Not found" }, 404);
     return c.json(char);
   } catch (err) { if (isInvalidLibraryScopeError(err)) return respondInvalidLibraryScope(c); throw err; }
 });
 
-app.delete("/:id", (c) => {
+app.get("/deletions/:operationId", async (c) => {
+  c.header("Cache-Control", "no-store");
+  const operation = await svc.getDeletionOperationAsync(c.get("userId"), c.req.param("operationId"));
+  if (!operation) return c.json({ error: "Not found" }, 404);
+  return c.json(operation);
+});
+
+app.delete("/:id", async (c) => {
   const userId = c.get("userId");
-  const deleted = svc.deleteCharacter(userId, c.req.param("id"));
-  if (!deleted) return c.json({ error: "Not found" }, 404);
-  return c.json({ success: true });
+  const operationId = c.req.query("operation_id") ?? crypto.randomUUID();
+  if (!/^[\w-]{1,128}$/.test(operationId)) return c.json({ error: "Invalid operation ID" }, 400);
+  try {
+    const operation = await svc.requestCharacterDeletionAsync(userId, c.req.param("id"), operationId);
+    if (!operation) return c.json({ error: "Not found" }, 404);
+    c.header("Cache-Control", "no-store");
+    return c.json({ success: true, ...operation }, operation.status === "accepted" ? 202 : 200);
+  } catch (error: any) {
+    if (error?.code === "DELETION_ID_CONFLICT") return c.json({ error: "Operation ID is already in use" }, 409);
+    throw error;
+  }
 });
 
 app.get("/:id/avatar", async (c) => {
@@ -916,10 +944,10 @@ app.post("/:id/duplicate", (c) => {
   return c.json(character, 201);
 });
 
-app.get("/:id/image-gen-lora", (c) => {
+app.get("/:id/image-gen-lora", async (c) => {
   const userId = c.get("userId");
   const characterId = c.req.param("id");
-  if (!svc.getCharacter(userId, characterId)) {
+  if (!(await svc.getCharacterAsync(userId, characterId))) {
     return c.json({ error: "Not found" }, 404);
   }
   return c.json({ binding: characterLoraSvc.getCharacterLora(userId, characterId) });
@@ -950,10 +978,10 @@ app.put("/:id/image-gen-lora", async (c) => {
   }
 });
 
-app.delete("/:id/image-gen-lora", (c) => {
+app.delete("/:id/image-gen-lora", async (c) => {
   const userId = c.get("userId");
   const characterId = c.req.param("id");
-  if (!svc.getCharacter(userId, characterId)) {
+  if (!(await svc.getCharacterAsync(userId, characterId))) {
     return c.json({ error: "Not found" }, 404);
   }
   characterLoraSvc.deleteCharacterLora(userId, characterId);
@@ -977,7 +1005,7 @@ app.get("/:id/export", async (c) => {
   if (format === "png") {
     const buf = await exportSvc.exportAsPng(userId, id);
     if (!buf) return c.json({ error: "Not found" }, 404);
-    const character = svc.getCharacter(userId, id);
+    const character = await svc.getCharacterAsync(userId, id);
     const name = exportSvc.sanitizeFilename(character?.name || "character");
     return new Response(new Uint8Array(buf), {
       headers: {
@@ -1019,7 +1047,7 @@ app.get("/:id/export", async (c) => {
         emitProgress({ phase: "failed", error: "Character not found" });
         return c.json({ error: "Not found" }, 404);
       }
-      const character = svc.getCharacter(userId, id);
+      const character = await svc.getCharacterAsync(userId, id);
       const name = exportSvc.sanitizeFilename(character?.name || "character");
       return new Response(new Uint8Array(buf), {
         headers: {
@@ -1040,7 +1068,7 @@ app.get("/:id/export", async (c) => {
 
 app.post("/:id/avatar", async (c) => {
   const userId = c.get("userId");
-  const char = svc.getCharacter(userId, c.req.param("id"));
+  const char = await svc.getCharacterAsync(userId, c.req.param("id"));
   if (!char) return c.json({ error: "Not found" }, 404);
 
   const formData = await c.req.formData();
@@ -1056,7 +1084,7 @@ app.post("/:id/avatar", async (c) => {
 app.post("/:id/perspective-layers", async (c) => {
   const userId = c.get("userId");
   const characterId = c.req.param("id");
-  if (!svc.getCharacter(userId, characterId)) return c.json({ error: "Not found" }, 404);
+  if (!(await svc.getCharacterAsync(userId, characterId))) return c.json({ error: "Not found" }, 404);
 
   const formData = await c.req.formData();
   const file = formData.get("image") as File | null;
@@ -1099,7 +1127,7 @@ app.post("/:id/perspective-layers/:layer", async (c) => {
   const characterId = c.req.param("id");
   const layer = c.req.param("layer") as svc.PerspectiveLayerKind;
   if (!PERSPECTIVE_LAYERS.has(layer)) return c.json({ error: "Invalid layer" }, 400);
-  if (!svc.getCharacter(userId, characterId)) return c.json({ error: "Not found" }, 404);
+  if (!(await svc.getCharacterAsync(userId, characterId))) return c.json({ error: "Not found" }, 404);
 
   const formData = await c.req.formData();
   const file = formData.get("image") as File | null;
@@ -1279,7 +1307,7 @@ app.post("/import", async (c) => {
         svc.setCharacterAvatar(userId, character.id, image.filename);
         importCardRegexBestEffort(userId, character.id, cardInput.extensions);
         autoImportEmbeddedWorldbook(userId, character.id);
-        const imported = svc.getCharacter(userId, character.id)!;
+        const imported = (await svc.getCharacterAsync(userId, character.id))!;
         return c.json({ character: imported, ...loraSurface(imported) }, 201);
       } else if (detectedFormat === "charx" || detectedFormat === "jpeg_polyglot") {
         // CHARX archive (or JPEG+ZIP polyglot) — ZIP with card.json + optional
@@ -1292,7 +1320,7 @@ app.post("/import", async (c) => {
           signal: c.req.raw.signal,
           emitGalleryProgress: true,
         });
-        const imported = svc.getCharacter(userId, character.id)!;
+        const imported = (await svc.getCharacterAsync(userId, character.id))!;
         return c.json({
           character: imported,
           ...(lumiverseModulesSummary ? { lumiverse_modules: lumiverseModulesSummary } : {}),
@@ -1313,7 +1341,7 @@ app.post("/import", async (c) => {
         const character = svc.createCharacter(userId, { ...cardInput, ...(libraryScope ? { library_scope: libraryScope } : {}) });
         importCardRegexBestEffort(userId, character.id, cardInput.extensions);
         autoImportEmbeddedWorldbook(userId, character.id);
-        const imported = svc.getCharacter(userId, character.id)!;
+        const imported = (await svc.getCharacterAsync(userId, character.id))!;
         return c.json({ character: imported, ...loraSurface(imported) }, 201);
       }
     } else {
@@ -1327,7 +1355,7 @@ app.post("/import", async (c) => {
       const character = svc.createCharacter(userId, { ...input, ...(libraryScope ? { library_scope: libraryScope } : {}) });
       importCardRegexBestEffort(userId, character.id, input.extensions);
       autoImportEmbeddedWorldbook(userId, character.id);
-      const imported = svc.getCharacter(userId, character.id)!;
+      const imported = (await svc.getCharacterAsync(userId, character.id))!;
       return c.json({ character: imported, ...loraSurface(imported) }, 201);
     }
   } catch (err: any) {

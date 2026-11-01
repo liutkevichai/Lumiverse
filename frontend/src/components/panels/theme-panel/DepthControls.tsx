@@ -6,12 +6,15 @@ import type { DesktopBackground, RenderingMode } from '@/types/theme'
 import styles from './DepthControls.module.css'
 
 interface DepthControlsProps {
+  slidersLocked?: boolean
   radiusScale: number
   enableGlass: boolean
+  liquidGlass: boolean
   fontScale: number
   uiScale: number
   onRadiusChange: (v: number) => void
   onGlassToggle: (v: boolean) => void
+  onLiquidGlassToggle: (v: boolean) => void
   onFontScaleChange: (v: number) => void
   onUiScaleChange: (v: number) => void
   showDesktopBackgroundControls?: boolean
@@ -69,6 +72,33 @@ function commitFromInput(e: React.SyntheticEvent, commit: (v: number) => void) {
   commit(Number((e.target as HTMLInputElement).value))
 }
 
+/** Finish native pointer processing before a scale change can move the slider. */
+function useDeferredRangeCommit(commit: (value: number) => void) {
+  const frame = useRef<number | null>(null)
+  const commitRef = useRef(commit)
+
+  useEffect(() => { commitRef.current = commit }, [commit])
+  useEffect(() => () => {
+    if (frame.current !== null) window.cancelAnimationFrame(frame.current)
+  }, [])
+
+  return {
+    onPointerUp: (event: React.PointerEvent<HTMLInputElement>) => {
+      const input = event.currentTarget
+      if (frame.current !== null) window.cancelAnimationFrame(frame.current)
+      frame.current = window.requestAnimationFrame(() => {
+        frame.current = null
+        commitRef.current(Number(input.value))
+      })
+    },
+    onKeyUp: (event: React.KeyboardEvent<HTMLInputElement>) => {
+      if (frame.current !== null) window.cancelAnimationFrame(frame.current)
+      frame.current = null
+      commitFromInput(event, commitRef.current)
+    },
+  }
+}
+
 interface DeferredColorInputProps {
   value: string
   className?: string
@@ -113,12 +143,15 @@ export function DeferredColorInput({ value, className, onCommit }: DeferredColor
 }
 
 export default function DepthControls({
+  slidersLocked = false,
   radiusScale,
   enableGlass,
+  liquidGlass,
   fontScale,
   uiScale,
   onRadiusChange,
   onGlassToggle,
+  onLiquidGlassToggle,
   onFontScaleChange,
   onUiScaleChange,
   showDesktopBackgroundControls = false,
@@ -133,7 +166,21 @@ export default function DepthControls({
   // theme recalculations on every step.
   const [localFontScale, setLocalFontScale] = useState(fontScale)
   const [localUiScale, setLocalUiScale] = useState(() => normalizeUiScale(uiScale))
+  const fontScaleCommit = useDeferredRangeCommit(onFontScaleChange)
+  const uiScaleCommit = useDeferredRangeCommit(onUiScaleChange)
   const resolvedDesktopBackground = parseDesktopBackground(desktopBackground?.color)
+  const [surfaceRestartRequired, setSurfaceRestartRequired] = useState(false)
+
+  useEffect(() => {
+    if (!showDesktopBackgroundControls) return
+    const root = document.documentElement
+    const update = () => setSurfaceRestartRequired(root.hasAttribute('data-desktop-surface-restart'))
+    update()
+    const observer = new MutationObserver(update)
+    observer.observe(root, { attributes: true, attributeFilter: ['data-desktop-surface-restart'] })
+    return () => observer.disconnect()
+  }, [showDesktopBackgroundControls])
+
 
   useEffect(() => { setLocalFontScale(fontScale) }, [fontScale])
   useEffect(() => { setLocalUiScale(normalizeUiScale(uiScale)) }, [uiScale])
@@ -145,6 +192,7 @@ export default function DepthControls({
         <span className={styles.label}>{t('cornerRadius')}</span>
         <input
           type="range"
+          disabled={slidersLocked}
           min={0.5}
           max={2}
           step={0.1}
@@ -161,13 +209,13 @@ export default function DepthControls({
         <span className={styles.label}>{t('fontScale')}</span>
         <input
           type="range"
+          disabled={slidersLocked}
           min={0.85}
           max={2}
           step={0.05}
           value={localFontScale}
           onChange={(e) => setLocalFontScale(Number(e.target.value))}
-          onPointerUp={(e) => commitFromInput(e, onFontScaleChange)}
-          onKeyUp={(e) => commitFromInput(e, onFontScaleChange)}
+          {...fontScaleCommit}
           className={styles.slider}
           style={trackFill(localFontScale, 0.85, 2)}
         />
@@ -179,13 +227,13 @@ export default function DepthControls({
         <span className={styles.label}>{t('uiScale')}</span>
         <input
           type="range"
+          disabled={slidersLocked}
           min={MIN_UI_SCALE}
           max={MAX_UI_SCALE}
           step={0.05}
           value={localUiScale}
           onChange={(e) => setLocalUiScale(Number(e.target.value))}
-          onPointerUp={(e) => commitFromInput(e, onUiScaleChange)}
-          onKeyUp={(e) => commitFromInput(e, onUiScaleChange)}
+          {...uiScaleCommit}
           className={styles.slider}
           style={trackFill(localUiScale, MIN_UI_SCALE, MAX_UI_SCALE)}
         />
@@ -198,6 +246,22 @@ export default function DepthControls({
         onChange={onGlassToggle}
         label={t('glassEffects')}
       />
+
+      {/* Liquid glass — a refraction layer on top of the frosted glass layer,
+          so it is only selectable while that layer is on. */}
+      <div className={styles.switchRow}>
+        <span className={styles.switchText}>
+          <span className={styles.label}>{t('liquidGlass.label')}</span>
+          <span className={styles.hint}>{t('liquidGlass.hint')}</span>
+        </span>
+        <Toggle.Switch
+          checked={liquidGlass}
+          onChange={onLiquidGlassToggle}
+          disabled={!enableGlass}
+          aria-label={t('liquidGlass.label')}
+          title={enableGlass ? undefined : t('liquidGlass.requiresGlass')}
+        />
+      </div>
 
       {showDesktopBackgroundControls && onDesktopBackgroundChange && (
         <>
@@ -215,6 +279,11 @@ export default function DepthControls({
                 <option value="quality">{t('renderingMode.quality')}</option>
               </select>
             </label>
+          )}
+          {surfaceRestartRequired && (
+            <p className={styles.renderingHint} role="status">
+              {t('renderingMode.restartRequired', 'Restart the desktop app to apply the window transparency change.')}
+            </p>
           )}
           <Toggle.Checkbox
             checked={Boolean(desktopBackground)}

@@ -1,15 +1,23 @@
+import { createOrganizationWriter } from '@/lib/connection-organization-writes'
+import { get as getApi } from '@/api/client'
+import { ORGANIZATION_KEYS, organizationEdits, type OrganizationSettingKey } from '../../../../src/shared/connection-organization-edits'
 import type { StateCreator } from 'zustand'
 import type { AppStore, EnterToSendSettings, SettingsSlice, StartupSettings, ThemeConfig, ReasoningSettings, SettingsWriteSource, ToastPosition } from '@/types/store'
 import { settingsApi } from '@/api/settings'
+import { DEFAULT_UI_LANGUAGE, isUiLanguage } from '@/i18n/languages'
 import { themeAssetsApi } from '@/api/theme-assets'
 import { BASE_URL } from '@/api/client'
 import { activeTab } from '@/lib/active-tab'
 import { beginActiveLoomPresetSelection, type PresetSelectionRequest } from '@/lib/loom/preset-selection-coordinator'
 import { generateUUID } from '@/lib/uuid'
+import { restoreThemePackComponents } from '@/lib/themePack'
+import { uploadThemePackAssets } from '@/lib/themePackAssets'
 import { DEFAULT_THEME, normalizeTheme } from '@/theme/presets'
+import { setDeviceThemeControlsScope } from '@/lib/deviceThemeControls'
 import { PRODUCTIVITY_DEFAULTS, migrateProductivitySetting } from '@/lib/uiProductivityDefaults'
 import { isMobileViewportOrDevice } from '@/lib/mobile'
 import { DEFAULT_IMPERSONATION_MODE, resolveImpersonationMode } from '@/lib/impersonationPreset'
+import { isChatImageSize, isChatImageAlignment, isChatImageTargets, DEFAULT_CHAT_IMAGE_TARGETS } from '@/lib/chatImagePresentation'
 import { whistleLanguage } from '@/lib/whistle/config'
 import { createSettingsLoadGenerationGuard } from './settings-load-generation'
 import {
@@ -18,7 +26,7 @@ import {
   type ConnectionsOrder,
 } from './connections-order-merge'
 
-/** Default reasoning settings — used as initial state and for restore-on-unbind. */
+/** Default reasoning settings — used until the user has an unbound preference. */
 export const REASONING_DEFAULTS: ReasoningSettings = {
   prefix: '<think>\n',
   suffix: '\n</think>',
@@ -31,6 +39,7 @@ export const REASONING_DEFAULTS: ReasoningSettings = {
 
 /** Keys that represent persisted data (not functions) */
 export const DATA_KEYS: ReadonlySet<string> = new Set([
+  'uiLanguage',
   'landingPageChatsDisplayed',
   'landingPageLayoutMode',
   'landingPageGalleryWidth',
@@ -39,6 +48,11 @@ export const DATA_KEYS: ReadonlySet<string> = new Set([
   'personasPerPage',
   'messagesPerPage',
   'chatDisplayMode',
+  'showGreetingImage',
+  'greetingImagePosition',
+  'chatImageSize',
+  'chatImageAlignment',
+  'chatImageTargets',
   'longMessageCollapseEnabled',
   'longMessageCollapsePreset',
   'longMessageCollapseCustomHeight',
@@ -50,6 +64,7 @@ export const DATA_KEYS: ReadonlySet<string> = new Set([
   'bubbleUseFullAvatar',
   'bubbleOpacity',
   'saveDraftInput',
+  'composerActionBar',
   'defaultImpersonationMode',
   'chatWidthMode',
   'centerChatWithSidebar',
@@ -116,6 +131,7 @@ export const DATA_KEYS: ReadonlySet<string> = new Set([
   'useCharacterBackground',
   // Reasoning / CoT settings
   'reasoningSettings',
+  'unboundReasoningSettings',
   'promptBias',
   'regenFeedback',
   'swipeGesturesEnabled',
@@ -136,6 +152,8 @@ export const DATA_KEYS: ReadonlySet<string> = new Set([
   'pushNotificationPreferences',
   // Connection reorder persistence
   'connectionsOrder',
+  'connectionLibraries',
+  'recentConnections',
   'customCSS',
   'componentOverrides',
   // Saved theme library (My Themes)
@@ -163,6 +181,16 @@ const TOAST_POSITIONS: ReadonlySet<string> = new Set([
 
 function isToastPosition(value: unknown): value is ToastPosition {
   return typeof value === 'string' && TOAST_POSITIONS.has(value)
+}
+
+function isValidSettingValue(key: string, value: unknown): boolean {
+  if (key === 'uiLanguage') return isUiLanguage(value)
+  if (key === 'chatImageSize') return isChatImageSize(value)
+  if (key === 'chatImageAlignment') return isChatImageAlignment(value)
+  if (key === 'chatImageTargets') return isChatImageTargets(value)
+  if (key === 'showGreetingImage') return typeof value === 'boolean'
+  if (key === 'greetingImagePosition') return value === 'top' || value === 'bottom'
+  return true
 }
 
 // ── Debounced batch persistence ──────────────────────────────────────────
@@ -277,8 +305,12 @@ function persistDeviceEnterToSend(value: EnterToSendSettings): void {
 /** Select the authenticated user's local persistence bridge. */
 export function setSettingsPersistenceScope(userId: string | null): void {
   persistenceScope = userId
+  setDeviceThemeControlsScope(userId)
 }
 
+let organizationWriter: ReturnType<typeof createOrganizationWriter> | undefined
+let organizationWriterGeneration = -1
+let deferredOrganizationReload = false
 let settingsSelectionAbort: AbortController | null = null
 const settingsLoadGeneration = createSettingsLoadGenerationGuard()
 
@@ -404,7 +436,9 @@ function readPendingSettings(): Record<string, any> | null {
     const raw = localStorage.getItem(bridgeStorageKey(PENDING_SETTINGS_KEY))
     if (!raw) return null
     const parsed = JSON.parse(raw)
-    return isPlainObject(parsed) ? parsed : null
+    if (!isPlainObject(parsed)) return null
+    for (const key of ORGANIZATION_KEYS) delete parsed[key]
+    return parsed
   } catch {
     return null
   }
@@ -502,7 +536,12 @@ export function clearPendingSettings(persisted: Record<string, unknown>): void {
   } catch {}
 }
 
-function mergeStoredSetting(defaultValue: any, storedValue: any): any {
+function mergeStoredSetting(defaultValue: any, storedValue: any, settingKey?: string): any {
+  // These maps are complete snapshots. Deep merging with the previous load
+  // resurrects removed assignments or histories after another tab saves them.
+  if (settingKey === 'connectionLibraries' || settingKey === 'recentConnections') {
+    return isPlainObject(storedValue) ? storedValue : {}
+  }
   if (!isPlainObject(defaultValue)) return storedValue
   if (!isPlainObject(storedValue)) return defaultValue
   const merged: Record<string, any> = { ...defaultValue }
@@ -572,6 +611,7 @@ export function flushSettings() {
 
 /** Immediately persist all dirty settings and wait for the server commit. */
 export function flushSettingsNow(): Promise<void> {
+  if (organizationWriter?.pending) return organizationWriter.flush().then(() => flushSettingsNow())
   if (flushTimer !== null) {
     clearTimeout(flushTimer)
     flushTimer = null
@@ -592,7 +632,7 @@ export function flushSettingsNow(): Promise<void> {
 
 /** True when a flush is in flight or dirty keys are pending. */
 export function hasUnsavedSettings(): boolean {
-  return dirtyKeys.size > 0 || flushInFlight || activeFlushPromise !== null
+  return !!organizationWriter?.pending || dirtyKeys.size > 0 || flushInFlight || activeFlushPromise !== null
 }
 
 export function consumeOwnSettingsUpdate(payload: unknown): boolean {
@@ -610,6 +650,11 @@ export function consumeOwnSettingsUpdate(payload: unknown): boolean {
 
 /** Whether a SETTINGS_UPDATED event requires a settings reload in this tab. */
 export function shouldReloadSettingsAfterUpdate(payload: unknown): boolean {
+  // This navigation bookmark is not hydrated by loadSettings. Other clients
+  // still receive its event; it never justifies reloading all settings/presets.
+  const keys = settingsUpdateKeys(payload)
+  if (keys.length > 0 && keys.every((key) => key === 'activeChatId')) return false
+  if (organizationWriter?.pending) deferredOrganizationReload = true
   const unsaved = hasUnsavedSettings()
   const ownUpdate = consumeOwnSettingsUpdate(payload)
   const reload = !unsaved && !ownUpdate
@@ -664,6 +709,9 @@ export function resetSettingsPersistence(): void {
       localStorage.removeItem(PENDING_IMAGE_GENERATION_PATCH_KEY)
     } catch {}
   }
+  organizationWriter?.dispose()
+  organizationWriter = undefined
+  deferredOrganizationReload = false
   persistenceGeneration += 1
   settingsLoadGeneration.begin()
   dirtyKeys.clear()
@@ -672,14 +720,33 @@ export function resetSettingsPersistence(): void {
   activeFlushBatch = null
   lastCommittedSettingsKeys.clear()
   persistenceScope = null
+  setDeviceThemeControlsScope(null)
 }
 
 // Flush on page unload so slider drags / rapid changes are never lost
 if (typeof window !== 'undefined') {
-  window.addEventListener('beforeunload', flushSettings)
+  window.addEventListener('beforeunload', event => {
+    // Organization intent is deliberately not saved in browser storage. Let the
+    // user wait for its server acknowledgement before leaving the page.
+    if (organizationWriter?.pending) { event.preventDefault(); event.returnValue = '' }
+    flushSettings()
+  })
+}
+
+function applyConnectionOrder(state: AppStore, order: ConnectionsOrder | undefined, isCurrent = () => true) {
+  if (!order) return
+  const args = deriveReorderArgs(order, { llm: state.profiles ?? [], imageGen: state.imageGenProfiles ?? [],
+    stt: state.sttProfiles ?? [], decision: state.decisionProfiles ?? [], tts: state.ttsProfiles ?? [] })
+  const apply = { llm: state.applyProfileOrder, imageGen: state.applyImageGenProfileOrder,
+    stt: state.applySttProfileOrder, decision: state.applyDecisionProfileOrder, tts: state.applyTtsProfileOrder }
+  for (const kind of Object.keys(apply) as Array<keyof typeof apply>) {
+    if (!isCurrent()) return
+    if (args[kind]) apply[kind]?.(args[kind])
+  }
 }
 
 export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> = (set, get) => ({
+  uiLanguage: null,
   settingsLoaded: false,
   fullSettingsLoaded: false,
   landingPageChatsDisplayed: 12,
@@ -690,6 +757,11 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
   personasPerPage: 24,
   messagesPerPage: 50,
   chatDisplayMode: 'minimal',
+  showGreetingImage: false,
+  greetingImagePosition: 'top',
+  chatImageSize: 'default',
+  chatImageAlignment: 'left',
+  chatImageTargets: { ...DEFAULT_CHAT_IMAGE_TARGETS },
   longMessageCollapseEnabled: false,
   longMessageCollapsePreset: 'comfortable',
   longMessageCollapseCustomHeight: 500,
@@ -701,7 +773,8 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
   bubbleUseFullAvatar: false,
   bubbleOpacity: 1,
   inputBarEnterToSend: { ...DEFAULT_ENTER_TO_SEND_SETTINGS },
-  saveDraftInput: false,
+  saveDraftInput: true,
+  composerActionBar: null,
   defaultImpersonationMode: DEFAULT_IMPERSONATION_MODE,
   chatWidthMode: 'full',
   centerChatWithSidebar: false,
@@ -719,6 +792,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
     panelWidthMode: 'default',
     customPanelWidth: 35,
     showTabLabels: true,
+    duoAlwaysOpen: true,
     hiddenTabIds: [],
     tabOrder: [],
     layout: [],
@@ -741,6 +815,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
     loomItems: { enabled: false, keepDepth: 5, keepOnly: false },
   },
   reasoningSettings: { ...REASONING_DEFAULTS },
+  unboundReasoningSettings: null,
   regenFeedback: {
     enabled: false,
     position: 'user',
@@ -771,6 +846,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
   toastPosition: 'bottom-right',
   wallpaper: {
     global: null,
+    mobile: null,
     opacity: 0.3,
     fit: 'cover',
     blur: 0,
@@ -816,6 +892,8 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
   },
   ...PRODUCTIVITY_DEFAULTS,
 
+  recentConnections: {},
+  connectionLibraries: {},
   connectionsOrder: normalizeConnectionsOrder(),
 
   hydrateStartupSettings: (settings: StartupSettings) => {
@@ -871,6 +949,12 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
     if (settings.defaultImpersonationMode) {
       patch.defaultImpersonationMode = resolveImpersonationMode(settings.defaultImpersonationMode)
     }
+    if (typeof settings.showGreetingImage === 'boolean') {
+      patch.showGreetingImage = settings.showGreetingImage
+    }
+    if (settings.greetingImagePosition === 'top' || settings.greetingImagePosition === 'bottom') {
+      patch.greetingImagePosition = settings.greetingImagePosition
+    }
 
     set(patch as any)
     if (Object.prototype.hasOwnProperty.call(settings, 'activeProfileId')) {
@@ -909,11 +993,13 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
     }),
 
   setSetting: (key, value, source: SettingsWriteSource = 'user') => {
+    if (key === 'uiLanguage' && !isUiLanguage(value)) return
     if (key === 'inputBarEnterToSend') {
       get().setInputBarEnterToSend(value as EnterToSendSettings)
       return
     }
-    const previous = (get() as unknown as Record<string, unknown>)[key as string]
+    const state = get()
+    const previous = (state as unknown as Record<string, unknown>)[key as string]
     const changed = !pendingValuesMatch(previous, value)
     traceSettings('setSetting', {
       key: key as string,
@@ -928,7 +1014,60 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
     // winning the load-generation merge solely because its object identity
     // changed.
     if (!changed) return
-    set({ [key]: value } as any)
+    if ((ORGANIZATION_KEYS as readonly string[]).includes(key as string)) {
+      if (!state.fullSettingsLoaded) return
+      const edits = organizationEdits(key as OrganizationSettingKey, previous, value)
+      if (!edits.length) return
+      if (!organizationWriter || organizationWriterGeneration !== persistenceGeneration) {
+        organizationWriter?.dispose()
+        organizationWriterGeneration = persistenceGeneration
+        const generation = persistenceGeneration
+        organizationWriter = createOrganizationWriter({
+          commit: values => {
+            if (generation !== persistenceGeneration) return
+            for (const organizationKey of ORGANIZATION_KEYS) localSettingRevisions.set(organizationKey, ++localSettingsRevision)
+            set(values as Partial<AppStore>)
+            applyConnectionOrder(get(), values.connectionsOrder as ConnectionsOrder)
+          },
+          failed: async () => {
+            if (generation !== persistenceGeneration) return
+            get().addToast({ type: 'error', message: 'Connection organization could not be saved. Reloading saved folders and order.' })
+            return getApi<Record<string, unknown>>('/connections/organization')
+          },
+          settled: () => {
+            if (generation !== persistenceGeneration || !deferredOrganizationReload) return
+            deferredOrganizationReload = false
+            void get().loadSettings()
+          },
+        })
+      }
+      // Organization operations bypass the whole-blob debounce and localStorage recovery bridge.
+      for (const organizationKey of ORGANIZATION_KEYS) dirtyKeys.delete(organizationKey)
+      localSettingRevisions.set(key as string, ++localSettingsRevision)
+      set({ [key]: value } as Partial<AppStore>)
+      organizationWriter.enqueue(edits)
+      return
+    }
+    let unboundReasoningSettings: ReasoningSettings | undefined
+    if (
+      key === 'reasoningSettings'
+      && !state.profiles?.find((profile) => profile.id === state.activeProfileId)?.metadata?.reasoningBindings?.settings
+    ) {
+      const next = value as ReasoningSettings
+      unboundReasoningSettings = { ...(state.unboundReasoningSettings ?? state.reasoningSettings) }
+      // Only user-edited fields replace the preference. A provider may have
+      // mapped the displayed effort to a supported tier in the meantime.
+      const fields = new Set([
+        ...Object.keys(state.reasoningSettings),
+        ...Object.keys(next),
+      ]) as Set<keyof ReasoningSettings>
+      for (const field of fields) {
+        if (pendingValuesMatch(state.reasoningSettings[field], next[field])) continue
+        if (field in next) Object.assign(unboundReasoningSettings, { [field]: next[field] })
+        else delete unboundReasoningSettings[field]
+      }
+    }
+    set({ [key]: value, ...(unboundReasoningSettings ? { unboundReasoningSettings } : {}) } as any)
     if (DATA_KEYS.has(key as string)) {
       // Runtime synchronization and migration may observe the default store
       // before the authoritative GET completes. They must not create a local
@@ -943,6 +1082,12 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
         || source === 'compatibility'
       if (!automatic || get().fullSettingsLoaded) {
         persistKey(key as string, value, source)
+        if (unboundReasoningSettings) persistKey('unboundReasoningSettings', unboundReasoningSettings, source)
+        // Persist a language selection before the app can be closed or opened
+        // on another device; the pending-settings bridge still covers failures.
+        if (key === 'uiLanguage' && source === 'user') {
+          void flushSettingsNow().catch(() => {})
+        }
       } else {
         traceSettings('setSetting:pre-hydration-skip', {
           key: key as string,
@@ -1061,7 +1206,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
     // Layer 2: Global CSS
     const customCSS = {
       css: pack.globalCSS || '',
-      enabled: !!pack.globalCSS.trim(),
+      enabled: pack.globalCSSEnabled ?? !!pack.globalCSS.trim(),
       revision: Date.now(),
       bundleId: pack.bundleId || generateUUID(),
     }
@@ -1136,17 +1281,18 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
     const savedThemes = get().savedThemes.filter((e) => e.id !== id)
     set({ savedThemes })
     persistKey('savedThemes', savedThemes)
-    // Clean up bundle assets for pack entries, unless the bundle is still the
-    // active customCSS bundle (i.e. the user is currently using it).
+    // Backups can share a bundle with other saved themes.
     if (entry.kind === 'pack') {
-      const activeBundleId = get().customCSS.bundleId
       const packBundleId = entry.pack.bundleId
-      if (packBundleId && packBundleId !== activeBundleId) {
+      const isReferenced = () => get().customCSS.bundleId === packBundleId
+        || get().savedThemes.some((saved) => saved.kind === 'pack' && saved.pack.bundleId === packBundleId)
+      if (packBundleId && !isReferenced()) {
         try {
           const assets = await themeAssetsApi.list(packBundleId)
+          if (isReferenced()) return
           await Promise.all(assets.map((a) => themeAssetsApi.delete(a.id).catch(() => {})))
         } catch {
-          // Swallow — orphaned assets are non-fatal; the user can prune manually.
+          // Failed cleanup must not prevent removal from the library.
         }
       }
     }
@@ -1164,10 +1310,40 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
       }
       get().setTheme(theme)
     } else {
-      get().applyThemePack({
-        ...entry.pack,
-        name: entry.name,
-        theme: entry.pack.theme ? { ...entry.pack.theme, name: entry.name } : null,
+      const apply = (pack = entry.pack) => {
+        get().applyThemePack({
+          ...pack,
+          components: entry.authoringSnapshot
+            ? restoreThemePackComponents(pack.components, get().componentOverrides)
+            : pack.components,
+          globalCSSEnabled: entry.authoringSnapshot?.globalEnabled ?? pack.globalCSSEnabled,
+          name: entry.name,
+          theme: pack.theme ? { ...pack.theme, name: entry.name } : null,
+        })
+        if (entry.authoringSnapshot?.themeWasNull) get().setTheme(null)
+      }
+      if (!entry.authoringSnapshot || !entry.pack.assets.length) return apply()
+
+      const before = get()
+      const { theme, customCSS, componentOverrides } = before
+      const bundleId = generateUUID()
+      return uploadThemePackAssets(entry.pack.assets, bundleId, themeAssetsApi).then(async (uploaded) => {
+        try {
+          const current = get()
+          if (current.savedThemes.find((saved) => saved.id === id) !== entry
+            || current.theme !== theme || current.customCSS !== customCSS
+            || current.componentOverrides !== componentOverrides) {
+            throw new Error('Theme changed while restoring the backup. Try again.')
+          }
+          const pack = { ...entry.pack, bundleId }
+          const savedThemes = current.savedThemes.map((saved) => saved.id === id ? { ...entry, pack } : saved)
+          set({ savedThemes })
+          persistKey('savedThemes', savedThemes)
+          apply(pack)
+        } catch (error) {
+          await Promise.all(uploaded.map((asset) => themeAssetsApi.delete(asset.id).catch(() => {})))
+          throw error
+        }
       })
     }
   },
@@ -1195,11 +1371,15 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
       )
       return {
         ...entry,
+        ...(entry.authoringSnapshot ? {
+          authoringSnapshot: { version: 1 as const, globalEnabled: state.customCSS.enabled, themeWasNull: state.theme === null },
+        } : {}),
         pack: {
           ...entry.pack,
           name: entry.name,
           theme: { ...currentTheme, name: entry.name },
           globalCSS: state.customCSS.css || '',
+          globalCSSEnabled: state.customCSS.enabled,
           components,
         },
       } as typeof entry
@@ -1213,6 +1393,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
   },
 
   loadSettings: async () => {
+    if (organizationWriter?.pending) deferredOrganizationReload = true
     const loadGeneration = settingsLoadGeneration.begin()
     const isCurrentLoad = () => settingsLoadGeneration.isCurrent(loadGeneration)
     settingsSelectionAbort?.abort()
@@ -1280,6 +1461,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
         const canonicalKey = LEGACY_SETTINGS_KEY_RENAMES[row.key] ?? row.key
         if (
           !DATA_KEYS.has(canonicalKey)
+          || ((ORGANIZATION_KEYS as readonly string[]).includes(canonicalKey) && organizationWriter?.pending)
           || hasNewerLocalSetting(canonicalKey, localRevisionAtLoadStart)
           // Prefer a canonical setting row when both its legacy and current
           // names are present in the account.
@@ -1287,12 +1469,13 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
           // Drop values outside the ToastPosition union; the startup payload
           // validates identically so the two hydration paths cannot disagree.
           || (canonicalKey === 'toastPosition' && !isToastPosition(row.value))
+          || !isValidSettingValue(canonicalKey, row.value)
         ) continue
         const storedValue = migrateStoredSettingValue(canonicalKey, row.value)
         if (canonicalKey === 'quickToolbarSettings' && !pendingValuesMatch(storedValue, row.value)) {
           migratedProductivityKeys.add(canonicalKey)
         }
-        patch[canonicalKey] = mergeStoredSetting((defaults as any)[canonicalKey], storedValue)
+        patch[canonicalKey] = mergeStoredSetting((defaults as any)[canonicalKey], storedValue, canonicalKey)
         if (canonicalKey !== row.key) legacySettingsToPersist[canonicalKey] = patch[canonicalKey]
       }
 
@@ -1325,13 +1508,24 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
           if (
             !DATA_KEYS.has(k)
             || hasNewerLocalSetting(k, localRevisionAtLoadStart)
+            || !isValidSettingValue(k, v)
           ) continue
           const pendingValue = migrateStoredSettingValue(k, v)
           if (k === 'quickToolbarSettings' && !pendingValuesMatch(pendingValue, v)) {
             migratedProductivityKeys.add(k)
           }
-          patch[k] = mergeStoredSetting(patch[k] ?? (defaults as any)[k], pendingValue)
+          patch[k] = mergeStoredSetting(patch[k] ?? (defaults as any)[k], pendingValue, k)
         }
+      }
+
+      // Accounts created before language persistence may have no language row.
+      // Give them one stable app default instead of promoting a device-detected
+      // cache. Preserve a Settings edit made while this GET was in flight.
+      const initializeUiLanguage = !hasNewerLocalSetting('uiLanguage', localRevisionAtLoadStart)
+        && !rows.some(row => row.key === 'uiLanguage' && isUiLanguage(row.value))
+        && !isUiLanguage(pendingKeys?.uiLanguage)
+      if (initializeUiLanguage) {
+        patch.uiLanguage = defaults.uiLanguage ?? DEFAULT_UI_LANGUAGE
       }
 
       if (!isCurrentLoad()) return
@@ -1447,29 +1641,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
       // something in the panel — which is the visible divergence C3 found.
       if (patch.connectionsOrder) {
         if (!isCurrentLoad()) return
-        const order = patch.connectionsOrder as ConnectionsOrder
-        const args = deriveReorderArgs(order, {
-          llm: get().profiles,
-          imageGen: get().imageGenProfiles,
-          stt: get().sttProfiles,
-          tts: get().ttsProfiles,
-        })
-        if (args.llm) {
-          if (!isCurrentLoad()) return
-          get().applyProfileOrder(args.llm)
-        }
-        if (args.imageGen) {
-          if (!isCurrentLoad()) return
-          get().applyImageGenProfileOrder(args.imageGen)
-        }
-        if (args.stt) {
-          if (!isCurrentLoad()) return
-          get().applySttProfileOrder(args.stt)
-        }
-        if (args.tts) {
-          if (!isCurrentLoad()) return
-          get().applyTtsProfileOrder(args.tts)
-        }
+        applyConnectionOrder(get(), patch.connectionsOrder as ConnectionsOrder, isCurrentLoad)
       }
       if (migratedCharacterFilterTab) {
         if (!isCurrentLoad()) return
@@ -1481,6 +1653,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
       // image-generation row still waits for profile reconciliation when needed.
       if (!isCurrentLoad()) return
       set({ fullSettingsLoaded: true })
+      if (initializeUiLanguage) persistKey('uiLanguage', get().uiLanguage, 'compatibility')
       traceSettings('loadSettings:hydrated', {
         loadGeneration,
         pendingKeys: pendingKeys ? Object.keys(pendingKeys) : [],
@@ -1506,7 +1679,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
       }
       if (pendingKeys) {
         for (const [key, value] of Object.entries(pendingKeys)) {
-          if (!DATA_KEYS.has(key) || key === 'imageGeneration') continue
+          if (!DATA_KEYS.has(key) || key === 'imageGeneration' || !isValidSettingValue(key, value)) continue
           if (!isCurrentLoad()) return
           persistKey(key, patch[key] ?? value)
         }

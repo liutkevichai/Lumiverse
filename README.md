@@ -12,13 +12,16 @@ Please also review the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 - [User guides](https://lumiverse.chat/guides)
 - [Extension developer docs](https://docs.lumiverse.chat)
+- [Native iOS and Android projects](developer-docs/docs/getting-started/mobile-projects.md)
 
 ## Get the Repository
 
 Clone the repo from GitHub. Do **not** use a general-release source archive as
 the server checkout; those archives are not the supported update path. The
-separately tagged `desktop-v*` releases contain prebuilt desktop installers,
-but the desktop companion still needs this checkout to run the local server.
+separately tagged `desktop-v*` releases contain self-contained desktop installers
+with the local server included. They also support remote instances and existing
+checkouts. See the [bundled desktop update guide](developer-docs/docs/getting-started/desktop-updates.md)
+for stable and nightly release channels.
 
 ```bash
 git clone https://github.com/prolix-oc/Lumiverse.git
@@ -46,7 +49,14 @@ git pull --ff-only
 
 ## Quick Start
 
-All commands below assume you have already cloned the repo and are working from the branch you want to run.
+**Experimental bundled desktop:** stable and nightly releases include Bun, the
+server, and the frontend. First launch offers a built-in server, an existing
+checkout, or a remote instance. Built-in setup uses a three-step wizard in a
+native Tauri window. The standalone server can also be built locally. See the
+[bundled server guide](developer-docs/docs/getting-started/bundled-server.md)
+for downloads, supported architectures, and testing instructions.
+
+The source commands below assume you have already cloned the repo and are working from the branch you want to run.
 
 ### One-line launch (macOS/Linux)
 
@@ -62,7 +72,7 @@ All commands below assume you have already cloned the repo and are working from 
 
 The launcher will:
 1. Install Bun if not found
-2. Upgrade unsupported Bun versions to the latest stable release (minimum 1.4.2)
+2. Upgrade unsupported Bun versions to the latest stable release (minimum 1.4.4)
 3. Run the **first-time setup wizard** (admin account, port, extension storage, optional SMART disk monitoring)
 4. Install backend dependencies and serve the existing frontend build if one is available
 5. Start the backend with the runner and IPC bridge when launched interactively
@@ -105,95 +115,7 @@ You can run Lumiverse for free on [Hugging Face Spaces](https://huggingface.co/s
 
 > **Free-tier limits:** Spaces on the free tier run on 2 vCPU / 16 GB RAM with no GPU. The container sleeps after **48 hours of inactivity** and cold-starts on the next visit (typically 30–60 s). Persistent storage buckets are **free** and keep your data across restarts — attach one in **Settings → Persistent storage**. For always-on, full-speed inference consider a paid Space or a dedicated server.
 
-#### 1. Create a new Space
-
-1. Go to [huggingface.co/new-space](https://huggingface.co/new-space).
-2. Give it a name, set **Space SDK** to **Docker**, and set **Visibility** to *Public* or *Private*.
-3. Click **Create Space**.
-
-#### 2. Add persistent storage
-
-In your Space's **Settings → Persistent storage**, attach a storage bucket and mount it at `/app/data`.
-
-#### 3. Add the Dockerfile
-
-In the **Files** tab of your Space, create a file named `Dockerfile` with the following contents:
-
-```dockerfile
-FROM oven/bun:1.4.2-slim@sha256:cb3bbbb08e13a4a2ff400f24c7a2a1d5efa83f6ef8544d52d95a519631e2fc61
-
-ARG DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
-  git ca-certificates curl sqlite3 rsync python3 \
-  && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-ARG LUMIVERSE_REPO=https://github.com/prolix-oc/Lumiverse.git
-ARG LUMIVERSE_REF=staging
-RUN git clone --depth 1 --branch "${LUMIVERSE_REF}" "${LUMIVERSE_REPO}" .
-
-RUN rm -f package-lock.json && bun install --production
-
-WORKDIR /app/frontend
-RUN rm -f package-lock.json && bun install && bun run build
-RUN printf "self.addEventListener('install',e=>self.skipWaiting());self.addEventListener('activate',e=>e.waitUntil(self.clients.claim()));\n" > /app/frontend/dist/sw.js
-RUN test -f /app/frontend/dist/index.html
-
-WORKDIR /app
-ENV NODE_ENV=production
-ENV PORT=7860
-ENV DATA_DIR=/app/data
-ENV FRONTEND_DIR=/app/frontend/dist
-ENV TRUST_ANY_ORIGIN=true
-ENV OWNER_PASSWORD=admin123
-
-RUN cat > /app/start.sh <<'SH'
-#!/usr/bin/env sh
-set -eu
-export DATA_DIR="${DATA_DIR:-/app/data}"
-exec bun run scripts/runner.ts
-SH
-
-RUN chmod +x /app/start.sh
-
-USER root
-RUN mkdir -p /app/data && chown -R bun:bun /app/data
-
-EXPOSE 7860
-VOLUME /app/data
-
-USER bun
-CMD ["/app/start.sh"]
-```
-
-#### 4. Set your admin password
-
-Before the Space builds, go to **Settings → Variables and secrets** and add a secret:
-
-| Name | Value |
-|------|-------|
-| `OWNER_PASSWORD` | *your chosen password* |
-
-This overrides the `admin123` default baked into the Dockerfile. **Do not skip this step on a public Space.**
-
-#### 5. Open the Space
-
-Once the build finishes (~3–5 min on the free tier), click **Open in new tab** (or visit `https://<your-username>-<space-name>.hf.space`). Log in with username `admin` and the password you set.
-
-## First-Run Setup
-
-On first launch, the setup wizard walks you through:
-
-1. **Admin account** — username and password for the owner account
-2. **Server port** — defaults to `7860`
-3. **Extension storage** — disk budget for Spindle extension data pools
-4. **Disk health monitoring** — installs smartmontools through the detected system package manager when possible
-5. **Identity file** — auto-generated encryption identity (`data/lumiverse.identity`)
-
-The wizard produces a `.env` file and the identity file. Both are required to run the server.
-
-> **Important:** Keep `data/lumiverse.identity` safe. It holds the encryption key for all secrets. If lost, encrypted data cannot be recovered.
+Check out [HF GUIDE](HF-HOSTING-GUIDE.md)
 
 ### SMART disk health
 
@@ -251,7 +173,9 @@ If you start Lumiverse with `--no-runner`, `-NoRunner`, `bun run start`, or `bun
 with Lumiverse's integrated browser as its primary interface and a macOS menu
 bar / Windows system tray / Linux StatusNotifier icon for controls. It starts
 and stops a local server, shows serving stats, opens the same address in your
-default browser on request, and applies updates through the runner. See
+default browser on request, and updates bundled installations through signed
+stable/nightly desktop releases. Existing checkouts retain the runner's Git
+updates. See
 [desktop/README.md](desktop/README.md) for prebuilt Linux AppImage help and
 development instructions. Prebuilt installers are attached to `desktop-v*`
 releases. To build the companion from this checkout instead, use

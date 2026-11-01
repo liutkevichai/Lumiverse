@@ -124,6 +124,11 @@ export const TABLE_REGISTRY: readonly TableSpec[] = [
     ownership: "user",
     scrubColumns: { has_api_key: 0 },
   },
+  {
+    table: "decision_connections",
+    ownership: "user",
+    scrubColumns: { has_api_key: 0 },
+  },
 
   // 4) Presets reference connection_profiles via metadata only
   { table: "presets", ownership: "user" },
@@ -302,6 +307,7 @@ export const IMPORT_ORDER: readonly string[] = [
   "image_gen_connections",
   "tts_connections",
   "stt_connections",
+  "decision_connections",
 
   // Phase 4: world books (referenced by personas)
   "world_books",
@@ -383,6 +389,7 @@ export const EXCLUDED_TABLES = new Set<string>([
   // Device-specific
   "push_subscriptions",
   "desktop_notification_destinations",
+  "ios_push_destinations",
   // System / built-in
   "_migrations",
   "tokenizer_configs",
@@ -413,12 +420,13 @@ export const SECRET_SETTING_KEY_PATTERNS: readonly RegExp[] = [
   /^image_gen_connection_.+_api_key$/,
   /^tts_connection_.+_api_key$/,
   /^stt_connection_.+_api_key$/,
+  /^decision_connection_.+_api_key$/,
   /^embedding_api_key_/,
   /^pollinations_app_key$/,
   // Web-search provider credentials live in the encrypted `secrets` table.
-  // Keep legacy SearXNG and the provider-specific Exa/Tavily names out of
+  // Keep legacy SearXNG and the provider-specific hosted API names out of
   // settings exports/imports in case an older client ever wrote one there.
-  /^web_search_(?:exa_|tavily_)?api_key$/,
+  /^web_search_(?:exa_|tavily_|deepseek_)?api_key$/,
 ];
 
 /** LanceDB tables that participate in optional vector export. */

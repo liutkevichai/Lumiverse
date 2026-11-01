@@ -1,5 +1,9 @@
 import { useState, useEffect, useCallback } from 'react'
 import { pushApi, type PushSubscriptionRecord, type PushTestResult } from '@/api/push'
+import { isNativeIOS } from '@/lib/ios-native'
+import { useIOSPushSubscription } from './useIOSPushSubscription'
+import { isNativeAndroid } from '@/lib/android-native'
+import { useAndroidPushSubscription } from './useAndroidPushSubscription'
 import {
   clearDesktopNotificationEnrollment,
   getDesktopNotificationDevice,
@@ -233,12 +237,21 @@ function describeSubscribeError(error: unknown): string {
 }
 
 export function usePushSubscription() {
+  const ios = isNativeIOS()
+  const native = useIOSPushSubscription(ios)
+  const android = isNativeAndroid()
+  const nativeAndroid = useAndroidPushSubscription(android)
+  const browserDesktop = useBrowserDesktopPushSubscription(!ios && !android)
+  return ios ? native : android ? nativeAndroid : browserDesktop
+}
+
+function useBrowserDesktopPushSubscription(enabled: boolean) {
   const desktop = isTauriDesktop()
   const [capability, setCapability] = useState<PushCapability>(DEFAULT_PUSH_CAPABILITY)
   const [isSubscribed, setIsSubscribed] = useState(false)
   const [subscriptions, setSubscriptions] = useState<PushSubscriptionRecord[]>([])
   const [permissionState, setPermissionState] = useState<NotificationPermission>(
-    !desktop && typeof Notification !== 'undefined' ? Notification.permission : 'default'
+    enabled && !desktop && typeof Notification !== 'undefined' ? Notification.permission : 'default'
   )
   const [desktopDeviceId, setDesktopDeviceId] = useState<string | null>(null)
   const [desktopDestinationId, setDesktopDestinationId] = useState<string | null>(null)
@@ -246,6 +259,7 @@ export function usePushSubscription() {
 
   // Check current subscription status on mount
   useEffect(() => {
+    if (!enabled) return
     let cancelled = false
 
     detectPushCapability().then((result) => {
@@ -324,10 +338,10 @@ export function usePushSubscription() {
     return () => {
       cancelled = true
     }
-  }, [desktop])
+  }, [desktop, enabled])
 
   useEffect(() => {
-    if (!desktop) return
+    if (!desktop || !enabled) return
     let cancelled = false
     const refreshTransport = async () => {
       try {
@@ -359,7 +373,7 @@ export function usePushSubscription() {
       cancelled = true
       window.clearInterval(timer)
     }
-  }, [desktop])
+  }, [desktop, enabled])
 
   const subscribe = useCallback(async (): Promise<boolean> => {
     if (!capability.supported) {

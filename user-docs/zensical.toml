@@ -70,6 +70,7 @@ nav = [
     { "Overview" = "connections/index.md" },
     { "Setting Up a Connection" = "connections/setting-up.md" },
     { "Supported Providers" = "connections/providers.md" },
+    { "Decision Models" = "connections/decisions.md" },
   ] },
   { "Presets" = [
     { "Overview" = "presets/index.md" },
@@ -117,6 +118,8 @@ nav = [
   { "Settings" = [
     { "Disk Health & SMART" = "settings/disk-health.md" },
     { "Embeddings" = "settings/embeddings.md" },
+    { "Milvus Maintenance" = "settings/milvus-maintenance.md" },
+    { "Local Inference Scheduling" = "settings/inference-scheduling.md" },
     { "Web Search" = "settings/web-search.md" },
     { "Notifications" = "settings/push-notifications.md" },
     { "LumiHub" = "settings/lumihub.md" },

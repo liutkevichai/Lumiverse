@@ -61,6 +61,7 @@ export interface ConsolidationSidecarOptions {
   sidecarTimeoutMs?: number;
   sidecar?: { connectionProfileId?: string | null; model?: string | null };
   signal?: AbortSignal;
+  onProgress?: (phase: "scene" | "arc") => void;
 }
 
 // ─── Row Mapper ────────────────────────────────────────────────
@@ -273,6 +274,7 @@ function resolveConsolidationSidecarOptions(
       sidecarTimeoutMs: sidecarOptions.sidecarTimeoutMs ?? sidecarTimeoutMs,
       sidecar: sidecarOptions.sidecar,
       signal: sidecarOptions.signal,
+      onProgress: sidecarOptions.onProgress,
     };
   }
 
@@ -296,20 +298,28 @@ function resolveConsolidationSidecarOptions(
 
 // ─── Consolidation Pipeline ────────────────────────────────────
 
-/**
- * Check if consolidation is needed and run it if so.
- * Called after chunk creation, runs synchronously for extractive mode.
- */
-export async function maybeConsolidate(
+const consolidatingChats = new Set<string>();
+
+/** Run one due scene batch. All entry points share a per-chat guard because
+ * provider calls release the JS thread while summaries are in progress. */
+export async function maybeConsolidate(...args: Parameters<typeof consolidateNext>): Promise<boolean> {
+  const chatId = args[1];
+  if (consolidatingChats.has(chatId)) return false;
+  consolidatingChats.add(chatId);
+  try { return await consolidateNext(...args); }
+  finally { consolidatingChats.delete(chatId); }
+}
+
+async function consolidateNext(
   userId: string,
   chatId: string,
   config: ConsolidationConfig,
   generateRawFn?: ConsolidationGenerateRawFn,
   sidecarConnectionId?: string,
   sidecarTimeoutMs?: number,
-  /** Sampling parameters forwarded to the underlying LLM call. Caller supplies
-   *  the user-configured sidecar temperature/top_p; max_tokens is set per call
-   *  from config.maxTokensPerSummary. */
+  /** Sampling parameters forwarded to the underlying LLM call, including the
+   *  total generation budget. config.maxTokensPerSummary limits the requested
+   *  summary length separately from reasoning tokens. */
   samplingParameters?: Record<string, unknown>,
   /** Additional scaffold tag names to strip from raw chunk content before
    *  feeding it to the consolidation LLM or extractive scorer. */
@@ -355,6 +365,7 @@ export async function maybeConsolidate(
     userId, sidecarConnectionId, sidecarTimeoutMs, sidecarOptions,
   );
   if (resolvedSidecar.signal?.aborted) return false;
+  resolvedSidecar.onProgress?.("scene");
 
   if (config.useSidecar && generateRawFn) {
     const decision = await generateConsolidationSummary(
@@ -464,7 +475,7 @@ async function maybeConsolidateArcs(
   samplingParameters?: Record<string, unknown>,
   extraScaffoldTags?: string[],
   sidecarOptions?: ConsolidationSidecarOptions,
-): Promise<void> {
+): Promise<boolean> {
   const db = getDb();
 
   // Check threshold with COUNT first, then fetch only the batch we need.
@@ -480,7 +491,7 @@ async function maybeConsolidateArcs(
     )
     .get(chatId, chatId) as { count: number } | null;
 
-  if (!countRow || countRow.count < config.arcThreshold) return;
+  if (config.arcThreshold < 1 || !countRow || countRow.count < config.arcThreshold) return false;
 
   const batch = db
     .query(
@@ -500,7 +511,8 @@ async function maybeConsolidateArcs(
   let arcSummary: string;
   let arcTitle: string | null = null;
 
-  if (sidecarOptions?.signal?.aborted) return;
+  if (sidecarOptions?.signal?.aborted) return false;
+  sidecarOptions?.onProgress?.("arc");
 
   if (config.useSidecar && generateRawFn) {
     const combined = summaries.join("\n\n---\n\n");
@@ -519,7 +531,7 @@ async function maybeConsolidateArcs(
       } else {
         console.warn("[memory-cortex] Arc consolidation sidecar exhausted, skip persist");
       }
-      return;
+      return false;
     }
 
     if (decision.result && !decision.useExtractive) {
@@ -572,6 +584,7 @@ async function maybeConsolidateArcs(
   console.info(
     `[memory-cortex] Created arc consolidation ${arcId} from ${batch.length} tier-1 consolidations`,
   );
+  return true;
 }
 
 // ─── Extractive Consolidation ──────────────────────────────────
@@ -645,6 +658,13 @@ function inferTitle(chunks: any[]): string | null {
 
 // ─── Generative Consolidation (Sidecar) ────────────────────────
 
+function consolidationResponseTokenLimit(maxTokens: number, parameters: Record<string, unknown>): number {
+  const configured = parameters.max_tokens;
+  return typeof configured === "number" && Number.isFinite(configured) && configured > 0
+    ? Math.max(maxTokens + 100, configured)
+    : maxTokens + 100;
+}
+
 const CONSOLIDATION_PROMPT = `Compress these roleplay passages into a factual long-term memory summary.
 
 RULES
@@ -656,6 +676,7 @@ RULES
 - Do NOT add interpretation, motives, symbolism, theme analysis, or likely implications.
 - Do NOT invent links between events that are not stated.
 - Keep chronology clear.
+- Keep the summary within {{MAX_TOKENS}} tokens.
 
 <passages>
 {{CONTENT}}
@@ -688,8 +709,8 @@ export async function generateConsolidationSummary(
         .replace("{{CONTENT}}", content)
         .replace("{{MAX_TOKENS}}", String(maxTokens));
 
-      // Caller-supplied temperature/top_p are honored; max_tokens is always set
-      // here from config.maxTokensPerSummary regardless of what the caller passed.
+      // The configured generation budget includes thinking. The prompt limits
+      // the summary itself, so reasoning does not consume its entire allowance.
       const userParams = samplingParameters ?? { temperature: 0.1 };
       const response = await generateRawFn({
         requestPurpose: "memory summarization",
@@ -700,7 +721,7 @@ export async function generateConsolidationSummary(
         ],
         parameters: {
           ...userParams,
-          max_tokens: maxTokens + 100,
+          max_tokens: consolidationResponseTokenLimit(maxTokens, userParams),
           ...(target.model ? { model: target.model } : {}),
         },
         signal: target.signal,
@@ -730,6 +751,7 @@ RULES
 - Omit scenic filler and details that do not matter later.
 - Do NOT add interpretation, motives, themes, or unsupported links.
 - Dense and factual: this summary replaces the individual scene summaries.
+- Keep the summary within {{MAX_TOKENS}} tokens.
 
 <summaries>
 {{CONTENT}}
@@ -768,7 +790,7 @@ async function generateArcSummary(
         ],
         parameters: {
           ...userParams,
-          max_tokens: maxTokens + 100,
+          max_tokens: consolidationResponseTokenLimit(maxTokens, userParams),
           ...(target.model ? { model: target.model } : {}),
         },
         signal: target.signal,
@@ -919,9 +941,9 @@ export function getSummaryQualityIssue(
 }
 
 /**
- * Drain an existing chunk backlog after a rebuild. Rebuild ingestion uses
- * pre-computed extraction responses, so consolidation must run separately
- * with the real sidecar adapter after all chunks have been persisted.
+ * Drain due scene batches and pending arcs after live ingestion or a rebuild.
+ * Rebuild ingestion uses pre-computed extraction responses, so its summaries
+ * run separately with the real sidecar adapter after all chunks are persisted.
  */
 export async function consolidateBacklog(
   userId: string,
@@ -935,20 +957,27 @@ export async function consolidateBacklog(
   sidecarOptions?: ConsolidationSidecarOptions,
 ): Promise<number> {
   let created = 0;
-  if (sidecarOptions?.signal?.aborted) return created;
-  while (await maybeConsolidate(
-    userId,
-    chatId,
-    config,
-    generateRawFn,
-    sidecarConnectionId,
-    sidecarTimeoutMs,
-    samplingParameters,
-    extraScaffoldTags,
-    sidecarOptions,
-  )) {
-    created++;
-    if (sidecarOptions?.signal?.aborted) break;
+  if (!config.enabled || sidecarOptions?.signal?.aborted || consolidatingChats.has(chatId)) return created;
+  consolidatingChats.add(chatId);
+  try {
+    const resolvedSidecar = resolveConsolidationSidecarOptions(userId, sidecarConnectionId, sidecarTimeoutMs, sidecarOptions);
+    while (await consolidateNext(
+      userId, chatId, config, generateRawFn, sidecarConnectionId, sidecarTimeoutMs,
+      samplingParameters, extraScaffoldTags, resolvedSidecar,
+    )) {
+      created++;
+      if (resolvedSidecar.signal?.aborted) return created;
+    }
+    // A previous arc request may have failed after its scene summaries were
+    // saved. Retry that backlog even when no new scene batch is due.
+    while (await maybeConsolidateArcs(
+      userId, chatId, config, generateRawFn, sidecarConnectionId, sidecarTimeoutMs,
+      samplingParameters, extraScaffoldTags, resolvedSidecar,
+    )) {
+      if (resolvedSidecar.signal?.aborted) break;
+    }
+    return created;
+  } finally {
+    consolidatingChats.delete(chatId);
   }
-  return created;
 }

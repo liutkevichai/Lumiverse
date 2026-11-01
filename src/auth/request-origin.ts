@@ -96,3 +96,18 @@ export function requestAtResolvedOrigin(
   rewritten.headers.delete("x-forwarded-port");
   return rewritten;
 }
+
+/**
+ * Give session lookups the approved transport without forwarding the API body.
+ * Reconstructing a Request from the incoming upload also retains a second,
+ * unread body in Bun. That copy grows with the entire archive even when the
+ * route streams its own body straight to disk. Session checks need only the
+ * origin and headers; the HTTP auth handler above still forwards its body.
+ */
+export function approvedAuthRequest(request: Request, trustForwarded: boolean): Request {
+  const url = new URL(request.url);
+  const sessionRequest = new Request(request.url, { headers: request.headers });
+  sessionRequest.headers.delete("content-length");
+  sessionRequest.headers.delete("transfer-encoding");
+  return requestAtResolvedOrigin(sessionRequest, resolveDesktopRequestOrigin(request, trustForwarded), url.pathname + url.search);
+}

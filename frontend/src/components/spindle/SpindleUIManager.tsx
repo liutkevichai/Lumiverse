@@ -3,12 +3,15 @@ import { createPortal } from 'react-dom'
 import { motion } from 'motion/react'
 import { X } from 'lucide-react'
 import { useStore } from '@/store'
+import { wsClient } from '@/ws/client'
+import { systemAudioConsent } from '@/lib/spindle/system-audio-consent'
 import SpindleFloatWidget from './SpindleFloatWidget'
 import SpindleDockPanel from './SpindleDockPanel'
 import SpindleAppMount from './SpindleAppMount'
 import ContainerTabContent from './ContainerTabContent'
+import SystemAudioIndicator from './SystemAudioIndicator'
+import SpindleConfirm from './SpindleConfirm'
 import ExpandedTextEditor from '@/components/shared/ExpandedTextEditor'
-import ConfirmationModal from '@/components/shared/ConfirmationModal'
 import { InputPromptModal } from '@/components/shared/InputPromptModal'
 import ContextMenu, { type ContextMenuEntry } from '@/components/shared/ContextMenu'
 import type { SpindleModalItem } from '@/types/store'
@@ -57,6 +60,10 @@ function SpindleTextEditor() {
 }
 
 export default function SpindleUIManager() {
+  const userId = useStore((s) => s.user?.id ?? null)
+  useEffect(() => wsClient.on('SPINDLE_PERMISSION_CHANGED', (payload: unknown) => {
+    systemAudioConsent.permissionsChanged(userId, payload)
+  }), [userId])
   const floatWidgets = useStore((s) => s.floatWidgets)
   const dockPanels = useStore((s) => s.dockPanels)
   const appMounts = useStore((s) => s.appMounts)
@@ -97,6 +104,7 @@ export default function SpindleUIManager() {
       <SpindleConfirm />
       <SpindleInputPrompt />
       <SpindleContextMenu />
+      <SystemAudioIndicator />
     </>
   )
 }
@@ -134,6 +142,21 @@ function ModalItemRenderer({ item }: { item: SpindleModalItem }) {
 function SpindleModal() {
   const req = useStore((s) => s.pendingModal)
   const closeModal = useStore((s) => s.closeSpindleModal)
+  const isOpen = Boolean(req)
+  const [, refreshGeometry] = useState(0)
+  useEffect(() => {
+    if (!isOpen) return
+    const refresh = () => refreshGeometry(value => value + 1)
+    const observer = new MutationObserver(refresh)
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ['style'] })
+    window.addEventListener('resize', refresh)
+    window.visualViewport?.addEventListener('resize', refresh)
+    return () => {
+      observer.disconnect()
+      window.removeEventListener('resize', refresh)
+      window.visualViewport?.removeEventListener('resize', refresh)
+    }
+  }, [isOpen])
 
   if (!req) return null
 
@@ -192,34 +215,6 @@ function SpindleModal() {
       </motion.div>
     </motion.div>,
     document.body
-  )
-}
-
-function SpindleConfirm() {
-  const req = useStore((s) => s.pendingConfirm)
-  const closeConfirm = useStore((s) => s.closeSpindleConfirm)
-
-  if (!req) return null
-
-  const variantMap: Record<string, 'danger' | 'warning' | 'safe'> = {
-    danger: 'danger',
-    warning: 'warning',
-    info: 'safe',
-    success: 'safe',
-  }
-
-  return (
-    <ConfirmationModal
-      isOpen={true}
-      title={`${req.extensionName}: ${req.title}`}
-      message={req.message}
-      variant={variantMap[req.variant] || 'safe'}
-      confirmText={req.confirmLabel}
-      cancelText={req.cancelLabel}
-      onConfirm={() => closeConfirm(req.requestId, true)}
-      onCancel={() => closeConfirm(req.requestId, false)}
-      zIndex={10004}
-    />
   )
 }
 

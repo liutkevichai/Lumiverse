@@ -1,5 +1,7 @@
 //! Frontend window — a native WebView loading the local Lumiverse server.
 
+use crate::desktop_surface::{Backend, SurfaceMode};
+
 use std::{
     path::PathBuf,
     sync::{
@@ -16,8 +18,11 @@ use tauri::{
 /// Besides being useful in terminal diagnostics, CI uses this to distinguish
 /// a working tray from a startup-error dialog that merely remains open.
 #[tauri::command]
-pub fn desktop_startup_ready() {
+pub fn desktop_startup_ready(app: AppHandle) {
     eprintln!("[desktop-startup] tray ready");
+    if let Err(error) = crate::linux_smoke::start(&app) {
+        eprintln!("[desktop-smoke] could not create fixture: {error}");
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -121,19 +126,93 @@ const WIDGET_MAX_HEIGHT: u32 = 900;
 // WebView2 explicitly supports this switch for applications whose foreground
 // work must not be coalesced into background-timer batches. Supplying browser
 // arguments replaces Wry's defaults, so retain its UI/SmartScreen feature
-// exclusions alongside the streaming fix. Every WebView in this process uses
-// the same value because WebView2 requires matching environment options for a
-// shared user-data directory.
+// exclusions and gesture-free playback alongside the streaming fix. Every
+// WebView in this process uses the same value because WebView2 requires matching
+// environment options for a shared user-data directory.
 #[cfg(target_os = "windows")]
 const WINDOWS_WEBVIEW_BROWSER_ARGS: &str =
-    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-background-timer-throttling";
+    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required --disable-background-timer-throttling";
 
 fn configure_webview_runtime<'a, R: tauri::Runtime, M: tauri::Manager<R>>(
     builder: WebviewWindowBuilder<'a, R, M>,
 ) -> WebviewWindowBuilder<'a, R, M> {
     #[cfg(target_os = "windows")]
     let builder = builder.additional_browser_args(WINDOWS_WEBVIEW_BROWSER_ARGS);
-    builder
+    crate::profile::configure_webview(builder)
+}
+
+fn create_frontend_popup(
+    app: &AppHandle,
+    url: tauri::Url,
+    features: tauri::webview::NewWindowFeatures,
+) -> tauri::webview::NewWindowResponse<tauri::Wry> {
+    // Only an empty placeholder or a web page may become a native popup.
+    if !matches!(url.scheme(), "http" | "https") && url.as_str() != "about:blank" {
+        return tauri::webview::NewWindowResponse::Deny;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let Some(main_thread) = objc2::MainThreadMarker::new() else {
+            return tauri::webview::NewWindowResponse::Deny;
+        };
+        // WebKit's child configuration shares the opener's content controller.
+        // Reusing it inherits the opener's non-configurable Tauri metadata and
+        // IPC handler: callbacks then identify as `frontend`, and destroying a
+        // child can remove its opener's IPC handler. Keep WebKit's process pool
+        // and cookie store, but let Tauri install fresh scripts/IPC for this view.
+        unsafe {
+            let configuration = &features.opener().target_configuration;
+            configuration.setUserContentController(&objc2_web_kit::WKUserContentController::new(
+                main_thread,
+            ));
+        }
+    }
+
+    let popup_id = NEXT_FRONTEND_POPUP_ID.fetch_add(1, Ordering::Relaxed);
+    let label = format!("frontend-popup-{popup_id}");
+    let child_app = app.clone();
+    let popup = configure_webview_runtime(WebviewWindowBuilder::new(
+        app,
+        &label,
+        // The browser attaches this view to the opener and loads the original
+        // request after Create returns. Loading the target here as well races
+        // that handoff and can repeat one-use OAuth redirects.
+        WebviewUrl::External("about:blank".parse().unwrap()),
+    ))
+    .title("Lumiverse Authorization")
+    .window_features(features)
+    .initialization_script(include_str!("frontend-popup.js"))
+    .on_new_window(move |url, features| create_frontend_popup(&child_app, url, features))
+    .on_document_title_changed(|window, title| {
+        let _ = window.set_title(&title);
+    })
+    .build();
+
+    match popup {
+        Ok(window) => {
+            #[cfg(target_os = "macos")]
+            {
+                // An about:blank reservation may never execute initialization
+                // scripts. Handle its browser close through WKUIDelegate too.
+                if let Err(error) = window.with_webview(|webview| unsafe {
+                    extern "C" {
+                        fn lumiverse_install_popup_close_handler(webview: *mut std::ffi::c_void);
+                    }
+                    lumiverse_install_popup_close_handler(webview.inner());
+                }) {
+                    eprintln!("[desktop-window] could not install popup close handler: {error}");
+                    let _ = window.destroy();
+                    return tauri::webview::NewWindowResponse::Deny;
+                }
+            }
+            tauri::webview::NewWindowResponse::Create { window }
+        }
+        Err(error) => {
+            eprintln!("[desktop-window] could not create frontend popup: {error}");
+            tauri::webview::NewWindowResponse::Deny
+        }
+    }
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -183,21 +262,49 @@ fn is_frontend_popup_label(label: &str) -> bool {
     })
 }
 
-/// Destroy the invoking SSO popup without granting remote content generic
+fn close_popup_window<R: tauri::Runtime>(window: &WebviewWindow<R>) -> tauri::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        // Let WebKit close the browsing context before WKUIDelegate closes the
+        // native container, so the opener also observes WindowProxy.closed.
+        window.eval("window.close()").or_else(|_| window.destroy())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        window.destroy()
+    }
+}
+
+/// Close the invoking authorization popup without granting remote content generic
 /// access to other native windows. Browser `window.close()` is not a reliable
 /// lifecycle signal for Rust-created WebviewWindows on every platform.
 #[tauri::command]
 pub fn close_current_sso_popup(window: WebviewWindow) -> Result<(), String> {
     if !is_frontend_popup_label(window.label()) {
-        return Err("Only a Lumiverse sign-in popup may invoke this command".into());
+        return Err("Only a Lumiverse authorization popup may invoke this command".into());
     }
-    window.destroy().map_err(|error| error.to_string())
+    close_popup_window(&window).map_err(|error| error.to_string())
+}
+
+/// Cmd+W belongs to the focused authorization window while one is active.
+/// Hiding the main frontend instead leaves the popup stranded on macOS.
+pub fn close_focused_popup<R: tauri::Runtime>(app: &AppHandle<R>) -> bool {
+    let popup = app.webview_windows().into_values().find(|window| {
+        is_frontend_popup_label(window.label()) && window.is_focused().unwrap_or(false)
+    });
+    if let Some(window) = popup {
+        let _ = close_popup_window(&window);
+        return true;
+    }
+    false
 }
 
 #[derive(Default)]
 pub struct FrontendState {
     /// Persisted window bounds: (x, y, width, height) or None for defaults.
     bounds: Mutex<Option<(i32, i32, u32, u32)>>,
+    surface_mode: Mutex<Option<SurfaceMode>>,
+    surface_color: Mutex<Option<[u8; 3]>>,
 }
 
 /// Native window-presence snapshot consumed by the remote frontend. Browser
@@ -243,11 +350,9 @@ pub fn emit_frontend_presence<R: tauri::Runtime>(
     app: &AppHandle<R>,
     window: &tauri::WebviewWindow<R>,
 ) {
-    let _ = app.emit_to(
-        FRONTEND_LABEL,
-        "desktop-presence-changed",
-        frontend_presence_for_window(window),
-    );
+    let presence = frontend_presence_for_window(window);
+    crate::system_audio::frontend_visible(app, presence.visible && !presence.minimized);
+    let _ = app.emit_to(FRONTEND_LABEL, "desktop-presence-changed", presence);
 }
 
 /// A small, local-only cache written by the trusted frontend after it has
@@ -266,6 +371,8 @@ pub struct FrontendStartupAppearance {
     native_color: [u8; 3],
     #[serde(default)]
     high_refresh: bool,
+    #[serde(default)]
+    surface_mode: Option<SurfaceMode>,
 }
 
 impl Default for FrontendStartupAppearance {
@@ -280,6 +387,7 @@ impl Default for FrontendStartupAppearance {
             blur_intensity: "balanced".into(),
             native_color: [10, 8, 18],
             high_refresh: false,
+            surface_mode: Some(SurfaceMode::Opaque),
         }
     }
 }
@@ -435,6 +543,17 @@ fn frontend_startup_shell_script(
   set('--lumiverse-startup-text-muted', snapshot.textMuted);
   set('--lumiverse-startup-primary', snapshot.primary);
   root.setAttribute('data-tauri-desktop', '');
+  if (snapshot.surfaceMode) root.setAttribute('data-desktop-surface', snapshot.surfaceMode);
+  if (snapshot.surfaceMode === 'opaque') {{
+    const rgb = snapshot.nativeColor || [10, 8, 18];
+    const color = `rgb(${{rgb.join(',')}})`;
+    set('--lumiverse-native-background', color);
+    set('--lumiverse-startup-background', color);
+    const surfaceStyle = document.createElement('style');
+    surfaceStyle.id = 'lumiverse-native-surface';
+    surfaceStyle.textContent = 'html[data-desktop-surface="opaque"]{{background:var(--lumiverse-native-background)!important;--desktop-window-corner-radius:0px!important;border-radius:0!important}}html[data-desktop-surface="opaque"] body{{background:var(--lumiverse-native-background)}}html[data-desktop-surface="opaque"] [data-app-root]{{background-color:var(--lumiverse-native-background)!important;border-radius:0!important;clip-path:none!important}}';
+    (document.head || root).appendChild(surfaceStyle);
+  }}
   if ('{windows_corners}') root.setAttribute('data-desktop-windows-corners', '{windows_corners}');
   root.setAttribute('data-lumiverse-startup-shell', '');
 
@@ -660,7 +779,9 @@ pub fn show_frontend(
             .set_shadow(rounded_windows)
             .map_err(|e| e.to_string())?;
         #[cfg(target_os = "macos")]
-        enforce_frontend_content_corner_radius(&window)?;
+        if *state.surface_mode.lock().unwrap() != Some(SurfaceMode::Opaque) {
+            enforce_frontend_content_corner_radius(&window)?;
+        }
         let target_changed = window
             .url()
             .map(|current| {
@@ -681,13 +802,13 @@ pub fn show_frontend(
         return Ok(());
     }
 
-    let startup_appearance = load_frontend_startup_appearance(&app);
-    let native_background = if startup_appearance.blur {
-        tauri::webview::Color(0, 0, 0, 0)
-    } else {
-        let [red, green, blue] = startup_appearance.native_color;
-        tauri::webview::Color(red, green, blue, 255)
-    };
+    let mut startup_appearance = load_frontend_startup_appearance(&app);
+    let surface_mode = resolved_surface_mode(startup_appearance.surface_mode);
+    // The page receives the actual creation-time mode, including a Linux
+    // compatibility override or a debug-only profiling override.
+    startup_appearance.surface_mode = Some(surface_mode);
+    let webview_background =
+        surface_mode.webview_background(Backend::current(), startup_appearance.native_color);
     let popup_app = app.clone();
     let frontend_origin = url.origin().ascii_serialization();
     let mut builder = WebviewWindowBuilder::new(&app, FRONTEND_LABEL, WebviewUrl::External(url))
@@ -706,12 +827,8 @@ pub fn show_frontend(
         // The tray host starts without a Dock/taskbar entry. Enable the
         // frontend's entry immediately before its first show below.
         .skip_taskbar(true)
-        // The frontend owns its own surface color. Keeping the native window
-        // and WebView transparent lets a theme opt into a translucent body.
-        // Opaque themes remain visually identical because their CSS body/app
-        // surfaces cover the transparent host.
-        .transparent(true)
-        .background_color(native_background)
+        // Surface opacity is a creation-time contract on all three backends.
+        .transparent(surface_mode == SurfaceMode::Translucent)
         // Install a lightweight titlebar/surface before the remote frontend's
         // bundle executes. It removes itself as soon as the app root mounts.
         .initialization_script(frontend_startup_shell_script(
@@ -727,34 +844,11 @@ pub fn show_frontend(
         // main frontend. Reuse the opener's WebView configuration/environment;
         // that keeps cookies and window.opener available for the completion
         // page's authenticated handoff on macOS, Windows, and Linux.
-        .on_new_window(move |popup_url, features| {
-            if !matches!(popup_url.scheme(), "about" | "http" | "https") {
-                return tauri::webview::NewWindowResponse::Deny;
-            }
-
-            let popup_id = NEXT_FRONTEND_POPUP_ID.fetch_add(1, Ordering::Relaxed);
-            let label = format!("frontend-popup-{popup_id}");
-            let popup = configure_webview_runtime(WebviewWindowBuilder::new(
-                &popup_app,
-                &label,
-                WebviewUrl::External(popup_url),
-            ))
-            .title("Lumiverse Sign-In")
-            .window_features(features)
-            .on_document_title_changed(|window, title| {
-                let _ = window.set_title(&title);
-            })
-            .build();
-
-            match popup {
-                Ok(window) => tauri::webview::NewWindowResponse::Create { window },
-                Err(error) => {
-                    eprintln!("[desktop-window] could not create frontend popup: {error}");
-                    tauri::webview::NewWindowResponse::Deny
-                }
-            }
-        })
+        .on_new_window(move |url, features| create_frontend_popup(&popup_app, url, features))
         .visible(false);
+    if let Some([red, green, blue, alpha]) = webview_background {
+        builder = builder.background_color(tauri::webview::Color(red, green, blue, alpha));
+    }
     builder = configure_webview_runtime(builder);
 
     // Quality mode opts into the high-refresh WebView configuration where
@@ -785,6 +879,31 @@ pub fn show_frontend(
     }
 
     let window = builder.build().map_err(|e| e.to_string())?;
+    *state.surface_mode.lock().unwrap() = Some(surface_mode);
+    *state.surface_color.lock().unwrap() = None;
+    if surface_mode == SurfaceMode::Opaque {
+        update_opaque_surface(&window, &state, startup_appearance.native_color)?;
+    }
+    eprintln!("[desktop-surface] created {surface_mode:?} frontend");
+    #[cfg(all(debug_assertions, target_os = "macos"))]
+    if std::env::var_os("LUMIVERSE_NATIVE_SURFACE").is_some() {
+        window
+            .with_webview(|webview| unsafe {
+                use objc2::{msg_send, runtime::AnyObject};
+                use objc2_foundation::ns_string;
+                let ns_window = &*webview.ns_window().cast::<AnyObject>();
+                let wk_view = &*webview.inner().cast::<AnyObject>();
+                let opaque: bool = msg_send![ns_window, isOpaque];
+                let draws: objc2::rc::Retained<AnyObject> =
+                    msg_send![wk_view, valueForKey: ns_string!("drawsBackground")];
+                let draws: bool = msg_send![&*draws, boolValue];
+                eprintln!(
+                    "[desktop-surface] AppKit opaque={opaque}, WebKit drawsBackground={draws}"
+                );
+            })
+            .map_err(|error| error.to_string())?;
+    }
+
     #[cfg(target_os = "linux")]
     crate::webview_media::configure_frontend_microphone(&window)?;
     // Applying this again after construction keeps a hot-reloaded frontend
@@ -796,14 +915,16 @@ pub fn show_frontend(
         .set_shadow(rounded_windows)
         .map_err(|e| e.to_string())?;
     #[cfg(target_os = "macos")]
-    enforce_frontend_content_corner_radius(&window)?;
+    if surface_mode == SurfaceMode::Translucent {
+        enforce_frontend_content_corner_radius(&window)?;
+    }
     // A newly-created hidden GTK window does not have a wl_surface yet. Apply
     // the Wayland effect after `show` below; the other platforms can install
     // their native material before the first visible frame.
     #[cfg(not(target_os = "linux"))]
     apply_frontend_native_appearance(
         &window,
-        startup_appearance.blur,
+        surface_mode.allows_blur(startup_appearance.blur),
         startup_appearance.dark,
         &startup_appearance.blur_intensity,
     )?;
@@ -821,6 +942,7 @@ pub fn show_frontend(
             // a resize event on the desktop runtimes, so re-query all native
             // flags after either transition instead of guessing from web APIs.
             WindowEvent::Focused(_) => {
+                crate::keybindings::frontend_focus_changed(&close_app);
                 emit_frontend_presence(&close_app, &close_window);
             }
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
@@ -835,6 +957,8 @@ pub fn show_frontend(
                 }
             }
             WindowEvent::Destroyed => {
+                crate::system_audio::frontend_gone(&close_app);
+                crate::keybindings::frontend_gone(&close_app);
                 #[cfg(target_os = "linux")]
                 if let Err(error) =
                     crate::wayland_background_effect::clear_background_effects(&close_window)
@@ -849,7 +973,9 @@ pub fn show_frontend(
     });
     // `tauri dev` runs a debug build, where the inspector is available.
     #[cfg(debug_assertions)]
-    window.open_devtools();
+    if std::env::var_os("LUMIVERSE_PERF_NO_INSPECTOR").is_none() {
+        window.open_devtools();
+    }
     set_frontend_task_switcher_visible(&app, &window, true)?;
     // On macOS `show` unhides the NSApplication. Calling it before focusing
     // ensures the active app (and therefore the menu bar) becomes Lumiverse.
@@ -859,7 +985,7 @@ pub fn show_frontend(
     #[cfg(target_os = "linux")]
     apply_frontend_native_appearance(
         &window,
-        startup_appearance.blur,
+        surface_mode.allows_blur(startup_appearance.blur),
         startup_appearance.dark,
         &startup_appearance.blur_intensity,
     )?;
@@ -1187,8 +1313,12 @@ pub fn show_extension_widget(
         // Widgets already draw their own visual edge. A native shadow
         // becomes a conspicuous border around transparent content.
         .shadow(false)
-        .transparent(true)
-        .background_color(tauri::webview::Color(0, 0, 0, 0))
+        .transparent(!crate::linux_runtime::opaque())
+        .background_color(if crate::linux_runtime::opaque() {
+            tauri::webview::Color(17, 16, 23, 255)
+        } else {
+            tauri::webview::Color(0, 0, 0, 0)
+        })
         .always_on_top(true)
         .skip_taskbar(true)
         .focused(false)
@@ -1263,6 +1393,53 @@ pub fn return_extension_widget_from_tray(
         return Ok(());
     }
     emit_widget_popout_state(&app, widget.id, false)
+}
+
+fn resolved_surface_mode(requested: Option<SurfaceMode>) -> SurfaceMode {
+    #[cfg(debug_assertions)]
+    let debug_override = match std::env::var("LUMIVERSE_NATIVE_SURFACE").as_deref() {
+        Ok("opaque") => Some(SurfaceMode::Opaque),
+        Ok("translucent") => Some(SurfaceMode::Translucent),
+        _ => None,
+    };
+    #[cfg(not(debug_assertions))]
+    let debug_override = None;
+    SurfaceMode::resolve(requested, crate::linux_runtime::opaque(), debug_override)
+}
+
+fn update_opaque_surface(
+    window: &WebviewWindow,
+    state: &FrontendState,
+    color: [u8; 3],
+) -> Result<(), String> {
+    if *state.surface_color.lock().unwrap() == Some(color) {
+        return Ok(());
+    }
+    let [red, green, blue] = color;
+    let background = Some(tauri::webview::Color(red, green, blue, 255));
+    // The combined WebviewWindow setter would turn off WK drawsBackground.
+    // Window-only preserves it. WebView2/GTK accept a fully opaque WebView color.
+    #[cfg(target_os = "macos")]
+    AsRef::<Webview>::as_ref(window)
+        .window()
+        .set_background_color(background)
+        .map_err(|error| error.to_string())?;
+    #[cfg(not(target_os = "macos"))]
+    window
+        .set_background_color(background)
+        .map_err(|error| error.to_string())?;
+    window.eval(&format!(
+        "document.documentElement.style.setProperty('--lumiverse-native-background', 'rgb({red}, {green}, {blue})')"
+    )).map_err(|error| error.to_string())?;
+    *state.surface_color.lock().unwrap() = Some(color);
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrontendSurfaceStatus {
+    surface_mode: SurfaceMode,
+    restart_required: bool,
 }
 
 /// Apply the native material behind an opt-in translucent frontend theme.
@@ -1360,7 +1537,10 @@ fn apply_frontend_native_appearance(
         // The protocol deliberately leaves the blur algorithm/intensity to the
         // compositor. The page continues to provide Lumiverse's tint.
         let _ = (dark, blur_intensity);
-        crate::wayland_background_effect::set_background_effect(window, blur)?;
+        crate::wayland_background_effect::set_background_effect(
+            window,
+            blur && !crate::linux_runtime::opaque(),
+        )?;
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
@@ -1382,7 +1562,8 @@ pub fn configure_frontend_appearance(
     blur: bool,
     dark: bool,
     blur_intensity: Option<String>,
-) -> Result<(), String> {
+    surface_mode: Option<SurfaceMode>,
+) -> Result<FrontendSurfaceStatus, String> {
     #[cfg(debug_assertions)]
     eprintln!(
         "[desktop-appearance] native-effect request: blur={blur}, dark={dark}, intensity={blur_intensity:?}"
@@ -1391,12 +1572,22 @@ pub fn configure_frontend_appearance(
     let window = app
         .get_webview_window(FRONTEND_LABEL)
         .ok_or("Frontend is not open")?;
+    let state = app.state::<FrontendState>();
+    let actual = state
+        .surface_mode
+        .lock()
+        .unwrap()
+        .unwrap_or(SurfaceMode::Translucent);
     apply_frontend_native_appearance(
         &window,
-        blur,
+        actual.allows_blur(blur),
         dark,
         blur_intensity.as_deref().unwrap_or("balanced"),
-    )
+    )?;
+    Ok(FrontendSurfaceStatus {
+        surface_mode: actual,
+        restart_required: resolved_surface_mode(surface_mode) != actual,
+    })
 }
 
 /// Persist the last resolved page surface and titlebar palette. It is limited
@@ -1410,7 +1601,15 @@ pub fn cache_frontend_startup_appearance(
     if !valid_startup_appearance(&appearance) {
         return Err("Invalid frontend startup appearance".into());
     }
-    save_frontend_startup_appearance(&app, &appearance)
+    save_frontend_startup_appearance(&app, &appearance)?;
+    let state = app.state::<FrontendState>();
+    let opaque = *state.surface_mode.lock().unwrap() == Some(SurfaceMode::Opaque);
+    if opaque {
+        if let Some(window) = app.get_webview_window(FRONTEND_LABEL) {
+            update_opaque_surface(&window, &state, appearance.native_color)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1422,6 +1621,21 @@ mod tests {
         supports_windows_rounded_corners, supports_windows_system_backdrop, valid_widget_size,
         FrontendStartupAppearance,
     };
+
+    #[test]
+    fn old_startup_caches_preserve_translucency_and_new_caches_roundtrip_the_mode() {
+        let mut cache = serde_json::to_value(FrontendStartupAppearance::default()).unwrap();
+        cache.as_object_mut().unwrap().remove("surfaceMode");
+        let old: FrontendStartupAppearance = serde_json::from_value(cache).unwrap();
+        assert_eq!(old.surface_mode, None);
+        let new = FrontendStartupAppearance::default();
+        let new: FrontendStartupAppearance =
+            serde_json::from_slice(&serde_json::to_vec(&new).unwrap()).unwrap();
+        assert_eq!(
+            new.surface_mode,
+            Some(crate::desktop_surface::SurfaceMode::Opaque)
+        );
+    }
 
     #[test]
     fn rounds_only_supported_windows_frames() {
@@ -1481,22 +1695,102 @@ mod tests {
 pub fn show_frontend_url_settings(app: AppHandle) -> Result<(), String> {
     const LABEL: &str = "frontend-url-settings";
     if let Some(window) = app.get_webview_window(LABEL) {
+        fit_connection_dialog(&window);
         window.show().map_err(|e| e.to_string())?;
         return window.set_focus().map_err(|e| e.to_string());
     }
 
-    let window = configure_webview_runtime(WebviewWindowBuilder::new(
+    let monitor = app
+        .get_webview_window(FRONTEND_LABEL)
+        .and_then(|window| window.current_monitor().ok().flatten())
+        .or_else(|| app.primary_monitor().ok().flatten());
+    let (width, height, min_width, min_height) = monitor
+        .as_ref()
+        .map(|monitor| {
+            let work = monitor.work_area();
+            connection_dialog_size(work.size.width, work.size.height, monitor.scale_factor())
+        })
+        .unwrap_or((620.0, 680.0, 320.0, 240.0));
+    let mut builder = configure_webview_runtime(WebviewWindowBuilder::new(
         &app,
         LABEL,
         WebviewUrl::App("custom-url.html".into()),
     ))
     .title("Instance Connection")
-    .inner_size(560.0, 480.0)
-    .min_inner_size(560.0, 480.0)
-    .max_inner_size(560.0, 480.0)
-    .resizable(false)
-    .center()
-    .build()
-    .map_err(|e| e.to_string())?;
+    .inner_size(width, height)
+    .min_inner_size(min_width, min_height)
+    .resizable(true);
+    if let Some(monitor) = monitor {
+        let area = monitor.work_area();
+        let scale = monitor.scale_factor();
+        builder = builder.position(
+            f64::from(area.position.x) / scale + (f64::from(area.size.width) / scale - width) / 2.0,
+            f64::from(area.position.y) / scale
+                + (f64::from(area.size.height) / scale - height) / 2.0,
+        );
+    } else {
+        builder = builder.center();
+    }
+    let window = builder.build().map_err(|e| e.to_string())?;
+    let resized = window.clone();
+    window.on_window_event(move |event| {
+        if matches!(
+            event,
+            WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. }
+        ) {
+            fit_connection_dialog(&resized);
+        }
+    });
     window.set_focus().map_err(|e| e.to_string())
+}
+
+fn fit_connection_dialog(window: &WebviewWindow) {
+    let Some(monitor) = window.current_monitor().ok().flatten() else {
+        return;
+    };
+    let scale = monitor.scale_factor();
+    let area = monitor.work_area();
+    let (w, h, min_w, min_h) = connection_dialog_size(area.size.width, area.size.height, scale);
+    let _ = window.set_min_size(Some(tauri::LogicalSize::new(min_w, min_h)));
+    if let Ok(size) = window.inner_size() {
+        let current = size.to_logical::<f64>(scale);
+        let available_w = (f64::from(area.size.width) / scale - 32.0).max(w);
+        let available_h = (f64::from(area.size.height) / scale - 72.0).max(h);
+        if current.width > available_w || current.height > available_h {
+            let _ = window.set_size(tauri::LogicalSize::new(
+                current.width.min(available_w),
+                current.height.min(available_h),
+            ));
+        }
+    }
+}
+
+// Tauri monitor work areas are physical; window-builder dimensions are logical.
+fn connection_dialog_size(width: u32, height: u32, scale: f64) -> (f64, f64, f64, f64) {
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let width = (f64::from(width) / scale - 32.0).max(1.0).min(620.0);
+    // Reserve titlebar space as well as a margin on small scaled displays.
+    let height = (f64::from(height) / scale - 72.0).max(1.0).min(680.0);
+    (width, height, width.min(320.0), height.min(240.0))
+}
+
+#[cfg(test)]
+mod connection_geometry_tests {
+    use super::connection_dialog_size;
+    #[test]
+    fn fits_scaled_work_areas_without_an_oversized_minimum() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let (w, h, mw, mh) = connection_dialog_size(1024, 768, scale);
+            assert!(w < 1024.0 / scale && h < 768.0 / scale);
+            assert!(mw <= w && mh <= h);
+        }
+        assert_eq!(
+            connection_dialog_size(2560, 1440, 1.0),
+            (620.0, 680.0, 320.0, 240.0)
+        );
+    }
 }

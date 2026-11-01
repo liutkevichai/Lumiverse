@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { flushSync } from 'react-dom'
 import clsx from 'clsx'
@@ -21,15 +21,17 @@ import type {
   SpindleRangeSliderOptions,
   SpindleRangeSliderHandle,
   SpindleRangeSliderFormat,
+  SpindleDualRangeSliderOptions,
+  SpindleDualRangeSliderHandle,
   SpindleCheckboxOptions,
   SpindleCheckboxHandle,
   SpindleSwitchOptions,
   SpindleSwitchHandle,
   SpindleSelectOption,
   SpindleSelectOptionLeading,
-  SpindleSelectOptions,
+  SpindleSelectOptions as PublishedSelectOptions,
   SpindleSelectHandle,
-  SpindleMultiSelectOptions,
+  SpindleMultiSelectOptions as PublishedMultiSelectOptions,
   SpindleMultiSelectHandle,
   SpindleModelComboboxOptions,
   SpindleModelComboboxHandle,
@@ -51,7 +53,8 @@ import { TextInput, TextArea } from '@/components/shared/FormComponents'
 import formStyles from '@/components/shared/FormComponents.module.css'
 import NumericInput from '@/components/shared/NumericInput'
 import NumberStepper from '@/components/shared/NumberStepper'
-import { RangeSlider, LabeledRangeSlider } from '@/components/shared/RangeSlider'
+import { RangeSlider, LabeledRangeSlider, DualRangeSlider, LabeledDualRangeSlider } from '@/components/shared/RangeSlider'
+import { snapNumericRange } from '@/components/shared/rangeSliderMath'
 import { Toggle } from '@/components/shared/Toggle'
 import { Badge } from '@/components/shared/Badge'
 import { Spinner } from '@/components/shared/Spinner'
@@ -105,12 +108,14 @@ import {
 import { scheduleMicrotask } from '@/lib/schedule-microtask'
 import { RouterContextBridge } from '@/lib/router-bridge'
 import { canMovePresetEditorPromptVariables, movePresetEditorPromptVariable } from './preset-editor-helper'
+import DesktopKeybindingsSettings from '@/components/settings/DesktopKeybindingsSettings'
+import { hasEnabledCommandExtensionId } from './frontend-extension-availability'
 
 // Spindle bridge components expose imperative handles by mutating the bridge
 // object passed from the extension runtime. This is an intentional escape hatch
 // from React's pure-render model, so the React Compiler cannot safely optimize
 // these components.
-/* eslint-disable react-compiler/react-compiler */
+/* eslint-disable react-hooks/immutability */
 
 // ── Tracking & lifecycle ──────────────────────────────────────────────────
 
@@ -1067,6 +1072,96 @@ function RangeSliderBridge({ initial, bridge }: { initial: SpindleRangeSliderOpt
   return <RangeSlider {...sharedProps} />
 }
 
+function normalizeDualRangeBridgeValue(
+  value: readonly [number, number] | undefined,
+  options: { min: number; max: number; step?: number; integer?: boolean },
+): [number, number] {
+  const candidate: readonly [number, number] =
+    Array.isArray(value) && value.length === 2 && Number.isFinite(value[0]) && Number.isFinite(value[1])
+      ? [value[0], value[1]]
+      : [options.min, options.max]
+  return snapNumericRange(candidate, options)
+}
+
+function DualRangeSliderBridge({
+  initial,
+  bridge,
+}: {
+  initial: SpindleDualRangeSliderOptions
+  bridge: BridgeAPI<SpindleDualRangeSliderOptions, [number, number]>
+}) {
+  const [props, setProps] = useState(initial)
+  const [value, setValue] = useState<[number, number]>(() =>
+    normalizeDualRangeBridgeValue(initial.value, {
+      min: initial.min,
+      max: initial.max,
+      step: initial.step,
+      integer: initial.integer,
+    }),
+  )
+  const commitValue = useBridgeBinding(bridge, props, setProps, value, setValue, 'value')
+  useLayoutEffect(() => {
+    bridge.update = (patch) => {
+      setProps((prev) => {
+        const nextProps = { ...prev, ...patch }
+        if (
+          patch.value !== undefined
+          || patch.min !== undefined
+          || patch.max !== undefined
+          || patch.step !== undefined
+          || patch.integer !== undefined
+        ) {
+          const source = patch.value !== undefined ? patch.value : bridge.getValue()
+          const committed = commitValue(
+            normalizeDualRangeBridgeValue(source, {
+              min: nextProps.min,
+              max: nextProps.max,
+              step: nextProps.step,
+              integer: nextProps.integer,
+            }),
+          )
+          return { ...nextProps, value: committed }
+        }
+        return nextProps
+      })
+    }
+  }, [bridge, commitValue])
+
+  const handleCommit = (next: [number, number]) => {
+    const committed = commitValue([next[0], next[1]])
+    props.onCommit?.([committed[0], committed[1]])
+  }
+
+  const sharedProps = {
+    min: props.min,
+    max: props.max,
+    step: props.step,
+    integer: props.integer,
+    value,
+    disabled: props.disabled,
+    className: props.className,
+    startLabel: props.startLabel,
+    endLabel: props.endLabel,
+    onCommit: handleCommit,
+    onDragValue: (next: [number, number] | null) => props.onDragValue?.(next ? [next[0], next[1]] : null),
+  }
+
+  if (props.label !== undefined) {
+    const formatEndpoint = buildRangeSliderFormatter(props.format, props.step ?? 1, props.integer ?? false)
+    const formatValue = ([start, end]: [number, number]) => `${formatEndpoint(start)} – ${formatEndpoint(end)}`
+    return (
+      <LabeledDualRangeSlider
+        label={props.label}
+        hint={props.hint}
+        formatValue={formatValue}
+        {...sharedProps}
+      />
+    )
+  }
+
+  return <DualRangeSlider {...sharedProps} />
+}
+
 function CheckboxBridge({ initial, bridge }: { initial: SpindleCheckboxOptions; bridge: BridgeAPI<SpindleCheckboxOptions, boolean> }) {
   const [props, setProps] = useState(initial)
   const [checked, setChecked] = useState<boolean>(initial.checked ?? false)
@@ -1104,10 +1199,21 @@ function SwitchBridge({ initial, bridge }: { initial: SpindleSwitchOptions; brid
   )
 }
 
+// Additive 0.6.71 contract; remove these aliases after the published SDK upgrade.
+interface SelectPaginationOptions {
+  forceSearch?: boolean; remoteSearch?: boolean; onSearchChange?: (value: string) => void;
+  loading?: boolean; hasMore?: boolean; onLoadMore?: () => void; loadMoreOnScroll?: boolean;
+  loadingMessage?: string; loadMoreLabel?: string;
+}
+type SpindleSelectOptions = PublishedSelectOptions & SelectPaginationOptions
+type SpindleMultiSelectOptions = PublishedMultiSelectOptions & SelectPaginationOptions
+
 function SelectBridge({ initial, bridge }: { initial: SpindleSelectOptions; bridge: BridgeAPI<SpindleSelectOptions, string> }) {
   const [props, setProps] = useState(initial)
   const [value, setValue] = useState<string>(initial.value ?? '')
   const commitValue = useBridgeBinding(bridge, props, setProps, value, setValue, 'value')
+  const searchChanged = useCallback((query: string) => notifyComponentOnChange('Select search', props.onSearchChange, query), [props.onSearchChange])
+  const loadMore = useCallback(() => notifyComponentOnChange('Select load more', props.onLoadMore, undefined), [props.onLoadMore])
   return (
     <SearchableSelect
       value={value}
@@ -1119,6 +1225,15 @@ function SelectBridge({ initial, bridge }: { initial: SpindleSelectOptions; brid
       placeholder={props.placeholder}
       searchPlaceholder={props.searchPlaceholder}
       searchThreshold={props.searchThreshold}
+      forceSearch={props.forceSearch}
+      remoteSearch={props.remoteSearch}
+      onSearchChange={props.onSearchChange ? searchChanged : undefined}
+      loading={props.loading}
+      hasMore={props.hasMore}
+      onLoadMore={props.onLoadMore ? loadMore : undefined}
+      loadMoreOnScroll={props.loadMoreOnScroll}
+      loadingMessage={props.loadingMessage}
+      loadMoreLabel={props.loadMoreLabel}
       emptyMessage={props.emptyMessage}
       noResultsMessage={props.noResultsMessage}
       triggerLabel={props.triggerLabel}
@@ -1142,6 +1257,8 @@ function MultiSelectBridge({ initial, bridge }: { initial: SpindleMultiSelectOpt
   const [props, setProps] = useState(initial)
   const [value, setValue] = useState<string[]>(() => cloneBridgeValue(initial.value ?? []))
   const commitValue = useBridgeBinding(bridge, props, setProps, value, setValue, 'value')
+  const searchChanged = useCallback((query: string) => notifyComponentOnChange('Select search', props.onSearchChange, query), [props.onSearchChange])
+  const loadMore = useCallback(() => notifyComponentOnChange('Select load more', props.onLoadMore, undefined), [props.onLoadMore])
   return (
     <SearchableSelect
       multi
@@ -1154,6 +1271,15 @@ function MultiSelectBridge({ initial, bridge }: { initial: SpindleMultiSelectOpt
       placeholder={props.placeholder}
       searchPlaceholder={props.searchPlaceholder}
       searchThreshold={props.searchThreshold}
+      forceSearch={props.forceSearch}
+      remoteSearch={props.remoteSearch}
+      onSearchChange={props.onSearchChange ? searchChanged : undefined}
+      loading={props.loading}
+      hasMore={props.hasMore}
+      onLoadMore={props.onLoadMore ? loadMore : undefined}
+      loadMoreOnScroll={props.loadMoreOnScroll}
+      loadingMessage={props.loadingMessage}
+      loadMoreLabel={props.loadMoreLabel}
       emptyMessage={props.emptyMessage}
       noResultsMessage={props.noResultsMessage}
       triggerLabel={props.triggerLabel}
@@ -1626,7 +1752,10 @@ export interface SpindleHostSurfaceComponentsHelper {
   listHostSurfaces(): readonly SpindleHostSurfaceInfo[]
 }
 
-export type SpindleComponentsHelperWithHostSurfaces = SpindleComponentsHelper & SpindleHostSurfaceComponentsHelper
+export interface SpindleKeybindingEditorHandle { readonly componentId: string; readonly element: HTMLElement; destroy(): void }
+export type SpindleComponentsHelperWithHostSurfaces = SpindleComponentsHelper & SpindleHostSurfaceComponentsHelper & {
+  mountKeybindingEditor(target: SpindleComponentTarget, options: { commandId: string }): SpindleKeybindingEditorHandle
+}
 
 // ── Public factory ────────────────────────────────────────────────────────
 
@@ -1740,6 +1869,18 @@ export function createComponentsHelper(
     ))
     return buildHandle(extensionId, id, el, result, componentPermissionForTarget(extensionId, el, generation)) as SpindleTextInputHandle
   }
+  function mountKeybindingEditor(target: SpindleComponentTarget, editorOptions: { commandId: string }): SpindleKeybindingEditorHandle {
+    const state = useStore.getState()
+    if (!hasEnabledCommandExtensionId(state.extensions, extensionId)
+      || !state.extensionCommands.some(entry => entry.extensionId === extensionId && entry.commands.some(command => command.id === editorOptions?.commandId))) {
+      throw new Error('KEYBINDING_COMMAND_UNAVAILABLE: register an enabled command owned by this extension first')
+    }
+    const el = resolveTarget(extensionId, target, generation)
+    const id = nextId(extensionId, 'keybinding-editor')
+    const result = mountBridge<Record<string, never>, void>(el, () => <DesktopKeybindingsSettings extensionCommand={{ extensionId, commandId: editorOptions.commandId }} />)
+    const handle = buildHandle(extensionId, id, el, result, componentPermissionForTarget(extensionId, el, generation))
+    return { componentId: handle.componentId, element: handle.element, destroy: handle.destroy }
+  }
   function mountTextArea(target: SpindleComponentTarget, options?: SpindleTextAreaOptions): SpindleTextAreaHandle {
     const el = resolveTarget(extensionId, target, generation)
     const id = nextId(extensionId, 'text-area')
@@ -1771,6 +1912,17 @@ export function createComponentsHelper(
       <RangeSliderBridge initial={options} bridge={b} />
     ))
     return buildHandle(extensionId, id, el, result, componentPermissionForTarget(extensionId, el, generation)) as SpindleRangeSliderHandle
+  }
+  function mountDualRangeSlider(
+    target: SpindleComponentTarget,
+    options: SpindleDualRangeSliderOptions,
+  ): SpindleDualRangeSliderHandle {
+    const el = resolveTarget(extensionId, target, generation)
+    const id = nextId(extensionId, 'dual-range-slider')
+    const result = mountBridge<SpindleDualRangeSliderOptions, [number, number]>(el, (b) => (
+      <DualRangeSliderBridge initial={options} bridge={b} />
+    ))
+    return buildHandle(extensionId, id, el, result, componentPermissionForTarget(extensionId, el, generation)) as SpindleDualRangeSliderHandle
   }
   function mountCheckbox(target: SpindleComponentTarget, options?: SpindleCheckboxOptions): SpindleCheckboxHandle {
     const el = resolveTarget(extensionId, target, generation)
@@ -1898,10 +2050,12 @@ export function createComponentsHelper(
 
   return {
     mountTextInput: mountText,
+    mountKeybindingEditor,
     mountTextArea,
     mountNumericInput,
     mountNumberStepper,
     mountRangeSlider,
+    mountDualRangeSlider,
     mountCheckbox,
     mountSwitch,
     mountSelect,
@@ -1919,4 +2073,4 @@ export function createComponentsHelper(
   }
 }
 
-/* eslint-enable react-compiler/react-compiler */
+/* eslint-enable react-hooks/immutability */

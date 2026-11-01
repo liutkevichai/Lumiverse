@@ -5,6 +5,27 @@ import * as personasSvc from "../services/personas.service";
 
 const app = new Hono();
 
+// All editor snapshots for one context. Missing bindings are normal and do
+// not require five independent 404 responses from the client.
+app.get("/context", (c) => {
+  const userId = c.get("userId");
+  const query = c.req.query();
+  // Preserve the independent endpoints' failure isolation and user scoping.
+  const errors: Record<string, string> = {};
+  const read = <T>(section: string, load: () => T): T | null => {
+    try { return load(); } catch { errors[section] = 'unavailable'; return null; }
+  };
+  return c.json({
+    defaults: query.preset_id ? read('defaults', () => svc.getDefaults(userId, query.preset_id)) : null,
+    chat: query.chat_id ? read('chat', () => svc.getChatBinding(userId, query.chat_id)) : null,
+    persona: query.persona_id ? read('persona', () => svc.getPersonaBinding(userId, query.persona_id)) : null,
+    character: query.character_id && query.is_group !== 'true'
+      ? read('character', () => svc.getCharacterBinding(userId, query.character_id)) : null,
+    connection: query.connection_id ? read('connection', () => svc.getConnectionBinding(userId, query.connection_id)) : null,
+    errors,
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Defaults
 // ---------------------------------------------------------------------------
@@ -287,7 +308,7 @@ app.patch("/connection/:connectionId/prompt-variables", async (c) => {
 // Resolution — resolve the effective binding for a chat context
 // ---------------------------------------------------------------------------
 
-app.get("/resolve/:chatId", (c) => {
+app.get("/resolve/:chatId", async (c) => {
   const userId = c.get("userId");
   const presetId = c.req.query("preset_id");
   const connectionId = c.req.query("connection_id") || null;
@@ -295,13 +316,13 @@ app.get("/resolve/:chatId", (c) => {
 
   const chatId = c.req.param("chatId");
 
-  const chat = chatsSvc.getChat(userId, chatId);
+  const chat = await chatsSvc.getChatAsync(userId, chatId);
   if (!chat) return c.json({ error: "Chat not found" }, 404);
 
   const resolved = svc.resolveProfile(userId, presetId ?? null, chatId, chat.character_id, {
     isGroup: chat.metadata?.group === true,
     connectionId,
-    personaId: requestedPersonaId ?? personasSvc.resolvePersonaOrDefault(userId)?.id ?? null,
+    personaId: requestedPersonaId ?? (await personasSvc.resolvePersonaOrDefaultAsync(userId))?.id ?? null,
   });
   return c.json(resolved);
 });

@@ -3,10 +3,18 @@ import { JSDOM } from 'jsdom'
 import { act } from 'react'
 import type { Root, createRoot as CreateRoot } from 'react-dom/client'
 import type { CreateTtsConnectionInput, TtsConnectionProfile, TtsProviderInfo } from '@/types/api'
+import { FishAudioTtsProvider } from '../../../../../src/tts/providers/fish-audio'
 
 const modelComboboxProps: Array<Record<string, any>> = []
 const voicePreviewInputs: Array<Record<string, any>> = []
 const voicePreviewOptions: Array<{ signal?: AbortSignal } | undefined> = []
+let libraryProps: Record<string, any> | undefined
+mock.module('@/components/modals/VoiceLibraryModal', () => ({
+  default: (props: Record<string, any>) => {
+    libraryProps = props
+    return <button onClick={() => { props.onSelect({ id: 'community-voice', name: 'Community narrator' }); props.onClose() }}>Choose library voice</button>
+  },
+}))
 let previewVoicesImpl = async (_input: Record<string, any>) => ({ voices: [] })
 
 function deferred<T>() {
@@ -40,6 +48,12 @@ dom.window.matchMedia = () => ({
 }) as any
 
 const t = (key: string, opts?: any) => opts?.file ? `${key}${opts.file}` : key
+// Folder save/cancel behavior is exercised with real managers in the browser test.
+mock.module('@/components/panels/connection-manager/ConnectionFolderField', () => ({
+  default: () => null,
+  useConnectionFolderDraft: () => ({ value: '', onChange: () => {} }),
+}))
+mock.module('@/hooks/useConnectionLibrary', () => ({ saveConnectionFolder: () => {} }))
 mock.module('react-i18next', () => ({
   useTranslation: () => ({ t }),
   Trans: ({ children }: { children?: unknown }) => children ?? null,
@@ -178,6 +192,25 @@ test('exposes service account JSON file input and region for Google Vertex TTS',
   expect(saved[0].metadata?.sa_file_name).toBe('test-key.json')
 })
 
+test('the ElevenLabs library uses draft credentials and saves its selected voice ID', async () => {
+  saved = []
+  const eleven = { ...providers[0], id: 'elevenlabs', name: 'ElevenLabs', capabilities: { ...providers[0].capabilities, voiceListStyle: 'dynamic' as const, supportsVoiceLibrary: true } }
+  await render(<Form providers={[eleven]} profile={ttsProfile({ provider: 'elevenlabs', api_url: 'https://proxy.example', voice: '', metadata: {} })} onSave={(input) => saved.push(input)} onCancel={() => {}} />)
+  const key = container.querySelector<HTMLInputElement>('input[type="password"]')!
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, 'value')!.set!.call(key, 'draft-key')
+    key.dispatchEvent(new dom.window.Event('input', { bubbles: true }))
+  })
+  const open = [...container.querySelectorAll('button')].find((button) => button.textContent === 'shared:voicePicker.voiceLibrary')!
+  await act(async () => { open.click(); await Bun.sleep(10) })
+  expect(libraryProps?.connection).toMatchObject({ connection_id: 'p1', provider: 'elevenlabs', api_url: 'https://proxy.example', api_key: 'draft-key' })
+  const choose = [...container.querySelectorAll('button')].find((button) => button.textContent === 'Choose library voice')!
+  await act(async () => choose.click())
+  const save = [...container.querySelectorAll('button')].find((button) => button.textContent?.includes('save'))!
+  await act(async () => save.click())
+  expect(saved[0]?.voice).toBe('community-voice')
+})
+
 test('renders standard API key and API url inputs for other providers', async () => {
   saved = []
   await render(
@@ -209,6 +242,104 @@ test('renders standard API key and API url inputs for other providers', async ()
   // Password input should exist
   const passwordInput = container.querySelector('input[type="password"]')
   expect(passwordInput).toBeTruthy()
+})
+
+const fishProvider: TtsProviderInfo = {
+  id: 'fish_audio', name: 'Fish Audio', capabilities: new FishAudioTtsProvider().capabilities,
+}
+
+async function renderFish(default_parameters: Record<string, any> = {}, model = 's2.1-pro') {
+  saved = []
+  await render(<Form providers={[fishProvider]} profile={ttsProfile({
+    provider: 'fish_audio', model, name: 'Fish voice', metadata: {}, default_parameters,
+  })} onSave={(input) => saved.push(input)} onCancel={() => {}} />)
+}
+
+function saveButton() {
+  return Array.from(container.querySelectorAll('button')).find((button) => button.textContent === 'ttsConnectionForm.save')!
+}
+
+async function expandFish(group: string) {
+  await act(async () => {
+    Array.from(container.querySelectorAll('button')).find((button) => button.textContent === `ttsConnectionForm.fishGroups.${group}`)!.click()
+  })
+}
+
+test('Fish settings preserve saved zero/false values and omit untouched defaults', async () => {
+  await renderFish({ temperature: 0, top_p: 0, normalize_loudness: false, normalize: false })
+  const loudness = Array.from(container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')).find((field) => field.closest('label')?.textContent?.includes('Normalize loudness'))!
+  expect(loudness.checked).toBe(false)
+  await expandFish('generation')
+  const normalize = Array.from(container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')).find((field) => field.closest('label')?.textContent?.includes('Normalize numbers and text'))!
+  expect(normalize.checked).toBe(false)
+  await act(async () => saveButton().click())
+  expect(saved[0].default_parameters).toEqual({ temperature: 0, top_p: 0, normalize_loudness: false, normalize: false })
+})
+
+test('Fish output controls switch bitrates and clear incompatible sample rates', async () => {
+  await renderFish({ sample_rate: '44100', mp3_bitrate: '192' })
+  await expandFish('audio')
+  const format = container.querySelector<HTMLSelectElement>('select[aria-label="Output format"]')!
+  expect(Array.from(format.options).find((option) => option.value === 'pcm')?.disabled).toBe(true)
+  await act(async () => {
+    format.value = 'opus'
+    format.dispatchEvent(new dom.window.Event('change', { bubbles: true }))
+  })
+  expect(container.querySelector('select[aria-label="MP3 bitrate"]')).toBeNull()
+  expect(container.querySelector('select[aria-label="Opus bitrate"]')).toBeTruthy()
+  const sampleRate = container.querySelector<HTMLSelectElement>('select[aria-label="Sample rate"]')!
+  expect(Array.from(sampleRate.options).map((option) => option.value)).toEqual(['', '48000'])
+  expect(sampleRate.value).toBe('')
+  await act(async () => saveButton().click())
+  expect(saved[0].default_parameters).toEqual({ format: 'opus', mp3_bitrate: '192' })
+})
+
+test('Fish model changes hide unsupported controls without losing saved settings', async () => {
+  await renderFish({ normalize_loudness: false })
+  const model = [...modelComboboxProps].reverse().find((props) => props.refreshKey?.endsWith(':models'))!
+  await act(async () => model.onChange('drama-3-preview'))
+  expect(container.querySelector('textarea[aria-label="Voice direction"]')).toBeTruthy()
+  expect(container.textContent).not.toContain('Normalize loudness')
+  await act(async () => model.onChange('s1'))
+  expect(container.querySelector('textarea[aria-label="Voice direction"]')).toBeNull()
+  await act(async () => saveButton().click())
+  expect(saved[0].default_parameters?.normalize_loudness).toBe(false)
+})
+
+test('Fish settings save edited directions, toggles, and numeric inputs', async () => {
+  await renderFish()
+  const direction = container.querySelector<HTMLTextAreaElement>('textarea[aria-label="Voice direction"]')!
+  const volume = container.querySelector<HTMLInputElement>('input[aria-label="Volume"]')!
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(dom.window.HTMLTextAreaElement.prototype, 'value')!.set!.call(direction, 'quiet and hesitant')
+    direction.dispatchEvent(new dom.window.Event('input', { bubbles: true }))
+  })
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, 'value')!.set!.call(volume, '2.5')
+    volume.dispatchEvent(new dom.window.Event('input', { bubbles: true }))
+  })
+  const loudness = Array.from(container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')).find((field) => field.closest('label')?.textContent?.includes('Normalize loudness'))!
+  await act(async () => loudness.click())
+  await act(async () => saveButton().click())
+  expect(saved[0].default_parameters).toEqual({ voice_direction: 'quiet and hesitant', volume: 2.5, normalize_loudness: false })
+})
+
+test('Fish dictionary references require both fields and settings can reset', async () => {
+  await renderFish({ pronunciation_dictionary_id: 'cast_names', temperature: 0.8, unrelated: true })
+  expect(saveButton().disabled).toBe(true)
+  await expandFish('pronunciation')
+  expect(container.textContent).toContain('ttsConnectionForm.fishDictionaryIncomplete')
+  const version = container.querySelector<HTMLInputElement>('input[aria-label="Dictionary version"]')!
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, 'value')!.set!.call(version, 'published-2')
+    version.dispatchEvent(new dom.window.Event('input', { bubbles: true }))
+  })
+  expect(saveButton().disabled).toBe(false)
+  await act(async () => {
+    Array.from(container.querySelectorAll('button')).find((button) => button.textContent === 'ttsConnectionForm.fishReset')!.click()
+  })
+  await act(async () => saveButton().click())
+  expect(saved[0].default_parameters).toEqual({ unrelated: true })
 })
 
 test.each(['google_tts', 'google_vertex_tts'])('shows gender and tone for %s voices and saves the API voice ID', async (providerId) => {
