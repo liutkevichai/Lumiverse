@@ -19,6 +19,7 @@ import type {
 import { PERMISSION_DENIED_PREFIX } from "lumiverse-spindle-types";
 import * as spindleUploads from "./uploads";
 import * as charactersSvc from "../services/characters.service";
+import * as characterGallerySvc from "../services/character-gallery.service";
 import * as chatsSvc from "../services/chats.service";
 import { getCharacterWorldBookIds, setCharacterWorldBookIds } from "../utils/character-world-books";
 import * as worldBooksSvc from "../services/world-books.service";
@@ -32,6 +33,10 @@ import * as personasSvc from "../services/personas.service";
 import * as globalAddonsSvc from "../services/global-addons.service";
 import * as settingsSvc from "../services/settings.service";
 import * as imagesSvc from "../services/images.service";
+import { IMAGE_READ_MAX_BYTES } from "./image-binary-contract";
+import type { CharacterGalleryItemDTO } from "./gallery-models-contract";
+import { prepareActivationPatterns } from "../services/regex-activation-inputs.service";
+import type { ActivationPatternsOptions } from "./activation-patterns-contract";
 import * as mediaSvc from "../services/media.service";
 import * as audioSvc from "../services/audio.service";
 import * as promptAssemblySvc from "../services/prompt-assembly.service";
@@ -48,7 +53,7 @@ import { extname, join, resolve } from "path";
 import { tmpdir } from "os";
 
 type ContentPermission = "characters" | "images" | "media" | "chats" | "world_books" | "databanks" | "personas" | "presets" | "regex_scripts";
-type ContentApiPermission = ContentPermission | "regex_scripts_unrestricted";
+type ContentApiPermission = ContentPermission | "regex_scripts_unrestricted" | "chat_mutation";
 export type SpindleEntityExtensionEntity = worldBooksSvc.EntityExtensionEntity;
 
 export function getEntityExtensionPermission(entity: string): ContentPermission {
@@ -171,12 +176,12 @@ export class WorkerHostContentApi {
   constructor(private readonly context: WorkerHostContentApiContext) {}
 
   private get manifest(): { identifier: string } { return this.context.manifest; }
-  private hasPermission(permission: ContentPermission): boolean { return this.context.hasPermission(permission); }
+  private hasPermission(permission: ContentApiPermission): boolean { return this.context.hasPermission(permission); }
   private resolveEffectiveUserId(userId?: string): string | null { return this.context.resolveEffectiveUserId(userId); }
   private enforceScopedUser(userId: string | null | undefined): void { this.context.enforceScopedUser(userId); }
   private postToWorker(message: { type: "response"; requestId: string; result?: unknown; error?: string }): void { this.context.postResponse(message); }
 
-  private toCharacterDTO(c: any): CharacterDTO {
+  private toCharacterDTO(c: any): CharacterDTO & { avatar_url: string | null } {
     return {
       id: c.id,
       name: c.name,
@@ -192,6 +197,7 @@ export class WorkerHostContentApi {
       alternate_greetings: Array.isArray(c.alternate_greetings) ? c.alternate_greetings : [],
       creator: c.creator || "",
       image_id: c.image_id || null,
+      avatar_url: c.image_id && c.user_id ? imagesSvc.getImage(c.user_id, c.image_id, { specificity: "sm" })?.url ?? null : null,
       world_book_ids: getCharacterWorldBookIds(c.extensions),
       extensions: c.extensions || {},
       created_at: c.created_at,
@@ -216,7 +222,7 @@ export class WorkerHostContentApi {
     return out;
   }
 
-  handleCharactersList(requestId: string, limit?: number, offset?: number, userId?: string): void {
+  handleCharactersList(requestId: string, limit?: number, offset?: number, userId?: string, search?: string): void {
     try {
       if (!this.hasPermission("characters")) {
         throw new Error(`${PERMISSION_DENIED_PREFIX} characters — Characters permission not granted`);
@@ -225,15 +231,20 @@ export class WorkerHostContentApi {
       if (!resolvedUserId) throw new Error("userId is required for operator-scoped extensions");
       this.enforceScopedUser(resolvedUserId);
 
-      const result = charactersSvc.listCharacters(resolvedUserId, {
-        limit: Math.min(limit || 50, 200),
-        offset: offset || 0,
-      });
+      if (search !== undefined && (typeof search !== "string" || search.length > 200)) throw new Error("search must be a string of at most 200 characters");
+      const pagination = { limit: Math.min(Math.max(Math.trunc(limit || 50), 1), 200), offset: Math.max(Math.trunc(offset || 0), 0) };
+      const query = search?.trim();
+      const result = query
+        ? charactersSvc.listCharacterSummaries(resolvedUserId, pagination, { search: query })
+        : charactersSvc.listCharacters(resolvedUserId, pagination);
+      const data = query
+        ? result.data.map(c => charactersSvc.getCharacter(resolvedUserId, c.id)).filter(c => c !== null)
+        : result.data;
       this.postToWorker({
         type: "response",
         requestId,
         result: {
-          data: result.data.map((c) => this.toCharacterDTO(c)),
+          data: data.map((c) => this.toCharacterDTO(c)),
           total: result.total,
         },
       });
@@ -257,6 +268,32 @@ export class WorkerHostContentApi {
         requestId,
         result: c ? this.toCharacterDTO(c) : null,
       });
+    } catch (err: any) {
+      this.postToWorker({ type: "response", requestId, error: err.message });
+    }
+  }
+
+  handleCharactersGetGallery(requestId: string, characterId: string, userId?: string): void {
+    try {
+      if (!this.hasPermission("characters")) {
+        throw new Error(`${PERMISSION_DENIED_PREFIX} characters — Characters permission not granted`);
+      }
+      const resolvedUserId = this.resolveEffectiveUserId(userId);
+      if (!resolvedUserId) throw new Error("userId is required for operator-scoped extensions");
+      this.enforceScopedUser(resolvedUserId);
+
+      const items: CharacterGalleryItemDTO[] = characterGallerySvc.listGallery(resolvedUserId, characterId, { registerReferences: false }).map((item) => ({
+        id: item.id,
+        image_id: item.image_id,
+        reference: item.reference,
+        caption: item.caption,
+        sort_order: item.sort_order,
+        created_at: item.created_at,
+        width: item.width,
+        height: item.height,
+        mime_type: item.mime_type,
+      }));
+      this.postToWorker({ type: "response", requestId, result: items });
     } catch (err: any) {
       this.postToWorker({ type: "response", requestId, error: err.message });
     }
@@ -405,6 +442,28 @@ export class WorkerHostContentApi {
   }
 
   // ─── Images CRUD (gated: "images") ─────────────────────────────────
+
+  async handleImagesReadBinary(requestId: string, imageId: string, userId?: string): Promise<void> {
+    try {
+      if (!this.hasPermission("images")) {
+        throw new Error(`${PERMISSION_DENIED_PREFIX} images - Images permission not granted`);
+      }
+      const resolvedUserId = this.resolveEffectiveUserId(userId);
+      if (!resolvedUserId) throw new Error("userId is required for operator-scoped extensions");
+      this.enforceScopedUser(resolvedUserId);
+      if (typeof imageId !== "string" || !imageId) throw new Error("imageId is required");
+      const path = await imagesSvc.getImageFilePath(resolvedUserId, imageId);
+      if (!path) throw new Error("Image not found");
+      const file = Bun.file(path);
+      const sizeLimitError = `Image exceeds the ${IMAGE_READ_MAX_BYTES / (1024 * 1024)} MiB binary read limit`;
+      if (file.size > IMAGE_READ_MAX_BYTES) throw new Error(sizeLimitError);
+      const data = new Uint8Array(await file.slice(0, IMAGE_READ_MAX_BYTES + 1).arrayBuffer());
+      if (data.byteLength > IMAGE_READ_MAX_BYTES) throw new Error(sizeLimitError);
+      this.postToWorker({ type: "response", requestId, result: data });
+    } catch (err: any) {
+      this.postToWorker({ type: "response", requestId, error: err.message });
+    }
+  }
 
   private toImageDTO(img: any): ImageDTO {
     return {
@@ -796,7 +855,7 @@ export class WorkerHostContentApi {
       case "image": {
         const imageId = typeof source.image_id === "string" ? source.image_id.trim() : "";
         if (!imageId) throw new Error("image media source requires image_id");
-        const image = imagesSvc.getImage(resolvedUserId, imageId);
+        const image = await imagesSvc.getImageAsync(resolvedUserId, imageId);
         if (!image) throw new Error("image media source not found");
         const path = await imagesSvc.getImageFilePath(resolvedUserId, imageId);
         if (!path) throw new Error("image media source file not found");
@@ -809,9 +868,9 @@ export class WorkerHostContentApi {
       case "audio": {
         const audioId = typeof source.audio_id === "string" ? source.audio_id.trim() : "";
         if (!audioId) throw new Error("audio media source requires audio_id");
-        const audio = audioSvc.getAudio(resolvedUserId, audioId);
+        const audio = await audioSvc.getAudioAsync(resolvedUserId, audioId);
         if (!audio) throw new Error("audio media source not found");
-        const path = audioSvc.getAudioFilePath(resolvedUserId, audioId);
+        const path = await audioSvc.getAudioFilePathAsync(resolvedUserId, audioId);
         if (!path) throw new Error("audio media source file not found");
         return {
           path,
@@ -977,12 +1036,13 @@ export class WorkerHostContentApi {
 
   // ─── Chats CRUD (gated: "chats") ──────────────────────────────────
 
-  private toChatDTO(c: any): ChatDTO {
+  private toChatDTO(c: any): ChatDTO & { variable_revision?: string } {
     return {
       id: c.id,
       character_id: c.character_id,
       name: c.name || "",
       metadata: (typeof c.metadata === "object" && c.metadata) ? c.metadata : {},
+      ...(typeof c.metadata?._swipe_variable_state?.revision === "string" ? { variable_revision: c.metadata._swipe_variable_state.revision } : {}),
       created_at: c.created_at,
       updated_at: c.updated_at,
     };
@@ -1082,6 +1142,43 @@ export class WorkerHostContentApi {
         }
       }
       this.postToWorker({ type: "response", requestId, result: this.toChatDTO(c) });
+    } catch (err: any) {
+      this.postToWorker({ type: "response", requestId, error: err.message });
+    }
+  }
+
+  handleChatsCompareAndSetMetadata(requestId: string, chatId: string, input: any, userId?: string): void {
+    try {
+      if (!this.hasPermission("chats")) {
+        throw new Error(`${PERMISSION_DENIED_PREFIX} chats — Chats permission not granted`);
+      }
+      // The comparison result can disclose message text, selection and metadata,
+      // so require the same permission as chat.getMessages().
+      if (!this.hasPermission("chat_mutation")) {
+        throw new Error(`${PERMISSION_DENIED_PREFIX} chat_mutation — Chat mutation permission not granted`);
+      }
+      const resolvedUserId = this.resolveEffectiveUserId(userId);
+      if (!resolvedUserId) throw new Error("userId is required for operator-scoped extensions");
+      this.enforceScopedUser(resolvedUserId);
+      const isPlainObject = (value: unknown) => !!value && typeof value === "object" && !Array.isArray(value);
+      if (!isPlainObject(input?.expected_metadata) || !isPlainObject(input?.metadata)) {
+        throw new Error("expected_metadata and metadata must be objects");
+      }
+      if (input.expected_last_message_id !== undefined && input.expected_last_message_id !== null &&
+          (typeof input.expected_last_message_id !== "string" || !input.expected_last_message_id)) {
+        throw new Error("Invalid expected_last_message_id");
+      }
+      const message = input.expected_message;
+      if (message !== undefined && (!isPlainObject(message) || typeof message.id !== "string" || !message.id ||
+          !Number.isSafeInteger(message.swipe_id) || message.swipe_id < 0 || !Array.isArray(message.swipes) ||
+          !message.swipes.every((value: unknown) => typeof value === "string") || !isPlainObject(message.metadata))) {
+        throw new Error("Invalid expected_message");
+      }
+      let chat = chatsSvc.compareAndSetChatMetadata(resolvedUserId, chatId, input);
+      if (chat && JSON.stringify(input.expected_metadata.chat_world_book_ids ?? []) !== JSON.stringify(chat.metadata.chat_world_book_ids ?? [])) {
+        chat = pruneOrphanedWiState(resolvedUserId, chat);
+      }
+      this.postToWorker({ type: "response", requestId, result: chat ? this.toChatDTO(chat) : null });
     } catch (err: any) {
       this.postToWorker({ type: "response", requestId, error: err.message });
     }
@@ -2496,6 +2593,25 @@ export class WorkerHostContentApi {
 
       const s = regexScriptsSvc.getRegexScript(resolvedUserId, scriptId);
       this.postToWorker({ type: "response", requestId, result: s ? this.toRegexScriptDTO(s) : null });
+    } catch (err: any) {
+      this.postToWorker({ type: "response", requestId, error: err.message });
+    }
+  }
+
+  handleRegexScriptsPrepareActivationPatterns(requestId: string, options: ActivationPatternsOptions): void {
+    try {
+      if (!this.hasPermission("regex_scripts")) {
+        throw new Error(`${PERMISSION_DENIED_PREFIX} regex_scripts - Regex scripts permission not granted`);
+      }
+      const resolvedUserId = this.resolveEffectiveUserId(options?.userId);
+      if (!resolvedUserId) throw new Error("userId is required for operator-scoped extensions");
+      this.enforceScopedUser(resolvedUserId);
+      const result = prepareActivationPatterns(resolvedUserId, {
+        preset_id: options?.presetId, patterns: options?.patterns,
+        chat_id: options?.chatId, character_id: options?.characterId,
+        persona_id: options?.personaId, connection_id: options?.connectionId,
+      });
+      this.postToWorker({ type: "response", requestId, result });
     } catch (err: any) {
       this.postToWorker({ type: "response", requestId, error: err.message });
     }

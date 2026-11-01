@@ -13,9 +13,12 @@ import MessageAttachments from './MessageAttachments'
 import MessageAudioSlot from './MessageAudioSlot'
 import SwipeControls from './SwipeControls'
 import GreetingNav from './GreetingNav'
+import GreetingImage from './GreetingImage'
+import { useGreetingMessageImage } from '@/hooks/useGreetingMessageImage'
 import ReasoningBlock from './ReasoningBlock'
 import StreamingIndicator from './StreamingIndicator'
 import BubbleActions from './BubbleActions'
+import MessageSelectCheckbox from './MessageSelectCheckbox'
 import LazyImage from '@/components/shared/LazyImage'
 import ContextMenu, { type ContextMenuEntry, type ContextMenuPos } from '@/components/shared/ContextMenu'
 import ConfirmationModal from '@/components/shared/ConfirmationModal'
@@ -202,6 +205,7 @@ export default function BubbleMessageDefault({
   const swipeGesturesEnabled = useStore((s) => s.swipeGesturesEnabled)
   const showMessageTokenCount = useStore((s) => s.showMessageTokenCount ?? true)
   const messageContextMenuEnabled = useStore((s) => s.messageContextMenuEnabled ?? true)
+  const greeting = useGreetingMessageImage(message, displayContent, !isEditing && !isActivelyStreaming)
   // Audio renders below the response and must not reserve an empty media wrapper.
   const visualAttachments = (message.extra?.attachments ?? []).filter(
     (attachment) => attachment.type === 'image' || attachment.type === 'video',
@@ -407,6 +411,15 @@ export default function BubbleMessageDefault({
       <div className={styles.bubble}>
         <div className={styles.header}>
           <div className={styles.headerLeft}>
+            {isSelectMode && (
+              <MessageSelectCheckbox
+                index={message.index_in_chat}
+                name={displayName}
+                content={displayContent}
+                checked={isSelected}
+                onToggle={onToggleSelect}
+              />
+            )}
             <div
               className={styles.avatar}
               style={fullAvatarUrl ? { cursor: 'pointer' } : undefined}
@@ -470,6 +483,16 @@ export default function BubbleMessageDefault({
 
         <div className={styles.content}>
           <span data-spindle-mount="message_body_before" data-spindle-scope={`message:${message.id}:bubble:body-before`} style={{ display: 'contents' }} />
+          {greeting.image && greeting.position === 'top' && (
+            <GreetingImage
+              key={greeting.image.url}
+              src={greeting.image.url}
+              alt={greeting.image.alt}
+              position="top"
+              onError={greeting.handleImageError}
+              onReady={greeting.handleImageReady}
+            />
+          )}
           {isEditing ? (
             <MessageEditArea
               editContent={editContent}
@@ -482,9 +505,9 @@ export default function BubbleMessageDefault({
               editReasoning={showReasoningEditor ? editReasoning : undefined}
               onChangeReasoning={showReasoningEditor ? setEditReasoning : undefined}
             />
-          ) : displayContent ? (
+          ) : greeting.content ? (
             <MessageContent
-              content={displayContent}
+              content={greeting.content}
               isUser={isUser}
               userName={macroUserName}
               isStreaming={isActivelyStreaming}
@@ -496,6 +519,16 @@ export default function BubbleMessageDefault({
           ) : isActivelyStreaming ? (
             <StreamingIndicator />
           ) : null}
+          {greeting.image && greeting.position === 'bottom' && (
+            <GreetingImage
+              key={greeting.image.url}
+              src={greeting.image.url}
+              alt={greeting.image.alt}
+              position="bottom"
+              onError={greeting.handleImageError}
+              onReady={greeting.handleImageReady}
+            />
+          )}
         </div>
         <span data-spindle-mount="message_body_after" data-spindle-scope={`message:${message.id}:bubble:body-after`} style={{ display: 'contents' }} />
 

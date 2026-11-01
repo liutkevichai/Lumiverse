@@ -20,8 +20,11 @@ import MessageEditArea from './MessageEditArea'
 import MessageAttachments from './MessageAttachments'
 import MessageAudioSlot from './MessageAudioSlot'
 import MessageActions from './MessageActions'
+import MessageSelectCheckbox from './MessageSelectCheckbox'
 import SwipeControls from './SwipeControls'
 import GreetingNav from './GreetingNav'
+import GreetingImage from './GreetingImage'
+import { useGreetingMessageImage } from '@/hooks/useGreetingMessageImage'
 import ReasoningBlock from './ReasoningBlock'
 import StreamingIndicator from './StreamingIndicator'
 import LazyImage from '@/components/shared/LazyImage'
@@ -201,6 +204,7 @@ export default function MinimalMessageDefault({
   const swipeGesturesEnabled = useStore((s) => s.swipeGesturesEnabled)
   const showMessageTokenCount = useStore((s) => s.showMessageTokenCount ?? true)
   const messageContextMenuEnabled = useStore((s) => s.messageContextMenuEnabled ?? true)
+  const greeting = useGreetingMessageImage(message, displayContent, !isEditing && !isActivelyStreaming)
   // Keep a MessageAudioSlot wrapper mounted on every assistant bubble when
   // TTS is enabled, and on either side whenever an audio attachment exists.
   // See BubbleMessageDefault for the full rationale.
@@ -408,6 +412,15 @@ export default function MinimalMessageDefault({
       <div className={styles.bubble}>
         {/* Name + meta pill */}
         <div className={styles.header}>
+          {isSelectMode && (
+            <MessageSelectCheckbox
+              index={message.index_in_chat}
+              name={displayName}
+              content={displayContent}
+              checked={isSelected}
+              onToggle={onToggleSelect}
+            />
+          )}
           <span className={clsx(styles.name, isUser ? styles.nameUser : styles.nameChar)}>
             {displayName}
           </span>
@@ -440,6 +453,16 @@ export default function MinimalMessageDefault({
 
         {/* Content */}
         <span data-spindle-mount="message_body_before" data-spindle-scope={`message:${message.id}:minimal:body-before`} style={{ display: 'contents' }} />
+        {greeting.image && greeting.position === 'top' && (
+          <GreetingImage
+            key={greeting.image.url}
+            src={greeting.image.url}
+            alt={greeting.image.alt}
+            position="top"
+            onError={greeting.handleImageError}
+            onReady={greeting.handleImageReady}
+          />
+        )}
         {isEditing ? (
           <MessageEditArea
             editContent={editContent}
@@ -452,9 +475,9 @@ export default function MinimalMessageDefault({
             editReasoning={showReasoningEditor ? editReasoning : undefined}
             onChangeReasoning={showReasoningEditor ? setEditReasoning : undefined}
           />
-        ) : displayContent ? (
+        ) : greeting.content ? (
           <MessageContent
-            content={displayContent}
+            content={greeting.content}
             isUser={isUser}
             userName={macroUserName}
             isStreaming={isActivelyStreaming}
@@ -466,6 +489,16 @@ export default function MinimalMessageDefault({
         ) : isActivelyStreaming ? (
           <StreamingIndicator />
         ) : null}
+        {greeting.image && greeting.position === 'bottom' && (
+          <GreetingImage
+            key={greeting.image.url}
+            src={greeting.image.url}
+            alt={greeting.image.alt}
+            position="bottom"
+            onError={greeting.handleImageError}
+            onReady={greeting.handleImageReady}
+          />
+        )}
         <span data-spindle-mount="message_body_after" data-spindle-scope={`message:${message.id}:minimal:body-after`} style={{ display: 'contents' }} />
 
         {/* User attachments render after content */}

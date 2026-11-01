@@ -1,4 +1,5 @@
 import { describeGenerationStop } from "../generation-stop";
+import { omitDisabledPenalties } from "../generation-parameters";
 import { incompleteStream, readProviderSse, throwIfProviderError } from "../provider-sse";
 import type { LlmProvider } from "../provider";
 import type { ProviderCapabilities } from "../param-schema";
@@ -252,6 +253,7 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
       if (typeof delta?.refusal === "string") refusal += delta.refusal;
 
       for (const tc of (delta?.tool_calls ?? [])) {
+        request.onResponseActivity?.();
         const idx = tc.index ?? toolCallBuffer.length;
         if (!toolCallBuffer[idx]) toolCallBuffer[idx] = { id: tc.id ?? "", name: "", argsJson: "" };
         if (tc.id && !toolCallBuffer[idx].id) toolCallBuffer[idx].id = tc.id;
@@ -370,6 +372,17 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
     const nonTool = parts.filter((p) => p.type !== "tool_use" && p.type !== "tool_result");
 
     const out: any[] = [];
+    // splice drains the list so the trailing call below is a no-op once the
+    // results have already been emitted ahead of user text.
+    const emitToolResults = (): void => {
+      for (const tr of toolResults.splice(0)) {
+        out.push({
+          role: "tool",
+          tool_call_id: tr.tool_use_id,
+          content: tr.content,
+        });
+      }
+    };
 
     if (m.role === "assistant" && toolUses.length > 0) {
       const text = nonTool
@@ -406,6 +419,9 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
             : {}),
       });
     } else if (nonTool.length > 0) {
+      // OpenAI-style APIs require role:"tool" replies to directly follow the
+      // assistant tool_calls message, so they precede user text sharing this message.
+      emitToolResults();
       out.push({
         role: m.role,
         content: this.formatContent({ ...m, content: nonTool }),
@@ -413,13 +429,7 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
       });
     }
 
-    for (const tr of toolResults) {
-      out.push({
-        role: "tool",
-        tool_call_id: tr.tool_use_id,
-        content: tr.content,
-      });
-    }
+    emitToolResults();
 
     return out;
   }
@@ -450,11 +460,11 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
   }
 
   /** Keys that are internal to Lumiverse and should never be sent to any provider API. */
-  protected static readonly INTERNAL_PARAMS = new Set(["max_context_length", "_include_usage", "use_responses_api"]);
+  protected static readonly INTERNAL_PARAMS = new Set(["max_context_length", "_include_usage", "use_responses_api", "_nanogpt"]);
 
   /** Build the request body using capabilities as the parameter allowlist. */
   protected buildBody(request: GenerationRequest, stream: boolean): any {
-    const params = request.parameters || {};
+    const params = omitDisabledPenalties(request.parameters);
     const allowed = this.capabilities.parameters;
 
     const body: any = {

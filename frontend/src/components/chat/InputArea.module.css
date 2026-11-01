@@ -35,8 +35,9 @@
     padding-bottom var(--lcs-transition, 220ms cubic-bezier(0.4, 0, 0.2, 1));
 }
 
-:global(html[data-ios-pwa]) .container {
-  /* .app has no bottom safe-area padding on iOS PWA, so this positions from
+:global(html[data-ios-pwa]) .container,
+:global(html[data-tauri-mobile='ios']) .container {
+  /* Standalone iOS shells have no bottom safe-area padding, so position from
      the screen edge. Background fills to the bottom; extra padding-bottom
      keeps interactive content above the home indicator. When keyboard is
      open, move up and drop the safe-area padding (keyboard covers it).
@@ -45,14 +46,41 @@
   padding-bottom: calc(10px + max(0px, env(safe-area-inset-bottom, 0px) - var(--app-keyboard-inset-bottom, 0px)) / var(--lumiverse-ui-scale, 1));
 }
 
-:global(html[data-pwa]:not([data-ios-pwa])) .container {
+/* Flatten beside either the Duo hinge or its native side status area.
+   Status-area alignment also applies to the standard drawer layout. */
+:global([data-duo-drawer-side='right'] [data-duo-chat]) .container,
+:global(html[data-tauri-mobile='ios'][data-ios-composer-flat-edges~='right']) .container {
+  --composer-right-edge-radius: 0px;
+  right: 0;
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+:global([data-duo-drawer-side='left'] [data-duo-chat]) .container,
+:global(html[data-tauri-mobile='ios'][data-ios-composer-flat-edges~='left']) .container {
+  --composer-left-edge-radius: 0px;
+  left: 0;
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+}
+
+/* A Duo pane can be phone-sized while the complete WebView is wider. */
+:global([data-duo-chat]) .textarea,
+:global([data-duo-chat]) .textareaMirror {
+  font-size: max(16px, calc(14px * var(--lumiverse-font-scale, 1)));
+  padding: 8px 14px;
+}
+
+:global(html[data-pwa]:not([data-ios-pwa]):not([data-tauri-mobile='ios'])) .container,
+:global(html[data-tauri-mobile='android']) .container {
   /* Chromium/Android PWA: .app is now edge-to-edge (no bottom padding), so
      pin the bar's glass to the screen edge and lift only its content above
      the gesture nav bar. Unlike iOS, Android sets
      interactive-widget=resizes-content (see main.tsx), so the dvh-sized
      shell shrinks above the keyboard and the bar rides up on its own — no
      --app-keyboard-inset-bottom lift needed. env(safe-area-inset-bottom)
-     collapses to 0 when the keyboard hides the nav bar. */
+     collapses to 0 when the keyboard hides the nav bar. Native Android's
+     host reserves IME space in the WebView bounds for the same behavior. */
   bottom: 0;
   padding-bottom: calc(10px + env(safe-area-inset-bottom, 0px));
 }
@@ -67,7 +95,7 @@
       color-mix(in srgb, var(--lcs-glass-bg) 70%, var(--lumiverse-bg) 30%)
     );
   border-color: var(--lcs-glass-border);
-  backdrop-filter: blur(var(--lcs-glass-blur));
+  backdrop-filter: blur(var(--lcs-glass-blur)) var(--lcs-liquid-filter, );
   box-shadow:
     0 14px 34px var(--lumiverse-fill-heavy),
     var(--lumiverse-highlight-inset),
@@ -95,7 +123,7 @@
   color: var(--lumiverse-text, rgba(255, 255, 255, 0.92));
   font-size: 13px;
   font-weight: 600;
-  backdrop-filter: blur(2px);
+  backdrop-filter: blur(2px) var(--lcs-liquid-filter, );
 }
 
 /* ── Action bar — regenerate / continue / stop ── */
@@ -217,7 +245,6 @@
   display: grid;
   grid-template-rows: 0fr;
   transition: grid-template-rows 250ms cubic-bezier(0.4, 0, 0.2, 1);
-  will-change: grid-template-rows;
 }
 
 .popoverSlotOpen {
@@ -1221,12 +1248,14 @@
     flex-shrink: 0;
   }
 
-  :global(html[data-ios-pwa]) .container {
+  :global(html[data-ios-pwa]) .container,
+  :global(html[data-tauri-mobile='ios']) .container {
     bottom: calc(var(--app-keyboard-inset-bottom, 0px) / var(--lumiverse-ui-scale, 1));
     padding-bottom: calc(8px + max(0px, env(safe-area-inset-bottom, 0px) - var(--app-keyboard-inset-bottom, 0px)) / var(--lumiverse-ui-scale, 1));
   }
 
-  :global(html[data-pwa]:not([data-ios-pwa])) .container {
+  :global(html[data-pwa]:not([data-ios-pwa]):not([data-tauri-mobile='ios'])) .container,
+  :global(html[data-tauri-mobile='android']) .container {
     bottom: 0;
     padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
   }

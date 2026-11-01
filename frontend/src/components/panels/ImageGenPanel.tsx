@@ -1,3 +1,4 @@
+import { imageInputMechanism } from "../../../../src/image-gen/image-input"
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Image as ImageIcon, Trash2, Download, Upload } from 'lucide-react'
@@ -367,7 +368,7 @@ export default function ImageGenPanel() {
 
   // Providers that accept image input: NovelAI/NanoGPT (style references) plus
   // the img2img providers, which reuse the same reference-image config surface.
-  const supportsImg2ImgSource = providerName === 'swarmui' || providerName === 'comfyui' || providerName === 'google_gemini' || providerName === 'openrouter' || providerName === 'openai' || providerName === 'sdapi'
+  const supportsImg2ImgSource = imageInputMechanism(providerName, activeConnection?.model) !== null
   const supportsRefs = (providerName === 'novelai' && !isNovelAIV5) || providerName === 'nanogpt' || supportsImg2ImgSource
 
   const runGenerationCall = useCallback(async (input: {
@@ -648,6 +649,37 @@ export default function ImageGenPanel() {
             />
             <ToggleRow checked={!!imageGeneration.includeCharacters} onChange={(checked) => updateTop({ includeCharacters: checked })} label={t('imageGenPanel.includeCharacters')} hint={t('imageGenPanel.includeCharactersHint')} />
             <ToggleRow checked={!!imageGeneration.includePersona} onChange={(checked) => updateTop({ includePersona: checked })} label={t('imageGenPanel.includePersona')} hint={t('imageGenPanel.includePersonaHint')} />
+            <ToggleRow
+              checked={!!imageGeneration.describeCharacterAvatar}
+              onChange={(checked) => updateTop({ describeCharacterAvatar: checked })}
+              label={t('imageGenPanel.describeCharacterAvatar')}
+              hint={t('imageGenPanel.describeCharacterAvatarHint')}
+            />
+            <ToggleRow
+              checked={!!imageGeneration.describePersonaAvatar}
+              onChange={(checked) => updateTop({ describePersonaAvatar: checked })}
+              label={t('imageGenPanel.describePersonaAvatar')}
+              hint={t('imageGenPanel.describePersonaAvatarHint')}
+            />
+            {(imageGeneration.describeCharacterAvatar || imageGeneration.describePersonaAvatar) && (
+              <FormField
+                className={styles.runtimeField}
+                label={t('imageGenPanel.avatarCaptionPreset')}
+                hint={t('imageGenPanel.avatarCaptionPresetHint')}
+              >
+                <Select
+                  aria-label={t('imageGenPanel.avatarCaptionPreset')}
+                  value={imageGeneration.activeCaptioningPresetId || ''}
+                  onChange={(value) => updateTop({ activeCaptioningPresetId: value || null })}
+                  options={[
+                    { value: '', label: t('imageGenPanel.noCaptioningPreset') },
+                    ...((imageGeneration.promptPresets || [])
+                      .filter((p) => p.kind === 'captioning')
+                      .map((p) => ({ value: p.id, label: p.name }))),
+                  ]}
+                />
+              </FormField>
+            )}
           </section>
           <input ref={refInputRef} type="file" accept="image/*" multiple style={{ display: 'none' }} onChange={onRefFiles} />
           {currentJobId && <ImageGenProgressBar jobId={currentJobId} />}

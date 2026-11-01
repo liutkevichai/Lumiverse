@@ -1,9 +1,12 @@
 import { afterEach, beforeAll, describe, expect, jest, mock, test } from 'bun:test'
+import { useDeviceThemeControls, themeControls } from '@/lib/deviceThemeControls'
 import { JSDOM } from 'jsdom'
-import { act, forwardRef, useSyncExternalStore, type ReactNode } from 'react'
+import { act, forwardRef, useEffect, useMemo, useRef, useSyncExternalStore, type ReactNode } from 'react'
+import type { ReactVirtualizerOptions, Virtualizer } from '@tanstack/react-virtual'
 import type { Root, createRoot as CreateRoot } from 'react-dom/client'
 import { createInstance } from 'i18next'
 import { I18nextProvider, initReactI18next } from 'react-i18next'
+import { publishImportedDataRefresh } from '@/lib/import-data-events'
 import landing from '../../i18n/locales/en/landing.json'
 import panels from '../../i18n/locales/en/panels.json'
 import common from '../../i18n/locales/en/shared.json'
@@ -11,7 +14,9 @@ import {
   clearLandingPageSnapshot,
   markLandingPageChatReturn,
   writeLandingPageSnapshot,
+  type LandingPageSnapshot,
 } from '@/lib/landingPageSnapshot'
+import type { DeviceRotationListener } from '@/lib/deviceRotation'
 
 let createRoot: typeof CreateRoot
 let LandingPage: () => ReactNode
@@ -29,6 +34,14 @@ const syncCancelAnimationFrame = (_handle: number) => {}
 Object.assign(domWindow, {
   requestAnimationFrame: syncRequestAnimationFrame,
   cancelAnimationFrame: syncCancelAnimationFrame,
+  matchMedia: (query: string) => ({
+    matches: query.includes('max-width') && domWindow.innerWidth <= Number(query.match(/\d+/)?.[0] ?? 0),
+    media: query,
+    addEventListener() {},
+    removeEventListener() {},
+    addListener() {},
+    removeListener() {},
+  }),
 })
 
 Object.assign(globalThis, {
@@ -90,6 +103,7 @@ type SummaryPage = { data: Summary[]; total: number }
 type MockFn = ReturnType<typeof jest.fn>
 
 type StoreState = {
+  theme?: { fontScale: number }
   landingPageChatsDisplayed: number
   landingPageLayoutMode: 'cards' | 'compact'
   landingPageGalleryWidth: 'compact' | 'expanded'
@@ -263,13 +277,16 @@ mock.module('@/ws/events', () => ({
 mock.module('@/hooks/useScrollGate', () => ({ useScrollGate: jest.fn() }))
 mock.module('@/hooks/useCharacterTheme', () => ({ warmCharacterPalette: jest.fn() }))
 mock.module('@/hooks/useLongPress', () => ({ useLongPress: () => ({}) }))
+const prefetchLandingImages = jest.fn()
 mock.module('@/lib/imageDecodeCache', () => ({
   holdImagesForTransition: jest.fn(),
-  prefetchImages: jest.fn(),
+  prefetchImages: prefetchLandingImages,
 }))
 mock.module('@/lib/uiScale', () => ({
+  normalizeUiScale: (value: unknown) => typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.min(1.5, Math.max(0.5, value)) : 1,
   measureLayoutHeight: () => 0,
   renderedPxToLayoutPx: (value: number) => value,
+  getUiScale: () => 1,
 }))
 mock.module('@/lib/avatarUrls', () => ({
   getCharacterAvatarLargeUrlById: (_id: string, imageId?: string | null) => imageId ? `/avatar-${imageId}.png` : '/avatar.png',
@@ -281,11 +298,17 @@ mock.module('@/lib/uiProductivityDefaults', () => ({
   PRODUCTIVITY_DEFAULTS: { homepageCharacterLibrarySettings: defaultHomepageSettings(true) },
 }))
 mock.module('@/lib/landingPageStartTab', () => ({ readDeviceLandingPageStartTab }))
+let motionSupported = false
+let motionPermissionNeeded = false
+let motionListener: DeviceRotationListener | undefined
+const stopMotion = jest.fn()
+const subscribeMotion = jest.fn((listener: DeviceRotationListener) => { motionListener = listener; return stopMotion })
+const defaultMatchMedia = domWindow.matchMedia
 mock.module('@/lib/deviceRotation', () => ({
-  doesDeviceRotationNeedPermission: () => false,
-  isDeviceRotationSupported: () => false,
+  doesDeviceRotationNeedPermission: () => motionPermissionNeeded,
+  isDeviceRotationSupported: () => motionSupported,
   requestDeviceRotationPermission: async () => ({ state: 'denied' }),
-  subscribeDeviceRotation: () => () => {},
+  subscribeDeviceRotation: subscribeMotion,
 }))
 mock.module('@/lib/toast', () => ({
   toast: { success: jest.fn(), error: jest.fn(), info: jest.fn() },
@@ -363,14 +386,30 @@ mock.module('motion/react', () => ({
   AnimatePresence: ({ children }: { children?: ReactNode }) => <>{children}</>,
 }))
 
+const measureChatRows = jest.fn()
+type ChatVirtualizerOptions = Partial<ReactVirtualizerOptions<HTMLDivElement, Element>> & {
+  count: number
+  getItemKey: (index: number) => string | number
+}
+const chatVirtualizerOptions: ChatVirtualizerOptions[] = []
 mock.module('@tanstack/react-virtual', () => ({
-  useVirtualizer: ({ count }: { count: number }) => ({
-    getVirtualItems: () => count > 0 ? [{ index: 0, key: 'row-0', start: 0, end: 100, size: 100, lane: 0 }] : [],
-    getTotalSize: () => 100,
-    measure: jest.fn(),
-    containerRef: jest.fn(),
-    measureElement: jest.fn(),
-  }),
+  useVirtualizer: (options: ChatVirtualizerOptions) => {
+    chatVirtualizerOptions.push(options)
+    const optionsRef = useRef(options)
+    optionsRef.current = options
+    useEffect(() => {
+      const scroller = optionsRef.current.getScrollElement?.()
+      const offset = optionsRef.current.initialOffset
+      if (scroller) scroller.scrollTop = typeof offset === 'function' ? offset() : offset ?? 0
+    }, [])
+    return useMemo(() => ({
+      getVirtualItems: () => Array.from({ length: optionsRef.current.count }, (_, index) => ({ index, key: optionsRef.current.getItemKey(index), start: index * 100, end: index * 100 + 100, size: 100, lane: 0 })),
+      getTotalSize: () => 100,
+      measure: measureChatRows,
+      measureElement: jest.fn(),
+      takeSnapshot: () => Array.from({ length: optionsRef.current.count }, (_, index) => ({ index, key: optionsRef.current.getItemKey(index), start: index * 100, end: index * 100 + 100, size: 100, lane: 0 })),
+    }), [])
+  },
 }))
 mock.module('./LandingPage.module.css', () => ({
   default: new Proxy({}, { get: (_target, key) => String(key) }),
@@ -446,6 +485,26 @@ function convertedGroupChat(id: string, name: string) {
 
 function page(data: Summary[], total = data.length): SummaryPage {
   return { data, total }
+}
+
+function measuredLandingSnapshot(layout: 'cards' | 'compact' = 'cards'): LandingPageSnapshot & { items: ReturnType<typeof recentChat>[] } {
+  const items = Array.from({ length: 24 }, (_, index) => recentChat(`character-${index}`, `Person ${index}`))
+  const columns = layout === 'cards' ? 4 : 2
+  const rowKeys = Array.from({ length: items.length / columns }, (_, index) => JSON.stringify(
+    items.slice(index * columns, (index + 1) * columns).map((item) => item.character_id),
+  ))
+  return {
+    userId: 'test-user-id', items, total: items.length, scrollTop: 420,
+    requestedTab: 'chats', searchQuery: '', sortField: 'recent', sortDirection: 'desc', pageSize: 12,
+    galleryWidth: 'compact', mainWidth: 960, chatViewportHeight: 700,
+    viewportWidth: domWindow.innerWidth, viewportHeight: domWindow.innerHeight,
+    virtualRows: {
+      geometry: { layout, width: 960, columns, gap: layout === 'cards' ? 20 : 12, rowEstimate: layout === 'cards' ? 320 : 98, uiScale: 1, fontScale: 1, viewportWidth: domWindow.innerWidth },
+      rowKeys,
+      scrollMargin: 120,
+      measurements: rowKeys.map((key, index) => ({ key, index, start: 120 + index * 100, size: 100, end: 220 + index * 100, lane: 0 })),
+    },
+  }
 }
 
 async function flush() {
@@ -546,6 +605,7 @@ afterEach(async () => {
   await act(async () => {
     for (const { root } of roots) root.unmount()
   })
+  useDeviceThemeControls.setState({ userId: null, enabled: false, controls: null })
   document.body.replaceChildren()
   document.documentElement.removeAttribute('data-tauri-desktop')
   document.documentElement.removeAttribute('data-platform')
@@ -556,7 +616,7 @@ afterEach(async () => {
   listTags.mockReset()
   getHomepagePreview.mockReset()
   listRecentGrouped.mockReset()
-  deleteTemporary.mockReset()
+  deleteTemporary.mockReset().mockResolvedValue({ deleted: 0 })
   deleteChat.mockReset()
   deleteCharacterChats.mockReset()
   patchMetadata.mockReset()
@@ -565,15 +625,125 @@ afterEach(async () => {
   branchChat.mockReset()
   listMessages.mockReset()
   navigate.mockReset()
+  measureChatRows.mockClear()
+  chatVirtualizerOptions.length = 0
+  prefetchLandingImages.mockClear()
   wsHandlers.clear()
   wsOn.mockClear()
   readDeviceLandingPageStartTab.mockReset()
   readDeviceLandingPageStartTab.mockReturnValue('characters')
   Object.defineProperty(domWindow, 'innerWidth', { configurable: true, value: 1024 })
   storeState = createStoreState()
+  motionSupported = false
+  motionPermissionNeeded = false
+  motionListener = undefined
+  subscribeMotion.mockClear()
+  stopMotion.mockClear()
+  domWindow.matchMedia = defaultMatchMedia
 })
 
 describe('LandingPage character library', () => {
+  for (const platform of ['ios', 'android']) {
+    test(`uses native ${platform} motion with a fine pointer attached`, async () => {
+      motionSupported = true
+      Object.assign(domWindow, { __LUMIVERSE_MOBILE__: true, __LUMIVERSE_PLATFORM__: platform })
+      domWindow.matchMedia = ((query: string) => ({ ...defaultMatchMedia(query), matches: false })) as typeof window.matchMedia
+      storeState = { ...createStoreState(false), landingPageLayoutMode: 'cards' }
+      const layeredChat = { ...recentChat('native-layered', 'Ava'), character_perspective_layers: [
+        { id: 'back', image_id: 'back', intensity: 0.6 }, { id: 'front', image_id: 'front', intensity: 0.6 },
+      ] }
+      listRecentGrouped.mockResolvedValue(page([layeredChat]))
+      try {
+        await mountLanding()
+        await flush()
+        expect(subscribeMotion).toHaveBeenCalledTimes(1)
+      } finally {
+        Reflect.deleteProperty(domWindow, '__LUMIVERSE_MOBILE__')
+        Reflect.deleteProperty(domWindow, '__LUMIVERSE_PLATFORM__')
+      }
+    })
+  }
+
+  test('applies both motion axes to layered cards and stops immediately for Reduce Motion', async () => {
+    motionSupported = true
+    let reduced = false
+    const changes = new domWindow.EventTarget()
+    domWindow.matchMedia = ((query: string) => ({
+      media: query,
+      get matches() { return query.includes('prefers-reduced-motion') ? reduced : query.includes('hover: none') },
+      addEventListener: changes.addEventListener.bind(changes),
+      removeEventListener: changes.removeEventListener.bind(changes),
+    })) as typeof window.matchMedia
+    storeState = { ...createStoreState(false), landingPageLayoutMode: 'cards' }
+    const layeredChat = { ...recentChat('layered', 'Ava'), character_perspective_layers: [
+      { id: 'back', image_id: 'back', intensity: 0.6 }, { id: 'front', image_id: 'front', intensity: 0.6 },
+    ] }
+    listRecentGrouped.mockResolvedValue(page([layeredChat]))
+    const host = await mountLanding()
+    await flush()
+    expect(subscribeMotion).toHaveBeenCalledTimes(1)
+    const emit = (beta: number, gamma: number) => motionListener!({
+      orientation: { alpha: 0, beta, gamma, absolute: false }, rotationRate: null,
+      timestamp: 10, hasReading: true, permission: 'granted',
+    })
+    await act(async () => { emit(70, 0); emit(75, 5) })
+    const card = host.querySelector<HTMLElement>('.mobileMotionTilting')!
+    expect(card).not.toBeNull()
+    expect(Number(card.style.getPropertyValue('--pointer-x'))).toBeGreaterThan(0.18)
+    expect(Number(card.style.getPropertyValue('--pointer-y'))).toBeGreaterThan(0.28)
+    await act(async () => { emit(65, -5) })
+    expect(Number(card.style.getPropertyValue('--pointer-x'))).toBeLessThan(-0.18)
+    expect(Number(card.style.getPropertyValue('--pointer-y'))).toBeLessThan(-0.28)
+    await act(async () => { reduced = true; changes.dispatchEvent(new domWindow.Event('change')) })
+    expect(stopMotion).toHaveBeenCalledTimes(1)
+    expect(card.classList.contains('mobileMotionTilting')).toBe(false)
+    await act(async () => { reduced = false; changes.dispatchEvent(new domWindow.Event('change')) })
+    expect(subscribeMotion).toHaveBeenCalledTimes(2)
+    await act(async () => { emit(80, 10) })
+    expect(Number(card.style.getPropertyValue('--pointer-x'))).toBeCloseTo(0)
+    expect(Number(card.style.getPropertyValue('--pointer-y'))).toBeCloseTo(0)
+  })
+
+  test('does not subscribe to motion when the gallery has no layered avatars', async () => {
+    motionSupported = true
+    domWindow.matchMedia = ((query: string) => ({ ...defaultMatchMedia(query), matches: query.includes('hover: none') })) as typeof window.matchMedia
+    storeState = { ...createStoreState(false), landingPageLayoutMode: 'cards' }
+    listRecentGrouped.mockResolvedValue(page([recentChat('ordinary', 'Ava')]))
+    await mountLanding()
+    await flush()
+    expect(subscribeMotion).not.toHaveBeenCalled()
+  })
+
+  test('releases ordinary card compositing after return motion and cancels release on reentry', async () => {
+    storeState = { ...createStoreState(false), landingPageLayoutMode: 'cards' }
+    listRecentGrouped.mockResolvedValue(page([recentChat('character-1', 'Ava')]))
+    const host = await mountLanding()
+    const card = host.querySelector<HTMLElement>('.cardTilt')!
+    const enter = () => card.dispatchEvent(new domWindow.MouseEvent('mouseover', { bubbles: true, clientX: 10, clientY: 10 }))
+    const leave = () => card.dispatchEvent(new domWindow.MouseEvent('mouseout', { bubbles: true, relatedTarget: document.body }))
+    expect(card.hasAttribute('data-compositing')).toBe(false)
+    await act(async () => { enter(); leave() })
+    expect(card.hasAttribute('data-compositing')).toBe(true)
+    expect(card.classList.contains('tilting')).toBe(false)
+    await act(async () => { enter() })
+    await new Promise(resolve => setTimeout(resolve, 600))
+    expect(card.hasAttribute('data-compositing')).toBe(true)
+    await act(async () => { leave() })
+    await new Promise(resolve => setTimeout(resolve, 600))
+    expect(card.hasAttribute('data-compositing')).toBe(false)
+  })
+
+  test('shows imported recent chats on the mounted landing page without reopening it', async () => {
+    storeState = createStoreState(false)
+    listRecentGrouped.mockResolvedValueOnce(page([]))
+      .mockResolvedValue(page([recentChat('restored-character', 'Imported character')]))
+    const host = await mountLanding()
+    await flush()
+    expect(host.textContent).not.toContain('Imported character')
+    await act(async () => { publishImportedDataRefresh() })
+    await flush()
+    expect(host.textContent).toContain('Imported character')
+  })
   for (const layout of ['cards', 'compact'] as const) {
     test(`keeps decorative avatars out of chat names and identifies delete targets in ${layout}`, async () => {
       storeState = { ...createStoreState(false), landingPageLayoutMode: layout }
@@ -589,6 +759,120 @@ describe('LandingPage character library', () => {
       expect(chats.querySelector(layout === 'cards' ? '.cardBtn' : '.listBtn')?.querySelector('.deleteBtn, .listDeleteBtn')).toBeNull()
     })
   }
+
+  for (const layout of ['cards', 'compact'] as const) {
+    test(`keeps neighboring images mounted after hiding a chat in ${layout}`, async () => {
+      storeState = { ...createStoreState(false), landingPageLayoutMode: layout }
+      const entries = Array.from({ length: 10 }, (_, index) => ({
+        ...recentChat(`character-${index}`, `Character ${index}`),
+        character_image_id: `image-${index}`,
+      }))
+      listRecentGrouped.mockResolvedValueOnce(page(entries))
+      const refresh = createDeferred<SummaryPage>()
+      listRecentGrouped.mockReturnValue(refresh.promise)
+      patchMetadata.mockResolvedValue({})
+      const host = await mountLanding()
+      await flush()
+      const chats = host.querySelector('[data-component="LandingPageChats"]')!
+      const images = [...chats.querySelectorAll('img')]
+      expect(images).toHaveLength(10)
+      const action = chats.querySelector<HTMLButtonElement>(layout === 'cards' ? '.deleteBtn' : '.listDeleteBtn')!
+
+      await act(async () => {
+        action.dispatchEvent(new domWindow.MouseEvent('click', { bubbles: true, cancelable: true, shiftKey: true }))
+      })
+
+      const survivors = [...chats.querySelectorAll('img')]
+      expect(survivors).toHaveLength(9)
+      expect(survivors.every((image, index) => image === images[index + 1])).toBe(true)
+      expect(patchMetadata).toHaveBeenCalledWith('chat-character-0', { hidden_from_recent: true })
+      await settleDeferred(refresh, page(entries.slice(1)))
+      expect([...chats.querySelectorAll('img')].every((image, index) => image === images[index + 1])).toBe(true)
+    })
+
+    test(`updates one avatar without invalidating neighboring images or measurements in ${layout}`, async () => {
+      storeState = { ...createStoreState(false), landingPageLayoutMode: layout }
+      const entries = Array.from({ length: 8 }, (_, index) => ({
+        ...recentChat(`character-${index}`, `Character ${index}`),
+        character_image_id: `image-${index}`,
+      }))
+      listRecentGrouped.mockResolvedValueOnce(page(entries))
+      const refresh = createDeferred<SummaryPage>()
+      listRecentGrouped.mockReturnValue(refresh.promise)
+      const host = await mountLanding()
+      await flush()
+      const chats = host.querySelector('[data-component="LandingPageChats"]')!
+      const images = [...chats.querySelectorAll('img')]
+      const sources = images.map((image) => image.getAttribute('src'))
+      const changedSources: Node[] = []
+      const observer = new domWindow.MutationObserver((records) => changedSources.push(...records.map((record) => record.target)))
+      observer.observe(chats, { attributes: true, attributeFilter: ['src'], subtree: true })
+      measureChatRows.mockClear()
+      prefetchLandingImages.mockClear()
+
+      await act(async () => {
+        for (const handler of wsHandlers.get('character-edited') ?? []) {
+          handler({ id: 'character-1', character: {
+            id: 'character-1', name: 'Character 1', avatar_path: 'updated.png', image_id: 'updated-image', extensions: {},
+          } })
+        }
+      })
+
+      expect([...chats.querySelectorAll('img')].every((image, index) => image === images[index])).toBe(true)
+      expect(images[1].getAttribute('src')).toBe(layout === 'cards' ? '/avatar-updated-image.png' : '/avatar-updated-image-thumb.png')
+      for (let index = 0; index < images.length; index++) {
+        if (index !== 1) expect(images[index].getAttribute('src')).toBe(sources[index])
+      }
+      expect(changedSources).toHaveLength(1)
+      expect(changedSources[0] === images[1]).toBe(true)
+      expect(measureChatRows).not.toHaveBeenCalled()
+      expect(prefetchLandingImages).toHaveBeenCalledTimes(1)
+      expect(prefetchLandingImages).toHaveBeenCalledWith([layout === 'cards' ? '/avatar-updated-image.png' : '/avatar-updated-image-thumb.png'])
+      observer.disconnect()
+      await settleDeferred(refresh, page(entries.map((item, index) => index === 1
+        ? { ...item, character_image_id: 'updated-image' }
+        : item)))
+      expect([...chats.querySelectorAll('img')].every((image, index) => image === images[index])).toBe(true)
+      expect(measureChatRows).not.toHaveBeenCalled()
+      expect(prefetchLandingImages).toHaveBeenCalledTimes(1)
+    })
+  }
+
+  test('updates one group mosaic avatar while keeping its members and neighboring cards mounted', async () => {
+    storeState = createStoreState(false)
+    storeState.characters = Array.from({ length: 4 }, (_, index) => ({
+      id: `member-${index}`, name: `Member ${index}`, avatar_path: null, image_id: `member-image-${index}`, extensions: {},
+    }))
+    const group = {
+      ...recentChat('group-character', 'Group'),
+      is_group: true,
+      group_character_ids: storeState.characters.map((character) => character.id),
+      group_name: 'Group',
+    }
+    listRecentGrouped.mockResolvedValue(page([group, recentChat('neighbor', 'Neighbor')]))
+    const host = await mountLanding()
+    await flush()
+    const chats = host.querySelector('[data-component="LandingPageChats"]')!
+    const images = [...chats.querySelectorAll('img')]
+    expect(images).toHaveLength(5)
+    const sources = images.map((image) => image.getAttribute('src'))
+    prefetchLandingImages.mockClear()
+    measureChatRows.mockClear()
+
+    await act(async () => {
+      storeState = { ...storeState, characters: storeState.characters.map((character, index) => index === 1
+        ? { ...character, image_id: 'replacement-member' }
+        : character) }
+      notifyStore()
+    })
+
+    expect([...chats.querySelectorAll('img')].every((image, index) => image === images[index])).toBe(true)
+    expect(images[1].getAttribute('src')).toBe('/avatar-replacement-member-thumb.png')
+    for (const index of [0, 2, 3, 4]) expect(images[index].getAttribute('src')).toBe(sources[index])
+    expect(prefetchLandingImages).toHaveBeenCalledTimes(1)
+    expect(prefetchLandingImages).toHaveBeenCalledWith(['/avatar-replacement-member-thumb.png'])
+    expect(measureChatRows).not.toHaveBeenCalled()
+  })
 
   test('opens chat history for forked one-member converted groups', async () => {
     storeState = createStoreState(false)
@@ -715,12 +999,17 @@ describe('LandingPage character library', () => {
     expect(leavingChats?.getAttribute('data-motion-animate')).toBe('visible')
     const storedSnapshot = JSON.parse(domWindow.sessionStorage.getItem('__lumiverse_landing_page_snapshot_v1') || '{}')
     expect(storedSnapshot.snapshot?.imageUrls).toEqual(['/avatar.png'])
+    expect(storedSnapshot.snapshot?.virtualRows?.measurements).toEqual([
+      { index: 0, key: '["character-1"]', start: 0, end: 100, size: 100, lane: 0 },
+    ])
+    expect(storedSnapshot.snapshot?.virtualRows?.geometry.layout).toBe('cards')
 
     const mounted = mountedRoots.find((entry) => entry.host === firstHost)!
     mountedRoots.splice(mountedRoots.indexOf(mounted), 1)
     await act(async () => mounted.root.unmount())
     firstHost.remove()
 
+    measureChatRows.mockClear()
     const restoredHost = await mountLanding()
 
     expect(restoredHost.textContent).toContain('Ava')
@@ -731,6 +1020,9 @@ describe('LandingPage character library', () => {
     expect(restoredHost.querySelector('[data-entry-mode="chat-return"]')?.getAttribute('data-motion-animate')).toBe('{"opacity":1,"y":0,"scale":1}')
     expect(restoredHost.querySelector<HTMLElement>('[data-component="LandingPage"]')?.scrollTop).toBe(420)
     expect(listRecentGrouped).toHaveBeenCalledTimes(2)
+    expect(chatVirtualizerOptions.at(-1)?.initialOffset).toBe(420)
+    expect(chatVirtualizerOptions.at(-1)?.initialMeasurementsCache).toEqual(storedSnapshot.snapshot.virtualRows.measurements)
+    expect(measureChatRows).not.toHaveBeenCalled()
 
     await settleDeferred(refresh, page([recentChat('character-1', 'Ava')]))
   })
@@ -886,6 +1178,124 @@ describe('LandingPage character library', () => {
     expect(domWindow.sessionStorage.getItem('__lumiverse_landing_page_snapshot_v1')).toBeNull()
 
     await settleDeferred(refresh, page([ava]))
+  })
+
+  for (const layout of ['cards', 'compact'] as const) {
+    test(`restores ${layout} measurements from session storage and consumes them only once`, async () => {
+      storeState = { ...createStoreState(false), landingPageLayoutMode: layout }
+      const saved = measuredLandingSnapshot(layout)
+      // Write only session storage to exercise the chat-route reload bridge.
+      domWindow.sessionStorage.setItem('__lumiverse_landing_page_snapshot_v1', JSON.stringify({ version: 1, snapshot: saved }))
+      const refresh = createDeferred<SummaryPage>()
+      listRecentGrouped.mockReturnValue(refresh.promise)
+      const host = await mountLanding()
+      expect(chatVirtualizerOptions[0]?.initialMeasurementsCache).toEqual(saved.virtualRows!.measurements)
+      expect(chatVirtualizerOptions[0]?.initialOffset).toBe(420)
+      expect(chatVirtualizerOptions[0]?.scrollMargin).toBe(120)
+      if (layout === 'compact') {
+        const options = chatVirtualizerOptions[0]
+        expect(options.measureElement!(document.createElement('div'), undefined, {
+          indexFromElement: () => 0, options,
+        } as unknown as Virtualizer<HTMLDivElement, Element>)).toBe(100)
+      }
+      expect(measureChatRows).not.toHaveBeenCalled()
+      expect(domWindow.sessionStorage.getItem('__lumiverse_landing_page_snapshot_v1')).toBeNull()
+
+      // A responsive width change still resets card measurements.
+      const main = host.querySelector('[data-component="LandingPageMain"]')!
+      Object.defineProperty(main, 'clientWidth', { configurable: true, value: 920 })
+      await act(async () => window.dispatchEvent(new domWindow.Event('resize')))
+      if (layout === 'cards') expect(measureChatRows).toHaveBeenCalledTimes(1)
+
+      // A later layout switch cannot replay the route-return offset or cache.
+      await act(async () => {
+        storeState = { ...storeState, landingPageLayoutMode: layout === 'cards' ? 'compact' : 'cards' }
+        notifyStore()
+      })
+      expect(chatVirtualizerOptions.at(-1)?.initialMeasurementsCache).toBeUndefined()
+      expect(chatVirtualizerOptions.at(-1)?.initialOffset).toBe(0)
+      await settleDeferred(refresh, page(saved.items))
+    })
+  }
+
+  test('keeps the virtual restore pending until bootstrap allows the list to mount', async () => {
+    storeState = { ...createStoreState(false), settingsLoaded: false }
+    const saved = measuredLandingSnapshot()
+    writeLandingPageSnapshot(saved)
+    const refresh = createDeferred<SummaryPage>()
+    listRecentGrouped.mockReturnValue(refresh.promise)
+    const host = await mountLanding()
+    expect(chatVirtualizerOptions).toHaveLength(0)
+    expect(host.querySelector('.skeletonCard')).not.toBeNull()
+    await act(async () => {
+      storeState = { ...storeState, settingsLoaded: true }
+      notifyStore()
+    })
+    expect(chatVirtualizerOptions[0]?.initialMeasurementsCache).toEqual(saved.virtualRows!.measurements)
+    expect(chatVirtualizerOptions[0]?.initialOffset).toBe(420)
+    expect(measureChatRows).not.toHaveBeenCalled()
+    await settleDeferred(refresh, page(saved.items))
+  })
+
+  test('falls back to estimates when a saved row cache is incompatible', async () => {
+    storeState = createStoreState(false)
+    const saved = measuredLandingSnapshot()
+    saved.virtualRows!.rowKeys.reverse()
+    writeLandingPageSnapshot(saved)
+    const refresh = createDeferred<SummaryPage>()
+    listRecentGrouped.mockReturnValue(refresh.promise)
+    await mountLanding()
+    expect(chatVirtualizerOptions[0]?.initialMeasurementsCache).toBeUndefined()
+    expect(chatVirtualizerOptions[0]?.initialOffset).toBe(420)
+    expect(measureChatRows).toHaveBeenCalledTimes(1)
+    await settleDeferred(refresh, page(saved.items))
+  })
+
+  test('invalidates restored compact heights when font scaling changes', async () => {
+    storeState = { ...createStoreState(false), landingPageLayoutMode: 'compact' }
+    const saved = measuredLandingSnapshot('compact')
+    writeLandingPageSnapshot(saved)
+    const refresh = createDeferred<SummaryPage>()
+    listRecentGrouped.mockReturnValue(refresh.promise)
+    await mountLanding()
+    expect(measureChatRows).not.toHaveBeenCalled()
+    await act(async () => {
+      storeState = { ...storeState, theme: { fontScale: 1.3 } }
+      notifyStore()
+    })
+    expect(measureChatRows).toHaveBeenCalledTimes(1)
+    const options = chatVirtualizerOptions.at(-1)!
+    expect(options.measureElement!(document.createElement('div'), undefined, {
+      indexFromElement: () => 0, options,
+    } as unknown as Virtualizer<HTMLDivElement, Element>)).toBe(98)
+    await settleDeferred(refresh, page(saved.items))
+  })
+
+  test('invalidates compact row measurements for device font changes while preserving the authored theme', async () => {
+    storeState = { ...createStoreState(false), landingPageLayoutMode: 'compact', theme: { fontScale: 1 } }
+    const saved = measuredLandingSnapshot('compact')
+    writeLandingPageSnapshot(saved)
+    const refresh = createDeferred<SummaryPage>()
+    listRecentGrouped.mockReturnValue(refresh.promise)
+    await mountLanding()
+    expect(measureChatRows).not.toHaveBeenCalled()
+    await act(async () => {
+      useDeviceThemeControls.setState({ userId: 'fixture', enabled: true, controls: themeControls({ fontScale: 1.3 }) })
+    })
+    expect(measureChatRows).toHaveBeenCalledTimes(1)
+    expect(storeState.theme?.fontScale).toBe(1)
+    await settleDeferred(refresh, page(saved.items))
+  })
+
+  test('does not restore another account’s measured rows or offset', async () => {
+    storeState = createStoreState(false)
+    const saved = measuredLandingSnapshot()
+    writeLandingPageSnapshot({ ...saved, userId: 'different-user' })
+    listRecentGrouped.mockResolvedValue(page(saved.items))
+    await mountLanding()
+    await flush()
+    expect(chatVirtualizerOptions[0]?.initialMeasurementsCache).toBeUndefined()
+    expect(chatVirtualizerOptions[0]?.initialOffset).toBe(0)
   })
 
   test('restores the expanded gallery geometry instead of its default-width topology', async () => {
@@ -1183,7 +1593,8 @@ describe('LandingPage character library', () => {
     expect(tab(host, 'Characters')?.getAttribute('aria-selected')).toBe('true')
     expect(storeState.setSetting).not.toHaveBeenCalledWith('landingPageActiveTab', expect.anything())
     expect(charactersMount(host).querySelectorAll('[data-homepage-character-library-root]')).toHaveLength(1)
-    expect(listRecentGrouped).toHaveBeenCalledTimes(1)
+    // Returning to native Chats refreshes once after hidden native reads were paused.
+    expect(listRecentGrouped).toHaveBeenCalledTimes(2)
     expect(listSummaries).not.toHaveBeenCalled()
   })
 })

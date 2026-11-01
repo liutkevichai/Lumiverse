@@ -4,18 +4,61 @@ import { useStore } from '@/store'
 import { bootstrapApi, type BootstrapPayload, type LandingBootstrapPayload } from '@/api/bootstrap'
 import { connectionsApi } from '@/api/connections'
 import { sttConnectionsApi } from '@/api/stt-connections'
+import { decisionConnectionsApi } from '@/api/decision-connections'
 import { ttsConnectionsApi } from '@/api/tts-connections'
 import { imageGenConnectionsApi } from '@/api/image-gen-connections'
 import { personasApi } from '@/api/personas'
 import { packsApi } from '@/api/packs'
 import { resetUserScopedStoreState } from '@/store/user-scoped-reset'
-import { setSettingsPersistenceScope } from '@/store/slices/settings'
+import { flushSettingsNow, setSettingsPersistenceScope } from '@/store/slices/settings'
 import { setPresetSaveCoordinatorScope } from '@/lib/loom/preset-save-coordinator'
 import { listAllConnections } from '@/api/listAllConnections'
 import { useTokenizerWarmup } from './useTokenizerWarmup'
 import { activeTab } from '@/lib/active-tab'
+import { clearLandingPageSnapshot } from '@/lib/landingPageSnapshot'
+import { forgetImportJob, watchImportJob } from '@/lib/import-recovery'
+import { reloadImportedData, takeImportReloadReceipt } from '@/lib/import-data-reload'
+import { clearImageCache } from '@/lib/imageDecodeCache'
+import { userDataApi } from '@/api/user-data'
+import { toast } from '@/lib/toast'
+import { t } from 'i18next'
 
 let appInitGeneration = 0
+const importRefreshes = new Map<string, Promise<void>>()
+
+/** Both WebSocket completion and status polling use this same refresh path. */
+export function refreshAppDataAfterImport(jobId: string): Promise<void> {
+  const userId = useStore.getState().user?.id
+  if (!userId || !useStore.getState().isAuthenticated || activeTab.signal.aborted) return Promise.resolve()
+  const key = `${userId}:${jobId}`
+  const existing = importRefreshes.get(key)
+  if (existing) return existing
+  const generation = ++appInitGeneration
+  const isCurrent = () => !activeTab.signal.aborted && appInitGeneration === generation
+    && useStore.getState().isAuthenticated && useStore.getState().user?.id === userId
+
+  const refresh = (async () => {
+    // Finish local settings edits before the new document reads the database.
+    await flushSettingsNow()
+    if (!isCurrent()) return
+    clearLandingPageSnapshot()
+    clearImageCache()
+    // Bootstrap alone leaves mounted editors, paginated lists, registries
+    // and extension-owned caches on their old snapshots. A restore is
+    // infrequent: restart every data view together at the current URL.
+    forgetImportJob(userId, jobId)
+    reloadImportedData(userId, jobId)
+  })().then(() => {
+    if (!isCurrent()) importRefreshes.delete(key)
+  }).catch((error) => {
+    importRefreshes.delete(key)
+    throw error
+  })
+  importRefreshes.set(key, refresh)
+  // Keep recent completions deduplicated without growing for the whole session.
+  if (importRefreshes.size > 100) importRefreshes.delete(importRefreshes.keys().next().value!)
+  return refresh
+}
 
 /**
  * Eagerly load shared data that multiple panels depend on.
@@ -35,6 +78,10 @@ export function useAppInit() {
   const isAuthenticated = useStore((s) => s.isAuthenticated)
   const userId = useStore((s) => s.user?.id ?? null)
   const initializedUserId = useRef<string | null>(null)
+
+  useEffect(() => {
+    if (isAuthenticated && userId) return watchImportJob(userId, refreshAppDataAfterImport)
+  }, [isAuthenticated, userId])
 
   useEffect(() => {
     if (!isAuthenticated || !userId) {
@@ -62,7 +109,18 @@ export function useAppInit() {
       && useStore.getState().user?.id === userId
     )
 
-    void initialize(isCurrent)
+    const reloadedJob = takeImportReloadReceipt(userId)
+    void initialize(isCurrent).then(async () => {
+      if (!reloadedJob || !isCurrent()) return
+      try {
+        const job = await userDataApi.getImportStatus(reloadedJob)
+        if (!isCurrent()) return
+        if (job.status === 'complete') toast.success(t('dataPortability.importComplete', { ns: 'settings' }))
+        else if (job.status === 'failed' || job.status === 'cancelled') {
+          toast.error(job.error || t(job.status === 'cancelled' ? 'dataPortability.importCancelled' : 'dataPortability.importFailed', { ns: 'settings' }))
+        }
+      } catch { /* A restarted backend may no longer retain the old job. */ }
+    })
   }, [isAuthenticated, userId])
 }
 
@@ -79,7 +137,9 @@ async function initialize(isCurrent: () => boolean): Promise<void> {
   let landingPreloadHandled = false
   const imageGenProfilesVersion = useStore.getState().imageGenProfilesVersion
 
-  const landingPromise = bootstrapApi.fetchLanding()
+  // Recent-chat grouping is landing data, not a prerequisite for direct chat
+  // navigation or native widget startup.
+  const landingPromise = window.location.pathname === '/' ? bootstrapApi.fetchLanding()
     .then((response) => {
       if (!isCurrent()) return
       const appliedRecentChats = applyLandingBootstrap(response.payload, response.errors ?? {}, {
@@ -89,7 +149,7 @@ async function initialize(isCurrent: () => boolean): Promise<void> {
     })
     .catch((err) => {
       console.warn('[useAppInit] landing bootstrap failed; landing page will fetch its own chats:', err)
-    })
+    }) : Promise.resolve()
 
   try {
     const response = await bootstrapApi.fetch()
@@ -101,6 +161,7 @@ async function initialize(isCurrent: () => boolean): Promise<void> {
     errors = {
       'startupSettings': 'fallback',
       'llm.connections': 'fallback', 'llm.providers': 'fallback',
+      'decision.connections': 'fallback', 'decision.providers': 'fallback',
       'stt.connections': 'fallback', 'stt.providers': 'fallback',
       'tts.connections': 'fallback', 'tts.providers': 'fallback',
       'imageGen.connections': 'fallback', 'imageGen.providers': 'fallback',
@@ -132,13 +193,14 @@ async function initialize(isCurrent: () => boolean): Promise<void> {
         .catch(() => {})
     }
   }
-  if (payload && !errors['startupSettings']) {
-    void loadFullSettings(isCurrent)
-  }
+  const settingsPromise = payload && !errors['startupSettings']
+    ? loadFullSettings(isCurrent)
+    : null
   if (Object.keys(errors).length > 0) await runFallbacks(errors, isCurrent)
   if (!isCurrent()) return
 
-  void landingPromise
+  await Promise.all([landingPromise, settingsPromise])
+  if (!isCurrent()) return
 
   // Council member pack items — always run after settings are loaded.
   // Walks the (now-populated) council member list and fetches full pack
@@ -199,6 +261,9 @@ export function applyBootstrap(
 
   if (!errors['llm.connections']) store.setProfiles(payload.llm.connections.data)
   if (!errors['llm.providers']) store.setProviders(payload.llm.providers)
+
+  if (payload.decision && !errors['decision.connections']) store.setDecisionProfiles(payload.decision.connections.data)
+  if (payload.decision && !errors['decision.providers']) store.setDecisionProviders(payload.decision.providers)
 
   if (!errors['stt.connections']) store.setSttProfiles(payload.stt.connections.data)
   if (!errors['stt.providers']) store.setSttProviders(payload.stt.providers)
@@ -271,6 +336,14 @@ async function runFallbacks(
       if (!isCurrent()) return
       if (profilesRes.status === 'fulfilled') store.setProfiles(profilesRes.value.data)
       if (providersRes.status === 'fulfilled') store.setProviders(providersRes.value.providers)
+    })
+  }
+
+  if (errors['decision.connections'] || errors['decision.providers']) {
+    Promise.allSettled([listAllConnections(decisionConnectionsApi), decisionConnectionsApi.providers()]).then(([profilesRes, providersRes]) => {
+      if (!isCurrent()) return
+      if (profilesRes.status === 'fulfilled') store.setDecisionProfiles(profilesRes.value.data)
+      if (providersRes.status === 'fulfilled') store.setDecisionProviders(providersRes.value.providers)
     })
   }
 

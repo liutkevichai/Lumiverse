@@ -172,9 +172,6 @@ mock.module('@/api/chats', () => ({
 mock.module('@/api/generate', () => ({
   generateApi: { start: generateStart },
 }))
-mock.module('@/lib/loom/runtimeProfile', () => ({
-  shouldForceLoomRuntimePreset: () => false,
-}))
 let nextRequestId = 0
 mock.module('@/lib/uuid', () => ({
   generateUUID: () => `request-${++nextRequestId}`,
@@ -231,7 +228,7 @@ let hookSurface: Surface
 const mountedRoots = new Set<Root>()
 
 function Harness({ message }: { message: Message }) {
-  // eslint-disable-next-line react-compiler/react-compiler
+  // eslint-disable-next-line react-hooks/globals
   hookSurface = useMessageCard(message, 'chat-1')
   return null
 }

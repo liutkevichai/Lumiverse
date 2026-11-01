@@ -9,6 +9,7 @@
  *   - Cortex rebuild trigger
  */
 
+import { CortexActivityTracker, getCortexActivity } from "../services/memory-cortex/activity";
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { getDb } from "../db/connection";
@@ -16,13 +17,15 @@ import { getProvider } from "../llm/registry";
 import * as chatsSvc from "../services/chats.service";
 import { enqueueChatPipelineTask, getChatPipelineStatus } from "../services/chat-pipeline-coordinator.service";
 import * as connectionsSvc from "../services/connections.service";
+import * as decisionConnectionsSvc from "../services/decision-connections.service";
+import { withReadableApiKeyStatus } from "../services/connection-secret-status";
 import * as embeddingsSvc from "../services/embeddings.service";
 import * as memoryCortex from "../services/memory-cortex";
 import { parsePagination } from "../services/pagination";
 import * as vectorizationQueue from "../services/vectorization-queue.service";
 import { ChatLinkError } from "../services/memory-cortex/vault";
-import { getCharacter } from "../services/characters.service";
-import { getChat } from "../services/chats.service";
+import { getCharacter, getCharacterAsync } from "../services/characters.service";
+import { getChat, getChatAsync } from "../services/chats.service";
 import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
 
@@ -81,22 +84,20 @@ async function resolveCortexParticipants(userId: string, chat: ReturnType<typeof
 
   if (!chat) return { characterNames, descriptionAliases: undefined as Map<string, string> | undefined };
 
-  const character = chat.character_id ? getCharacter(userId, chat.character_id) : null;
+  const character = chat.character_id ? (await getCharacterAsync(userId, chat.character_id)) : null;
   if (character) {
-    const normalized = memoryCortex.normalizeCharacterName(character.name);
-    characterNames.push(normalized);
-    aliasMaps.push(memoryCortex.extractDescriptionAliases(normalized, character.description, character.personality, character.scenario));
+    const names = memoryCortex.getCortexCharacterNames(character.name);
+    characterNames.push(...names);
+    if (names.length === 1) aliasMaps.push(memoryCortex.extractDescriptionAliases(names[0]!, character.description, character.personality, character.scenario));
   }
 
   if (chat.metadata?.character_ids) {
     for (const cid of chat.metadata.character_ids as string[]) {
-      const ch = getCharacter(userId, cid);
+      const ch = await getCharacterAsync(userId, cid);
       if (!ch) continue;
-      const normalized = memoryCortex.normalizeCharacterName(ch.name);
-      if (!characterNames.includes(normalized)) {
-        characterNames.push(normalized);
-        aliasMaps.push(memoryCortex.extractDescriptionAliases(normalized, ch.description, ch.personality));
-      }
+      const names = memoryCortex.getCortexCharacterNames(ch.name);
+      for (const name of names) if (!characterNames.includes(name)) characterNames.push(name);
+      if (names.length === 1) aliasMaps.push(memoryCortex.extractDescriptionAliases(names[0]!, ch.description, ch.personality));
     }
   }
 
@@ -245,8 +246,8 @@ function stampCortexFreshnessSnapshot(
     },
   };
 
-  getDb().query("UPDATE chats SET metadata = ? WHERE id = ? AND user_id = ?").run(
-    JSON.stringify(metadata),
+  getDb().query("UPDATE chats SET metadata = json_set(metadata, '$.cortex_rebuild_state', json(?)) WHERE id = ? AND user_id = ?").run(
+    JSON.stringify(metadata.cortex_rebuild_state),
     chatId,
     userId,
   );
@@ -275,8 +276,8 @@ function stampCortexRebuildAttempt(userId: string, chatId: string): void {
     },
   };
 
-  getDb().query("UPDATE chats SET metadata = ? WHERE id = ? AND user_id = ?").run(
-    JSON.stringify(metadata),
+  getDb().query("UPDATE chats SET metadata = json_set(metadata, '$.cortex_rebuild_state', json(?)) WHERE id = ? AND user_id = ?").run(
+    JSON.stringify(metadata.cortex_rebuild_state),
     chatId,
     userId,
   );
@@ -301,6 +302,13 @@ function logCortexRebuildTrigger(
   );
 }
 
+function readCortexRequestTiming(body: unknown, requestedAt: number) {
+  const clientRequestId = isRecord(body) && typeof body.requestId === "string" && body.requestId.length <= 128 ? body.requestId : undefined;
+  const clientRequestedAt = isRecord(body) && Number.isSafeInteger(body.initiatedAt)
+    && Math.abs(Number(body.initiatedAt) - requestedAt) < 86_400_000 ? Number(body.initiatedAt) : undefined;
+  return { requestedAt, clientRequestedAt, clientRequestId };
+}
+
 type TrackedCortexRebuildOptions = {
   userId: string;
   chatId: string;
@@ -310,6 +318,7 @@ type TrackedCortexRebuildOptions = {
   sidecarConnectionId?: string;
   snapshot: CortexFreshnessSnapshot;
   source?: "warmup";
+  timing?: { requestedAt: number; clientRequestedAt?: number; clientRequestId?: string };
 };
 
 /** Per-chat registry of the rebuild currently running. Two warmups for the same
@@ -352,6 +361,8 @@ function launchTrackedCortexRebuild(
 ): void {
   const { userId, chatId, characterNames, descriptionAliases, generateRawFn, sidecarConnectionId, snapshot, source } = options;
   const abort = new AbortController();
+  const activity = new CortexActivityTracker(userId, chatId, source === "warmup" ? "warmup" : "rebuild", options.timing);
+  let activityStatus: "complete" | "cancelled" | "error" = "complete";
   const entry: InFlightCortexRebuild = {
     kind: source === "warmup" ? "warmup" : "force",
     abort,
@@ -370,7 +381,7 @@ function launchTrackedCortexRebuild(
           ? { action: "skip", reason: "aborted_before_start" }
           : { action: "run" }
       ),
-      run: (laneSignal) => memoryCortex.rebuildCortex(
+      run: (laneSignal) => activity.run(() => memoryCortex.rebuildCortex(
         userId,
         chatId,
         characterNames,
@@ -396,9 +407,9 @@ function launchTrackedCortexRebuild(
           warmupSignature: snapshot.rebuildSignature,
           signal: AbortSignal.any([abort.signal, laneSignal]),
         },
-      ),
+      )),
     }).then((scheduled) => {
-      if (scheduled.status !== "completed" || !scheduled.value) return;
+      if (scheduled.status !== "completed" || !scheduled.value) { activityStatus = "cancelled"; return; }
       const result = scheduled.value;
       try {
         stampCortexFreshnessSnapshot(userId, chatId, snapshot);
@@ -415,7 +426,8 @@ function launchTrackedCortexRebuild(
     }).catch((err) => {
       // Preempted by a superseding rebuild — that run owns the progress stream,
       // so stay silent instead of flashing a spurious error in the UI.
-      if (abort.signal.aborted) return;
+      if (abort.signal.aborted) { activityStatus = "cancelled"; return; }
+      activityStatus = "error";
       console.error(source === "warmup" ? "[memory-cortex] Warmup rebuild failed:" : "[memory-cortex] Rebuild failed:", err);
       eventBus.emit(EventType.CORTEX_REBUILD_PROGRESS, {
         chatId,
@@ -425,6 +437,7 @@ function launchTrackedCortexRebuild(
         error: err?.message || (source === "warmup" ? "Warmup failed" : "Rebuild failed"),
       }, userId);
     }).finally(() => {
+      activity.finish(activityStatus);
       // Only clear if we're still the active entry; a preemptor may have already
       // replaced us in the registry.
       if (cortexRebuildsInFlight.get(chatId) === entry) cortexRebuildsInFlight.delete(chatId);
@@ -461,7 +474,7 @@ async function warmLongTermChatMemory(options: {
   }
 
   if (!allowRebuild) {
-    const chat = getChat(userId, chatId);
+    const chat = await getChatAsync(userId, chatId);
     const storedHash = getStoredChatMemoryHash(chat);
     if (currentChatMemoryHash && storedHash !== currentChatMemoryHash) {
       return { status: "skipped", reason: "chat_memory_rebuild_deferred" };
@@ -494,8 +507,10 @@ async function warmLongTermChatMemory(options: {
   return { status: "skipped", reason: "chat_memory_already_fresh" };
 }
 
-async function performChatWarmup(userId: string, chatId: string, force: boolean): Promise<WarmupResponse> {
-  const chat = getChat(userId, chatId);
+async function performChatWarmup(userId: string, chatId: string, force: boolean,
+  timing?: TrackedCortexRebuildOptions["timing"],
+): Promise<WarmupResponse> {
+  const chat = await getChatAsync(userId, chatId);
   if (!chat) {
     return {
       status: "skipped",
@@ -536,7 +551,7 @@ async function performChatWarmup(userId: string, chatId: string, force: boolean)
     currentChatMemoryHash,
   });
 
-  const freshChat = getChat(userId, chatId);
+  const freshChat = await getChatAsync(userId, chatId);
   if (!freshChat) {
     return {
       status: "skipped",
@@ -628,6 +643,7 @@ async function performChatWarmup(userId: string, chatId: string, force: boolean)
                 generateRawFn: sidecar.generateRawFn,
                 sidecarConnectionId: sidecar.sidecarConnectionId,
                 snapshot,
+                timing,
                 ...(force ? {} : { source: "warmup" as const }),
               });
               cortex = { status: "started", reason: force ? "rebuild_started" : "warmup_started" };
@@ -1086,6 +1102,16 @@ app.get("/health", async (c) => {
     );
   }
 
+  const arbitrationEnabled = memoryCortex.shouldReviewCortexCandidates(config);
+  const decisionProfile = config.arbitration.connectionProfileId
+    ? decisionConnectionsSvc.getConnection(userId, config.arbitration.connectionProfileId) : null;
+  const readableDecisionProfile = decisionProfile
+    ? await withReadableApiKeyStatus(userId, decisionProfile, decisionConnectionsSvc.decisionConnectionSecretKey) : null;
+  const arbitrationReady = !arbitrationEnabled || !!readableDecisionProfile?.has_api_key;
+  if (arbitrationEnabled) pushCheck("arbitration_ready", "Candidate review", arbitrationReady ? "pass" : "fail",
+    arbitrationReady ? "The selected reviewer is configured. Live Decision inference is checked during ingestion."
+      : "Candidate review is enabled but its connection or readable credential is missing. Chunks remain pending until review succeeds.");
+
   let sidecarConnectivity: {
     attempted: boolean;
     success: boolean | null;
@@ -1169,7 +1195,7 @@ app.get("/health", async (c) => {
   } | null = null;
 
   if (chatId) {
-    const chat = getChat(userId, chatId);
+    const chat = await getChatAsync(userId, chatId);
     if (!chat) {
       chatReport = {
         id: chatId,
@@ -1343,6 +1369,13 @@ app.get("/health", async (c) => {
       queryGeneration: sidecarEndpoints.queryGeneration,
       memorySummarization: sidecarEndpoints.memorySummarization,
       connectivity: sidecarConnectivity,
+    },
+    arbitration: {
+      enabled: arbitrationEnabled, backend: config.arbitration.backend, ready: arbitrationReady,
+      connectionProfileId: config.arbitration.connectionProfileId,
+      model: config.arbitration.model || decisionProfile?.model || null,
+      minConfidence: config.arbitration.minConfidence, timeoutMs: config.arbitration.timeoutMs,
+      maxInputTokens: config.arbitration.maxInputTokens,
     },
     chat: chatReport,
     checks,
@@ -2053,11 +2086,11 @@ app.get("/chats/:chatId/cortex-stats", (c) => {
 });
 
 /** GET /chats/:chatId/settings — Get the Cortex state for one chat. */
-app.get("/chats/:chatId/settings", (c) => {
+app.get("/chats/:chatId/settings", async (c) => {
   const chatId = c.req.param("chatId");
   const owned = ensureChatOwnership(c, chatId);
   if (!owned.ok) return owned.response;
-  const chat = getChat(owned.userId, chatId)!;
+  const chat = (await getChatAsync(owned.userId, chatId))!;
   const config = memoryCortex.getCortexConfig(owned.userId);
   const chatSettings = isRecord(chat.metadata?.cortex_settings)
     ? chat.metadata.cortex_settings
@@ -2079,14 +2112,14 @@ app.put("/chats/:chatId/settings", async (c) => {
     return c.json({ error: "enabled must be a boolean" }, 400);
   }
 
-  const chat = getChat(owned.userId, chatId)!;
+  const chat = (await getChatAsync(owned.userId, chatId))!;
   const existingSettings = isRecord(chat.metadata?.cortex_settings)
     ? { ...chat.metadata.cortex_settings }
     : {};
   if (body.enabled) delete existingSettings.enabled;
   else existingSettings.enabled = false;
 
-  const updated = chatsSvc.mergeChatMetadata(
+  const updated = await chatsSvc.mergeChatMetadataAsync(
     owned.userId,
     chatId,
     { cortex_settings: Object.keys(existingSettings).length ? existingSettings : undefined },
@@ -2109,26 +2142,46 @@ app.put("/chats/:chatId/settings", async (c) => {
   });
 });
 
+function getChatIngestionSnapshot(chatId: string) {
+  const status = memoryCortex.getIngestionStatus(chatId);
+  const scheduler = getChatPipelineStatus(chatId);
+  return status ? { ...status, scheduler } : {
+    status: "idle", phase: "complete", chatId, chunkId: null,
+    startedAt: null, updatedAt: Date.now(), pendingJobs: 0, timings: null, scheduler,
+  };
+}
+
+function getChatRebuildSnapshot(chatId: string) {
+  return { ...(memoryCortex.getRebuildStatus(chatId) ?? { status: "idle" }), scheduler: getChatPipelineStatus(chatId) };
+}
+
+/** Passive snapshots only. A failed optional section must not hide the others. */
+app.get("/chats/:chatId/status", (c) => {
+  const chatId = c.req.param("chatId");
+  const owned = ensureChatOwnership(c, chatId);
+  if (!owned.ok) return owned.response;
+  const read = <T>(get: () => T): T | null => {
+    try { return get(); } catch { return null; }
+  };
+  return c.json({
+    activity: read(() => getCortexActivity(chatId)),
+    ingestion: read(() => getChatIngestionSnapshot(chatId)),
+    rebuild: read(() => getChatRebuildSnapshot(chatId)),
+  });
+});
+
 app.get("/chats/:chatId/ingestion-status", (c) => {
   const chatId = c.req.param("chatId");
   const owned = ensureChatOwnership(c, chatId);
   if (!owned.ok) return owned.response;
-  const status = memoryCortex.getIngestionStatus(chatId);
-  const scheduler = getChatPipelineStatus(chatId);
-  if (!status) {
-    return c.json({
-      status: "idle",
-      phase: "complete",
-      chatId,
-      chunkId: null,
-      startedAt: null,
-      updatedAt: Date.now(),
-      pendingJobs: 0,
-      timings: null,
-      scheduler,
-    });
-  }
-  return c.json({ ...status, scheduler });
+  return c.json(getChatIngestionSnapshot(chatId));
+});
+
+app.get("/chats/:chatId/activity", (c) => {
+  const chatId = c.req.param("chatId");
+  const owned = ensureChatOwnership(c, chatId);
+  if (!owned.ok) return owned.response;
+  return c.json(getCortexActivity(chatId));
 });
 
 // ─── Rebuild ───────────────────────────────────────────────────
@@ -2138,20 +2191,20 @@ app.get("/chats/:chatId/rebuild-status", (c) => {
   const chatId = c.req.param("chatId");
   const owned = ensureChatOwnership(c, chatId);
   if (!owned.ok) return owned.response;
-  const status = memoryCortex.getRebuildStatus(chatId);
-  const scheduler = getChatPipelineStatus(chatId);
-  if (!status) return c.json({ status: "idle", scheduler });
-  return c.json({ ...status, scheduler });
+  return c.json(getChatRebuildSnapshot(chatId));
 });
 
 /** POST /chats/:chatId/rebuild — Rebuild cortex from canonical chunks.
  *  Returns immediately with { status: "started" }. Progress is streamed via
  *  CORTEX_REBUILD_PROGRESS WebSocket events. Final result sent as status: "complete". */
 app.post("/chats/:chatId/rebuild", async (c) => {
+  const requestedAt = Date.now();
   const userId = c.get("userId");
   const chatId = c.req.param("chatId");
+  const body = await c.req.json().catch(() => ({}));
+  const timing = readCortexRequestTiming(body, requestedAt);
 
-  const chat = getChat(userId, chatId);
+  const chat = await getChatAsync(userId, chatId);
   if (!chat) return c.json({ error: "Chat not found" }, 404);
 
   const cortexConfig = memoryCortex.getCortexConfig(userId);
@@ -2177,17 +2230,19 @@ app.post("/chats/:chatId/rebuild", async (c) => {
     generateRawFn: sidecar.generateRawFn,
     sidecarConnectionId: sidecar.sidecarConnectionId,
     snapshot,
+    timing,
   });
 
-  return c.json({ status: "started", chatId });
+  return c.json({ status: "started", chatId, activity: getCortexActivity(chatId) });
 });
 
 app.post("/chats/:chatId/warm", async (c) => {
+  const requestedAt = Date.now();
   const userId = c.get("userId");
   const chatId = c.req.param("chatId");
   const body = await c.req.json().catch(() => ({})) as { force?: boolean };
   const force = body.force === true;
-  const chat = getChat(userId, chatId);
+  const chat = await getChatAsync(userId, chatId);
   if (!chat) return c.json({ error: "Chat not found" }, 404);
 
   if (!force) {
@@ -2201,7 +2256,8 @@ app.post("/chats/:chatId/warm", async (c) => {
     } satisfies WarmupResponse);
   }
 
-  return c.json(await performChatWarmup(userId, chatId, true));
+  const result = await performChatWarmup(userId, chatId, true, readCortexRequestTiming(body, requestedAt));
+  return c.json({ ...result, activity: getCortexActivity(chatId) });
 });
 
 // ─── Heuristics Engine Migration ──────────────────────────────
@@ -2213,7 +2269,7 @@ app.post("/chats/:chatId/warm", async (c) => {
  */
 app.post("/chats/:chatId/migrate-heuristics", async (c) => {
   const chatId = c.req.param("chatId");
-  const chat = getChat(c.get("userId"), chatId);
+  const chat = await getChatAsync(c.get("userId"), chatId);
   if (!chat) return c.json({ error: "Chat not found" }, 404);
 
   const result = memoryCortex.runHeuristicsMigration(chatId, (step, count) => {
@@ -2273,7 +2329,7 @@ app.post("/vaults", async (c) => {
   if (!chatId || !name) {
     return c.json({ error: "chatId and name are required" }, 400);
   }
-  const chat = getChat(userId, chatId);
+  const chat = await getChatAsync(userId, chatId);
   if (!chat) return c.json({ error: "Chat not found" }, 404);
 
   try {
@@ -2350,7 +2406,7 @@ app.post("/vaults/:id/reindex", async (c) => {
 app.post("/chats/:chatId/links", async (c) => {
   const userId = c.get("userId");
   const chatId = c.req.param("chatId");
-  const chat = getChat(userId, chatId);
+  const chat = await getChatAsync(userId, chatId);
   if (!chat) return c.json({ error: "Chat not found" }, 404);
 
   let body: unknown;

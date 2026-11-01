@@ -26,6 +26,8 @@ import { EventType } from "../../ws/events";
 import { getDb } from "../../db/connection";
 import { env } from "../../env";
 import { getEmbeddingConfig } from "../embeddings.service";
+import { getResolvedVectorStoreConfig } from "../vector-store-config.service";
+import { loadLanceDb } from "../../lancedb-preflight";
 import {
   TABLE_REGISTRY,
   VIA_CHAT_TABLES,
@@ -432,9 +434,10 @@ async function exportLancedbVectors(
   onProgress: (table: string, count: number) => void,
 ): Promise<{ counts: Record<string, number> }> {
   const counts: Record<string, number> = {};
+  if (getResolvedVectorStoreConfig().provider !== "lancedb") return { counts };
   let lance: any;
   try {
-    lance = await import("@lancedb/lancedb");
+    lance = await loadLanceDb();
   } catch {
     return { counts };
   }
@@ -571,6 +574,17 @@ async function runExport(
   });
 
   const sink = makeControllerSink(controller);
+  sink.on("error", (err) => {
+    // A disconnected or errored Web stream can reject queued ZIP chunks.
+    // Handle the Node stream error and stop producing the abandoned archive.
+    fatalErr = err;
+    archive.abort();
+    try {
+      controller.error(err);
+    } catch {
+      /* already errored */
+    }
+  });
   archive.pipe(sink);
 
   // Snapshot of the embedding config (drives import-side compatibility check).
@@ -623,42 +637,48 @@ async function runExport(
     const stmt = getDb().prepare(built.sql);
     emitProgress(userId, { phase: "table_start", table: spec.table });
 
-    for (const raw of stmt.iterate(...built.params) as Iterable<Record<string, any>>) {
-      if (signal?.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
+    try {
+      for (const raw of stmt.iterate(...built.params) as Iterable<Record<string, any>>) {
+        if (signal?.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
 
-      // Drop secret-looking settings rows defensively.
-      if (spec.table === "settings" && isSecretSettingKey(String(raw.key ?? ""))) continue;
+        // Drop secret-looking settings rows defensively.
+        if (spec.table === "settings" && isSecretSettingKey(String(raw.key ?? ""))) continue;
 
-      const scrubbed = scrubRow(raw, spec.scrubColumns);
-      entry.write(scrubbed);
-      rowsOut++;
+        const scrubbed = scrubRow(raw, spec.scrubColumns);
+        entry.write(scrubbed);
+        rowsOut++;
 
-      // Collect file references for later streaming.
-      if (spec.fileRefs) {
-        for (const ref of spec.fileRefs) {
-          const paths = ref.resolve(raw, env.dataDir);
-          for (const abs of paths) {
-            const inner = ref.archivePath ? ref.archivePath(raw, abs) : basename(abs);
-            fileQueue.push({
-              absolutePath: abs,
-              archivePath: `files/${ref.bucket}/${inner}`,
-            });
+        // Collect file references for later streaming.
+        if (spec.fileRefs) {
+          for (const ref of spec.fileRefs) {
+            const paths = ref.resolve(raw, env.dataDir);
+            for (const abs of paths) {
+              const inner = ref.archivePath ? ref.archivePath(raw, abs) : basename(abs);
+              fileQueue.push({
+                absolutePath: abs,
+                archivePath: `files/${ref.bucket}/${inner}`,
+              });
+            }
           }
         }
-      }
 
-      if (rowsOut % YIELD_INTERVAL_ROWS === 0) {
-        const now = Date.now();
-        if (now - lastEmittedAt >= 100) {
-          emitProgress(userId, {
-            phase: "table",
-            table: spec.table,
-            processed: rowsOut,
-          });
-          lastEmittedAt = now;
+        if (rowsOut % YIELD_INTERVAL_ROWS === 0) {
+          const now = Date.now();
+          if (now - lastEmittedAt >= 100) {
+            emitProgress(userId, {
+              phase: "table",
+              table: spec.table,
+              processed: rowsOut,
+            });
+            lastEmittedAt = now;
+          }
+          await yieldAndCheck(signal);
         }
-        await yieldAndCheck(signal);
       }
+    } finally {
+      // Bun iterators can retain their WAL read snapshot on early exit.
+      // Release it deterministically on cancellation and serialization errors.
+      stmt.finalize();
     }
 
     counts[spec.table] = entry.close();
@@ -680,22 +700,26 @@ async function runExport(
     const stmt = getDb().prepare(built.sql);
     emitProgress(userId, { phase: "table_start", table });
 
-    for (const raw of stmt.iterate(...built.params) as Iterable<Record<string, any>>) {
-      if (signal?.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
-      entry.write(raw);
-      rowsOut++;
-      if (rowsOut % YIELD_INTERVAL_ROWS === 0) {
-        const now = Date.now();
-        if (now - lastEmittedAt >= 100) {
-          emitProgress(userId, {
-            phase: "table",
-            table,
-            processed: rowsOut,
-          });
-          lastEmittedAt = now;
+    try {
+      for (const raw of stmt.iterate(...built.params) as Iterable<Record<string, any>>) {
+        if (signal?.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
+        entry.write(raw);
+        rowsOut++;
+        if (rowsOut % YIELD_INTERVAL_ROWS === 0) {
+          const now = Date.now();
+          if (now - lastEmittedAt >= 100) {
+            emitProgress(userId, {
+              phase: "table",
+              table,
+              processed: rowsOut,
+            });
+            lastEmittedAt = now;
+          }
+          await yieldAndCheck(signal);
         }
-        await yieldAndCheck(signal);
       }
+    } finally {
+      stmt.finalize();
     }
 
     counts[table] = entry.close();
@@ -716,22 +740,26 @@ async function runExport(
     const stmt = getDb().prepare(sql);
     emitProgress(userId, { phase: "table_start", table });
 
-    for (const raw of stmt.iterate(userId) as Iterable<Record<string, any>>) {
-      if (signal?.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
-      entry.write(raw);
-      rowsOut++;
-      if (rowsOut % YIELD_INTERVAL_ROWS === 0) {
-        const now = Date.now();
-        if (now - lastEmittedAt >= 100) {
-          emitProgress(userId, {
-            phase: "table",
-            table,
-            processed: rowsOut,
-          });
-          lastEmittedAt = now;
+    try {
+      for (const raw of stmt.iterate(userId) as Iterable<Record<string, any>>) {
+        if (signal?.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
+        entry.write(raw);
+        rowsOut++;
+        if (rowsOut % YIELD_INTERVAL_ROWS === 0) {
+          const now = Date.now();
+          if (now - lastEmittedAt >= 100) {
+            emitProgress(userId, {
+              phase: "table",
+              table,
+              processed: rowsOut,
+            });
+            lastEmittedAt = now;
+          }
+          await yieldAndCheck(signal);
         }
-        await yieldAndCheck(signal);
       }
+    } finally {
+      stmt.finalize();
     }
 
     counts[table] = entry.close();

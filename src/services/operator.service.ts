@@ -1,21 +1,18 @@
 import { RingBuffer } from "../utils/ring-buffer";
+import { formatLogArguments } from "../utils/log-format";
 import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
 import { env } from "../env";
 import type { LogEntry, OperatorStatus, IPCMessage, OperatorIpcReason } from "../types/operator";
 import { getDatabasePath, getDb } from "../db/connection";
 import {
-  collectDatabaseStats,
   getDatabaseMaintenanceSettingKey,
   getDatabaseMaintenanceStateSettingKey,
   getDatabaseTuningSettingKey,
-  readDatabaseMaintenanceSettings,
-  readDatabaseMaintenanceState,
-  readDatabaseTuningSettings,
-  resolveDatabaseTuning,
-  runDatabaseMaintenance,
   type WalCheckpointMode,
 } from "../db/maintenance";
+import { executeDatabaseOperation, getDatabaseExecutionStatus, runDatabaseMaintenanceAsync } from "../db/execution";
+import type { DatabaseSnapshot } from "../db/execution-protocol";
 import { getAutomaticDatabaseMaintenanceStatus } from "../db/maintenance-scheduler";
 import { getGitMetadata } from "../utils/git-metadata";
 import {
@@ -82,11 +79,16 @@ class OperatorService {
 
   private interceptConsole(): void {
     const origLog = console.log;
+    const origInfo = console.info;
     const origWarn = console.warn;
     const origError = console.error;
 
     console.log = (...args: any[]) => {
       origLog(...args);
+      this.captureEntry("stdout", args);
+    };
+    console.info = (...args: any[]) => {
+      origInfo(...args);
       this.captureEntry("stdout", args);
     };
     console.warn = (...args: any[]) => {
@@ -99,10 +101,8 @@ class OperatorService {
     };
   }
 
-  private captureEntry(source: "stdout" | "stderr", args: any[]): void {
-    const text = args
-      .map((a) => (typeof a === "string" ? a : JSON.stringify(a)))
-      .join(" ");
+  private captureEntry(source: "stdout" | "stderr", args: unknown[]): void {
+    const text = formatLogArguments(args);
     const entry: LogEntry = { timestamp: Date.now(), source, text };
     this.logBuffer.push(entry);
 
@@ -185,12 +185,9 @@ class OperatorService {
   async getDatabaseStatus(userId: string) {
     const db = getDb();
     const dbPath = getDatabasePath();
-    const stats = collectDatabaseStats(db, dbPath);
-    const configuredSettings = readDatabaseTuningSettings(db, userId);
-    const maintenanceSettings = readDatabaseMaintenanceSettings(db, userId);
-    const maintenanceState = readDatabaseMaintenanceState(db, userId);
-    const effectiveTuning = resolveDatabaseTuning(stats, db, userId);
-    const automaticMaintenance = await getAutomaticDatabaseMaintenanceStatus(db, userId, dbPath, this.busy);
+    const snapshot = await executeDatabaseOperation<DatabaseSnapshot>({ kind: "snapshot", userId });
+    const { stats, configuredSettings, maintenanceSettings, maintenanceState, effectiveTuning } = snapshot;
+    const automaticMaintenance = await getAutomaticDatabaseMaintenanceStatus(db, userId, dbPath, this.busy, snapshot);
 
     return {
       settingsKey: getDatabaseTuningSettingKey(),
@@ -207,6 +204,7 @@ class OperatorService {
         mmapSizeBytes: effectiveTuning.mmapSizeBytes,
       },
       automaticMaintenance,
+      execution: getDatabaseExecutionStatus(),
     };
   }
 
@@ -221,8 +219,7 @@ class OperatorService {
     }
   ) {
     return this.runOperation("database-maintenance", async () => {
-      return runDatabaseMaintenance(getDb(), {
-        dbPath: getDatabasePath(),
+      return runDatabaseMaintenanceAsync({
         userId,
         optimize: options.optimize,
         analyze: options.analyze,

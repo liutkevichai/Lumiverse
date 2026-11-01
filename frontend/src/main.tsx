@@ -1,14 +1,17 @@
+import { getTauriMobilePlatform, hasTauriDesktopBridge, isTauriMobile } from '@/lib/desktopWebView'
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { RouterProvider } from 'react-router'
 import { initI18n } from '@/i18n'
 import { registerSW } from 'virtual:pwa-register'
-import { getSafeInAppNavigationUrl } from './lib/navigationSafety'
+import { navigateFromNotification } from './lib/notificationNavigation'
 import { installWindowOpenGuard } from './lib/windowOpenGuard'
-import { computeViewportKeyboardInset } from './lib/viewportKeyboardInset'
-import { usesNativeWidgetTouchScroll } from './lib/spindle/widget-touch-scroll'
+import { computeVisibleViewport, computeViewportKeyboardInset } from './lib/viewportKeyboardInset'
+import { KEYBOARD_VIEWPORT_EVENT } from './lib/keyboardViewport'
+import { installIOSTouchScrollGuard, preventPageTouchZoom } from './lib/iosTouchScroll'
 import { installKeyboardFocusReveal } from './lib/keyboardFocusReveal'
 import { installIOSKeyboardScrollGuard } from './lib/iosKeyboardScroll'
+import { subscribeIOSNativeViewport } from './lib/iosNativeViewport'
 import { installIOSEditableFocusScrollPrevention } from './lib/iosEditableFocus'
 import { rememberRegistration } from './lib/swUpdater'
 import { claimServiceWorkerReload } from './lib/swUpdatePolicy'
@@ -16,13 +19,16 @@ import { installPwaLifecycleDiagnostics } from './lib/pwaLifecycleDiagnostics'
 import { initializeSafeThemeMode } from './lib/safeThemeMode'
 import { installDisplayPerformanceTelemetry, markDisplayInteractive, markDisplayMilestone } from './lib/displayPerformance'
 import { router } from './router'
+import { installAppNavigation } from './lib/app-navigation'
 import { installStreamDeckHandoffReceiver } from './lib/streamDeckHandoff'
 import ErrorBoundary from './components/shared/ErrorBoundary'
 import './theme/variables.css'
 import './theme/reset.css'
 import './theme/global.css'
+import { reportNativeCacheReady } from './lib/nativeCache'
 
 installDisplayPerformanceTelemetry('application')
+installAppNavigation(router.navigate)
 installWindowOpenGuard()
 installPwaLifecycleDiagnostics()
 installStreamDeckHandoffReceiver(path => { void router.navigate(path) })
@@ -64,7 +70,7 @@ registerSW({
 // Navigate when a push notification is clicked (SW posts NAVIGATE message)
 navigator.serviceWorker?.addEventListener('message', (event) => {
   if (event.data?.type === 'NAVIGATE') {
-    router.navigate(getSafeInAppNavigationUrl(event.data.url))
+    navigateFromNotification(window.location.href, event.data.url, path => { void router.navigate(path) })
   }
 })
 
@@ -89,6 +95,7 @@ const KEYBOARD_MIN_INSET = 80
 // occludes the bottom controls enough to trigger scroll bounce if ignored.
 const IOS_PWA_ACCESSORY_MIN_INSET = 44
 const isIOSStandalonePwa = (window.navigator as any).standalone === true && navigator.maxTouchPoints > 0
+const isIOSStandaloneClient = isIOSStandalonePwa || getTauriMobilePlatform() === 'ios'
 
 function isEditableElement(el: EventTarget | Element | null): boolean {
   return (
@@ -114,6 +121,7 @@ const initialFullHeight = window.visualViewport
 const startedPortrait = window.matchMedia('(orientation: portrait)').matches
 let basePortrait = startedPortrait ? initialFullHeight : 0
 let baseLandscape = startedPortrait ? 0 : initialFullHeight
+let nativeIOSHeight: number | undefined
 
 function syncViewportVars() {
   const root = document.documentElement
@@ -139,30 +147,48 @@ function syncViewportVars() {
   if (!keyboardActive && height > base) base = height
   if (isPortrait) basePortrait = base
   else baseLandscape = base
+  // Native bounds include safe areas and can shrink on an iPad window resize.
+  // Do not let an older WebKit's shortened visual viewport become the full
+  // height, or retain the previous window's maximum after resizing.
+  const fullHeight = nativeIOSHeight ?? base
 
   // Standalone iOS composers prevent native focus scrolling, and the guard
   // below recovers real document scrolling. WebKit can still report transient
   // or stale offsetTop values; do not subtract those from keyboard clearance.
   const keyboardInsetBottom = computeViewportKeyboardInset({
-    fullHeight: base,
+    fullHeight,
     viewportHeight: height,
     offsetTop,
     keyboardActive,
-    ignoreOffsetTop: isIOSStandalonePwa,
+    ignoreOffsetTop: isIOSStandaloneClient,
     keyboardMinInset: KEYBOARD_MIN_INSET,
-    accessoryMinInset: isIOSStandalonePwa ? IOS_PWA_ACCESSORY_MIN_INSET : KEYBOARD_MIN_INSET,
+    accessoryMinInset: isIOSStandaloneClient ? IOS_PWA_ACCESSORY_MIN_INSET : KEYBOARD_MIN_INSET,
+  })
+  const visibleViewport = computeVisibleViewport({
+    fullHeight,
+    viewportHeight: viewport?.height ?? window.innerHeight,
+    offsetTop: viewport?.offsetTop ?? 0,
+    scale,
+    keyboardInsetBottom,
+    isIOSStandaloneClient,
   })
 
   root.style.setProperty('--app-viewport-width', `${width}px`)
-  root.style.setProperty('--app-viewport-height', `${height}px`)
-  root.style.setProperty('--app-viewport-offset-top', `${offsetTop}px`)
+  root.style.setProperty('--app-viewport-height', `${Math.round(visibleViewport.height * scale)}px`)
+  root.style.setProperty('--app-viewport-offset-top', `${zoomed ? 0 : Math.round(visibleViewport.offsetTop)}px`)
   root.style.setProperty('--app-viewport-offset-left', `${offsetLeft}px`)
   root.style.setProperty('--app-visual-viewport-width', `${Math.round(viewport?.width ?? window.innerWidth)}px`)
-  root.style.setProperty('--app-visual-viewport-height', `${Math.round(viewport?.height ?? window.innerHeight)}px`)
-  root.style.setProperty('--app-visual-viewport-offset-top', `${Math.round(viewport?.offsetTop ?? 0)}px`)
+  root.style.setProperty('--app-visual-viewport-height', `${Math.round(visibleViewport.height)}px`)
+  root.style.setProperty('--app-visual-viewport-offset-top', `${Math.round(visibleViewport.offsetTop)}px`)
   root.style.setProperty('--app-visual-viewport-offset-left', `${Math.round(viewport?.offsetLeft ?? 0)}px`)
   root.style.setProperty('--app-keyboard-inset-bottom', `${keyboardInsetBottom}px`)
   root.style.setProperty('--app-screen-height', `${Math.round(window.innerHeight)}px`)
+  // Android resizes the WebView for chat, but fullscreen editors keep their
+  // original frame and scroll the caret within the keyboard-visible portion.
+  if (getTauriMobilePlatform() === 'android') {
+    root.style.setProperty('--app-fullscreen-height', `${Math.round(base || height)}px`)
+  }
+  window.dispatchEvent(new Event(KEYBOARD_VIEWPORT_EVENT))
 }
 
 let viewportSyncFrame = 0
@@ -179,6 +205,11 @@ function scheduleViewportSync() {
     syncViewportVars()
   })
 }
+
+subscribeIOSNativeViewport(height => {
+  nativeIOSHeight = height
+  scheduleViewportSync()
+})
 
 scheduleViewportSync()
 window.addEventListener('resize', scheduleViewportSync, { passive: true })
@@ -215,29 +246,13 @@ document.addEventListener('focusout', () => {
   }, 120)
 }, { passive: true })
 
-// Utility: walk up the DOM to find the nearest ancestor that is currently
-// scrollable (has overflow AND content exceeds container). Used by the
-// overscroll prevention touch handler. Returns the element and whether it
-// scrolls horizontally (so the touch handler can let horizontal swipes through).
-function findScrollableAncestor(el: HTMLElement | null): { el: HTMLElement; horizontal: boolean } | null {
-  while (el && el !== document.body && el !== document.documentElement) {
-    const style = getComputedStyle(el)
-    const scrollableY = (style.overflowY === 'auto' || style.overflowY === 'scroll') && el.scrollHeight > el.clientHeight
-    const scrollableX = (style.overflowX === 'auto' || style.overflowX === 'scroll') && el.scrollWidth > el.clientWidth
-    if (scrollableY || scrollableX) {
-      return { el, horizontal: scrollableX && !scrollableY }
-    }
-    el = el.parentElement
-  }
-  return null
-}
-
 // Composers and editors prevent native focus from panning the whole shell.
 // Fields retain native caret placement; their scroll containers own revealing.
 // Recover only real document scrolling, without resetting stale viewport offsets.
-if (isIOSStandalonePwa) {
+if (isIOSStandaloneClient) {
   installIOSEditableFocusScrollPrevention()
   installIOSKeyboardScrollGuard()
+  installKeyboardFocusReveal()
 }
 
 // Flag standalone PWA mode for CSS targeting.
@@ -248,7 +263,9 @@ const isStandalone =
   window.matchMedia('(display-mode: window-controls-overlay)').matches ||
   (window.navigator as any).standalone === true
 
-if (/^Mac/.test(navigator.platform) && navigator.maxTouchPoints === 0) {
+if (isTauriMobile()) {
+  document.documentElement.setAttribute('data-platform', getTauriMobilePlatform() || 'android')
+} else if (/^Mac/.test(navigator.platform) && navigator.maxTouchPoints === 0) {
   document.documentElement.setAttribute('data-platform', 'macos')
 } else if (/^Linux/.test(navigator.platform)) {
   document.documentElement.setAttribute('data-platform', 'linux')
@@ -264,7 +281,7 @@ if (isIOS) {
 // Mark the native dashboard WebView for desktop-specific behavior. The Tauri
 // window is frameless on every desktop platform, so the HTML titlebar owns its
 // drag surface and window controls outside browser PWA display-mode queries.
-if ('__TAURI_INTERNALS__' in window) {
+if (hasTauriDesktopBridge()) {
   document.documentElement.setAttribute('data-tauri-desktop', '')
   if (new URLSearchParams(window.location.search).has('desktopWidgetExtension')) {
     document.documentElement.setAttribute('data-tauri-floating-widget', '')
@@ -315,9 +332,7 @@ if (!isWebKit) {
 // handles these same events when enabled; native page zoom breaks app layout.
 document.addEventListener('gesturestart', (event) => event.preventDefault(), { passive: false })
 document.addEventListener('gesturechange', (event) => event.preventDefault(), { passive: false })
-document.addEventListener('touchmove', (event) => {
-  if (event.touches.length > 1) event.preventDefault()
-}, { passive: false })
+document.addEventListener('touchmove', preventPageTouchZoom, { passive: false })
 
 // Keep native desktop page zoom suppressed, including when the optional
 // viewport zoom setting is off. The controller handles ctrl-wheel when on.
@@ -333,53 +348,11 @@ document.addEventListener('wheel', (e) => {
 // 2. Bug #240860 — body with overflow:hidden becomes scrollable when the
 //    visual viewport is smaller than the layout viewport (keyboard open),
 //    causing scroll containers to fight with body scroll.
-// Fix: intercept single-finger touchmove at document level. Allow scrolling
-// within scrollable containers, but prevent the default (which triggers
-// page-level overscroll) at scroll boundaries and outside scroll containers.
-if ((window.navigator as any).standalone === true && navigator.maxTouchPoints > 0) {
-  let touchStartY = 0
-  let touchStartX = 0
-  let scrollTarget: { el: HTMLElement; horizontal: boolean } | null = null
-
-  document.addEventListener('touchstart', (e) => {
-    if (e.touches.length === 1) {
-      touchStartY = e.touches[0].clientY
-      touchStartX = e.touches[0].clientX
-      scrollTarget = findScrollableAncestor(e.target as HTMLElement)
-    }
-  }, { passive: true })
-
-  document.addEventListener('touchmove', (e) => {
-    if (e.touches.length !== 1) return
-    // Only an explicitly opted-in live widget owns its single-finger scrolling.
-    if (usesNativeWidgetTouchScroll(e)) return
-    // Let the browser pan the magnified page.
-    if (Math.abs((window.visualViewport?.scale ?? 1) - 1) > 0.01) return
-
-    const deltaY = touchStartY - e.touches[0].clientY
-    const deltaX = touchStartX - e.touches[0].clientX
-
-    // Don't interfere with horizontal scrolling (carousels, tab bars, sliders)
-    if (Math.abs(deltaX) > Math.abs(deltaY) + 5) return
-
-    // Touch started inside a horizontal-only scroll container — let it through
-    if (scrollTarget?.horizontal) return
-
-    if (scrollTarget) {
-      const { el } = scrollTarget
-      const atTop = el.scrollTop <= 0 && deltaY < 0
-      const atBottom =
-        el.scrollTop + el.clientHeight >=
-        el.scrollHeight - 1 && deltaY > 0
-      if (atTop || atBottom) e.preventDefault()
-    } else {
-      e.preventDefault()
-    }
-  }, { passive: false })
-
-  // Ordinary fields need ancestor scrolling because PWA viewport panning is
-  // suppressed. Bounded editors retain native caret/scroll ownership.
-  installKeyboardFocusReveal()
+// Fix: intercept finger swipes at document level, allowing scrolling inside
+// containers but preventing page overscroll at their boundaries. Pencil input
+// and small tap movements must retain native click/focus behavior.
+if (isIOSStandalonePwa) {
+  installIOSTouchScrollGuard()
 }
 
 // ── Mobile layout recovery after native popups / backgrounding ──
@@ -425,4 +398,5 @@ void Promise.all([initI18n(), initializeSafeThemeMode()]).then(() => {
     </StrictMode>,
   )
   markDisplayInteractive()
+  reportNativeCacheReady()
 })

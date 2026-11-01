@@ -96,6 +96,7 @@ For form components, the host commits the next value before invoking `onChange`,
 | `mountNumericInput` | Validated number input with optional empty state |
 | `mountNumberStepper` | Number input with +/− buttons |
 | `mountRangeSlider` | Touch-friendly slider with optional label, hint, and formatted value display |
+| `mountDualRangeSlider` | Touch-friendly two-handle interval slider with optional label, hint, and formatted range display |
 | `mountCheckbox` | Standard checkbox with optional label and hint |
 | `mountSwitch` | Toggle switch |
 | `mountSelect` | Searchable single-select dropdown |
@@ -307,6 +308,54 @@ In addition to the [shared handle methods](#shared-handle-shape):
 |---|---|---|
 | `getValue()` | `number` | The current committed value. |
 
+### Dual range slider
+
+A two-handle interval slider built on the same track, snapping, and mobile touch model as `mountRangeSlider`. The active handle is clamped so `start <= end`, and each handle supports keyboard navigation (`ArrowLeft`/`ArrowRight`/`ArrowUp`/`ArrowDown`/`Home`/`End`).
+
+```ts
+const windowRange = ctx.components.mountDualRangeSlider(target, {
+  label: 'Context window',
+  min: 0,
+  max: 100,
+  step: 5,
+  value: [20, 80],
+  format: { suffix: '%' },
+  startLabel: 'Window start',
+  endLabel: 'Window end',
+  onCommit: ([start, end]) => ctx.sendToBackend({ type: 'set_window', start, end }),
+})
+
+windowRange.update({ value: [10, 60] })
+const [start, end] = windowRange.getValue()
+```
+
+#### SpindleDualRangeSliderOptions
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `min` | `number` | — | **Required.** Inclusive lower bound. |
+| `max` | `number` | — | **Required.** Inclusive upper bound. |
+| `value` | `readonly [number, number]` | `[min, max]` | Initial committed `[start, end]` range. |
+| `step` | `number` | `1` | Snap increment. |
+| `integer` | `boolean` | `false` | Round endpoints to integers regardless of `step` formatting. |
+| `onCommit` | `(v: [number, number]) => void` | — | Fired once when a drag or keyboard adjustment commits a new range. |
+| `onDragValue` | `(v: [number, number] \| null) => void` | — | Fired with the live `[start, end]` range during a drag, and with `null` if cancelled without committing. |
+| `label` | `string` | — | If set, renders a header above the track with the label and live formatted range. |
+| `hint` | `string` | — | Helper text under the header. Ignored if `label` is omitted. |
+| `format` | `SpindleRangeSliderFormat` | — | Declarative formatting applied to each endpoint in the header. Ignored if `label` is omitted. |
+| `startLabel` | `string` | `'Start'` | Accessible label for the start handle. |
+| `endLabel` | `string` | `'End'` | Accessible label for the end handle. |
+| `disabled` | `boolean` | `false` | Dim the track and ignore input. |
+| `className` | `string` | — | Additional CSS class merged onto the track area. |
+
+#### SpindleDualRangeSliderHandle
+
+In addition to the [shared handle methods](#shared-handle-shape):
+
+| Method | Returns | Description |
+|---|---|---|
+| `getValue()` | `[number, number]` | Detached `[start, end]` snapshot of the current committed range. |
+
 ## Boolean inputs
 
 ```ts
@@ -376,6 +425,15 @@ const picker = ctx.components.mountSelect(target, {
 | `placeholder` | `string` | — | Placeholder text when no value is selected |
 | `searchPlaceholder` | `string` | — | Placeholder for the search input |
 | `searchThreshold` | `number` | `8` | Minimum option count before the search input is shown |
+| `forceSearch` | `boolean` | `false` | Always show the search field |
+| `onSearchChange` | `(query: string) => void` | — | Search text changed, including the initial empty query |
+| `remoteSearch` | `boolean` | `false` | Caller filters the options; skip local filtering |
+| `loading` | `boolean` | `false` | An incremental page is loading |
+| `hasMore` | `boolean` | `false` | More options are available |
+| `onLoadMore` | `() => void` | — | Request the next page |
+| `loadMoreOnScroll` | `boolean` | `false` | Request a page near the scroll boundary; retain the accessible load button |
+| `loadingMessage` | `string` | localized | Message while loading |
+| `loadMoreLabel` | `string` | localized | Accessible load/retry button label |
 | `emptyMessage` | `string` | — | Message when no options were supplied |
 | `noResultsMessage` | `string` | — | Message when the search query has no matches |
 | `triggerLabel` | `string` | — | Force a trigger label (e.g. `"+ Add"`), ignoring current selection |
@@ -388,6 +446,8 @@ const picker = ctx.components.mountSelect(target, {
 | `minWidth` | `number` | — | Minimum dropdown width in CSS pixels |
 | `disabled` | `boolean` | `false` | Disable interaction |
 | `className` | `string` | — | Additional CSS class on the wrapper |
+
+Incremental options require frontend capability `shared-select-pagination-v1`. Both single and multi selects support them. Debounce remote searches in the caller, discard stale responses, guard overlapping loads, and set `hasMore: false` at the end. Preserve the selected option in `options` while paging or searching so its trigger label and leading image remain available. Call `handle.update()` with new options and loading state. Automatic scrolling requests each displayed page once; the load button remains usable for keyboard access and retrying a failed page.
 
 Single-select also accepts:
 

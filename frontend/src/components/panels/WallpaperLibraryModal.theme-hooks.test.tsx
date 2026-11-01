@@ -11,7 +11,7 @@ const replacements = { window: dom.window, document: dom.window.document, naviga
 const previous = Object.fromEntries(Object.keys(replacements).map((key) => [key, globals[key]]))
 Object.assign(globals, replacements)
 
-const t = (key: string) => key
+const t = (key: string, options?: { scope?: string }) => options?.scope ? `${key}: ${options.scope}` : key
 // Bun does not compile CSS modules; retain representative class names in this DOM fixture.
 const cssClasses = ['modal', 'closeBtnPos', 'header', 'headerCopy', 'title', 'subtitle', 'count', 'error', 'scrollArea', 'state', 'grid', 'card', 'cardCurrent', 'thumb', 'thumbImage', 'thumbPlaceholder', 'placeholderLabel', 'badge', 'currentBadge', 'meta', 'filename', 'metaRow', 'metaLabel', 'metaValue', 'cardActions', 'applyBtn', 'deleteBtn', 'footer', 'loadMoreBtn']
 mock.module('./WallpaperLibraryModal.module.css', () => ({ default: Object.fromEntries(cssClasses.map((name) => [name, `fixture_${name}`])) }))
@@ -81,6 +81,24 @@ test('scopes all card surfaces inside the actual portal and preserves selection 
   expect(onClose).toHaveBeenCalledTimes(2)
 })
 
+test('labels the mobile scope and selects a video for the mobile override', async () => {
+  const onSelect = mock(async () => {})
+  await render(<WallpaperLibraryModal isOpen target="mobile" currentImageId="video" onSelect={onSelect} onClose={() => {}} />)
+  expect(document.querySelector('[data-part="subtitle"]')?.textContent).toContain('wallpaperPanel.mobileWallpaper')
+  const current = document.querySelector('[data-part="card"][data-current="true"]')!
+  await act(async () => (current.querySelector('[data-part="apply"]') as HTMLButtonElement).click())
+  expect(onSelect).toHaveBeenCalledWith({ image_id: 'video', type: 'video' })
+})
+
+test('labels the chat mobile scope and applies its selected image', async () => {
+  const onSelect = mock(async () => {})
+  await render(<WallpaperLibraryModal isOpen target="chat-mobile" currentImageId="image" onSelect={onSelect} onClose={() => {}} />)
+  expect(document.querySelector('[data-part="subtitle"]')?.textContent).toContain('wallpaperPanel.chatMobileWallpaper')
+  const current = document.querySelector('[data-part="card"][data-current="true"]')!
+  await act(async () => (current.querySelector('[data-part="apply"]') as HTMLButtonElement).click())
+  expect(onSelect).toHaveBeenCalledWith({ image_id: 'image', type: 'image' })
+})
+
 test('keeps loading, empty and error states addressable across reopening', async () => {
   let finish: (result: { data: Image[], total: number }) => void
   listWallpapers.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
@@ -107,8 +125,8 @@ test('preserves fullscreen sizing and classes alongside optional portal theme ho
   const modal = document.querySelector('[data-component="FullscreenFixture"]') as HTMLElement
   expect(modal.classList.contains('fixture_fullscreenModal')).toBe(true)
   expect(modal.classList.contains('fixture_scrollable')).toBe(true)
-  expect(modal.style.maxWidth).toBe('')
-  expect(modal.style.maxHeight).toBe('')
+  expect(modal.style.maxWidth).toBe('none')
+  expect(modal.style.maxHeight).toBe('none')
   expect(modal.parentElement?.classList.contains('fixture_fullscreenBackdrop')).toBe(true)
   expect(modal.parentElement?.getAttribute('data-modal')).toBe('FullscreenFixture')
 })

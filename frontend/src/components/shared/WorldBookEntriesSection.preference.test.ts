@@ -8,6 +8,7 @@ mock.module('@/lib/i18n/loomOptionLabels', () => ({ useLoomOptionLabels: () => (
 mock.module('@/lib/dndUiScale', () => ({
   DndContext: ({ children }: { children?: unknown }) => children,
   useScaledSortableStyle: (input: unknown) => input,
+  useScaledSortable: () => ({ attributes: {}, listeners: {}, setNodeRef: noop, style: {}, isDragging: false }),
 }))
 mock.module('@/hooks/useScrollGate', () => ({ useScrollGate: noop }))
 mock.module('@/hooks/useIsMobile', () => ({ default: () => false }))
@@ -25,6 +26,7 @@ mock.module('@/components/shared/Pagination', () => ({ default: noop }))
 mock.module('@/store', () => ({ useStore: () => ({}) }))
 mock.module('@/lib/clearableSearch', () => ({ clearSearchOnEscape: noop }))
 mock.module('@dnd-kit/core', () => ({
+  useDndContext: () => ({ active: null }),
   DndContext: noop, MouseSensor: noop, TouchSensor: noop, KeyboardSensor: noop, DragOverlay: noop,
   closestCenter: noop, useSensor: noop, useSensors: noop,
 }))

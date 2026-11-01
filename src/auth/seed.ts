@@ -71,8 +71,8 @@ function seedOwnerDirectly(db: ReturnType<typeof getDb>, username: string, passw
     );
 
     db.run(
-      `INSERT INTO "account" (id, accountId, providerId, issuer, userId, password, createdAt, updatedAt)
-       VALUES (?, ?, 'credential', 'local:credential', ?, ?, ?, ?)`,
+      `INSERT INTO "account" (id, accountId, providerId, userId, password, createdAt, updatedAt)
+       VALUES (?, ?, 'credential', ?, ?, ?, ?)`,
       [accountId, userId, userId, passwordHash, now, now]
     );
   })();
@@ -154,6 +154,7 @@ async function migrateOwnerPassword(credentialsPath: string): Promise<boolean> {
  *  - OWNER_PASSWORD  → stored hashed in data/owner.credentials
  */
 function cleanupLegacyEnvSecrets(): void {
+  if (process.env.LUMIVERSE_BUNDLE_ID) return;
   const envPath = resolve(process.cwd(), ".env");
   const identityPath = join(env.dataDir, "lumiverse.identity");
 

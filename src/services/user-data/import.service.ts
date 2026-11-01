@@ -9,7 +9,7 @@
 // progress flows over the WebSocket EventBus.
 
 import { createHash } from "node:crypto";
-import { createInflateRaw, inflateRawSync } from "node:zlib";
+import { createInflateRaw, crc32, inflateRawSync } from "node:zlib";
 import {
   decryptSecret,
   lookupConsumedTicket,
@@ -22,7 +22,6 @@ import {
 import { putSecret } from "../secrets.service";
 import {
   closeSync,
-  constants as fsConstants,
   copyFileSync,
   createReadStream,
   existsSync,
@@ -41,6 +40,8 @@ import { env } from "../../env";
 import { eventBus } from "../../ws/bus";
 import { EventType } from "../../ws/events";
 import { getEmbeddingConfig } from "../embeddings.service";
+import { getResolvedVectorStoreConfig } from "../vector-store-config.service";
+import { loadLanceDb } from "../../lancedb-preflight";
 import { detectAudioFormat } from "../notification-sounds.service";
 import {
   parseManifest,
@@ -57,19 +58,19 @@ import {
 } from "./table-registry";
 import { sanitizeEntry, safeJoin, SanitizeError, type SanitizedEntry } from "./sanitize";
 import { markConnectionSecretRestored } from "./connection-secret-restore";
+import { MAX_ACCOUNT_ARCHIVE_BYTES } from "./archive-limits";
+import { loadImportJob, recentImportJobIds, saveImportJob } from "./import-job-store";
+import { listenForAndroidImportCancellation, notifyAndroidImport } from "../../runtime/android-import";
 
 // ---------------------------------------------------------------------------
 // Tunables / safety caps
 // ---------------------------------------------------------------------------
 
-/** Reject archives whose total decompressed size exceeds this cap. */
+/** Default expansion cap for extension/selected ZIP extraction, not account restores. */
 export const MAX_DECOMPRESSED_BYTES = 20 * 1024 * 1024 * 1024; // 20 GB
 
 /** Keep a small reserve for SQLite journals and normal server operation. */
 const IMPORT_DISK_HEADROOM_BYTES = 64 * 1024 * 1024;
-
-/** Reject archives over this compressed size at upload time. */
-export const MAX_COMPRESSED_BYTES = 5 * 1024 * 1024 * 1024; // 5 GB
 
 /**
  * ZIP32 archives and format-1 ZIP64 archives predate a trustworthy record
@@ -93,8 +94,32 @@ const MAX_ENTRIES = 500_000;
 /** Apply DB rows in batches of this size, one transaction per batch. */
 const ROW_BATCH = 200;
 
+/** Bound retained serialized row data as well as row count. Larger rows run alone. */
+const ROW_BATCH_BYTES = 8 * 1024 * 1024;
+
 /** Yield to the event loop between batches. */
 const YIELD_INTERVAL_MS = 0;
+
+function isImportLockError(error: unknown): boolean {
+  const code = (error as { code?: string })?.code;
+  return typeof code === "string" && (code.startsWith("SQLITE_BUSY") || code.startsWith("SQLITE_LOCKED"));
+}
+
+/** Short writes share the database with the executor and background workers. */
+async function retryImportWrite<T>(action: () => T | Promise<T>, signal?: AbortSignal): Promise<T> {
+  const deadline = Date.now() + 10_000;
+  let delay = 25;
+  for (;;) {
+    signal?.throwIfAborted();
+    try { return await action(); }
+    catch (error) {
+      if (!isImportLockError(error) || Date.now() >= deadline) throw error;
+      // Yield so a lock owner in this process can also finish.
+      await Bun.sleep(delay);
+      delay = Math.min(delay * 2, 200);
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Job tracking
@@ -106,7 +131,17 @@ export type ImportJobStatus =
   | "running"
   | "complete"
   | "failed"
+  | "interrupted"
   | "cancelled";
+
+export interface ImportProgress {
+  phase: string;
+  table?: string;
+  processed?: number;
+  total?: number;
+  bytesProcessed?: number;
+  bytesTotal?: number;
+}
 
 export interface ImportJob {
   jobId: string;
@@ -122,6 +157,11 @@ export interface ImportJob {
   fileSummary: Record<string, number>;
   /** Most recent error message if status === 'failed'. */
   error: string | null;
+  /** Latest progress snapshot, also available when WebSocket delivery is interrupted. */
+  progress: ImportProgress | null;
+  /** A resumed restore replays safely from its retained archive. */
+  resuming?: boolean;
+  interrupted?: boolean;
   /** Abort controller — exposed for cancel endpoint. */
   abort: AbortController;
   /**
@@ -144,13 +184,24 @@ export interface ImportJob {
 const JOBS: Map<string, ImportJob> = new Map();
 const USER_RUNNING: Map<string, string> = new Map(); // userId -> jobId
 const USER_UPLOAD_RESERVATIONS: Map<string, string> = new Map();
+const UPLOAD_ABORTS = new Map<string, AbortController>();
+const LAST_SAVED = new WeakMap<ImportJob, { at: number; status: string; phase?: string; table?: string }>();
 let globalImportSlot: string | null = null;
 
-export function getJob(jobId: string): ImportJob | undefined {
-  return JOBS.get(jobId);
+export function getJob(jobId: string, userId?: string): ImportJob | undefined {
+  let job = JOBS.get(jobId);
+  if (!job && userId) {
+    const stored = loadImportJob(userId, jobId);
+    if (stored) {
+      job = { ...stored, abort: new AbortController() };
+      JOBS.set(jobId, job);
+    }
+  }
+  return userId && job?.userId !== userId ? undefined : job;
 }
 
 export function listJobsForUser(userId: string): ImportJob[] {
+  for (const jobId of recentImportJobIds(userId)) getJob(jobId, userId);
   return [...JOBS.values()].filter((j) => j.userId === userId);
 }
 
@@ -167,13 +218,18 @@ export function reserveImportUpload(userId: string): string | null {
   if (isUserImportRunning(userId) || globalImportSlot !== null) return null;
   const jobId = crypto.randomUUID();
   USER_UPLOAD_RESERVATIONS.set(userId, jobId);
+  UPLOAD_ABORTS.set(jobId, new AbortController());
   globalImportSlot = jobId;
+  notifyAndroidImport({ jobId, status: "uploading", phase: "uploading" });
   return jobId;
 }
 
 export function releaseImportUpload(userId: string, jobId: string): void {
   if (USER_UPLOAD_RESERVATIONS.get(userId) === jobId) {
     USER_UPLOAD_RESERVATIONS.delete(userId);
+    const cancelled = UPLOAD_ABORTS.get(jobId)?.signal.aborted;
+    UPLOAD_ABORTS.delete(jobId);
+    notifyAndroidImport({ jobId, status: cancelled ? "cancelled" : "failed" });
   }
   if (globalImportSlot === jobId) globalImportSlot = null;
 }
@@ -182,6 +238,7 @@ export function releaseImportUpload(userId: string, jobId: string): void {
 function claimImportReservation(userId: string, jobId: string): void {
   if (USER_UPLOAD_RESERVATIONS.get(userId) === jobId) {
     USER_UPLOAD_RESERVATIONS.delete(userId);
+    UPLOAD_ABORTS.delete(jobId);
   }
 }
 
@@ -191,7 +248,11 @@ function releaseGlobalImportSlot(jobId: string): void {
 
 export function cancelJob(jobId: string): boolean {
   const job = JOBS.get(jobId);
-  if (!job) return false;
+  if (!job) {
+    const upload = UPLOAD_ABORTS.get(jobId);
+    upload?.abort();
+    return !!upload;
+  }
   if (
     job.status !== "running" &&
     job.status !== "queued" &&
@@ -209,11 +270,28 @@ export function cancelJob(jobId: string): boolean {
 // Entry point
 // ---------------------------------------------------------------------------
 
-/**
- * Errors thrown while staging or verifying an uploaded archive. The HTTP
- * route maps these onto specific 4xx codes (415 for the wrong format, 422
- * for a wrong/incompatible manifest, 413 for size).
- */
+export function importUploadSignal(jobId: string): AbortSignal | undefined {
+  return UPLOAD_ABORTS.get(jobId)?.signal;
+}
+
+/** Preserve recoverable state before normal shutdown closes SQLite or the IPC pipe. */
+export function interruptActiveImports(): void {
+  for (const job of JOBS.values()) {
+    if (!["queued", "running", "awaiting_ticket"].includes(job.status)) continue;
+    job.interrupted = true;
+    job.status = "interrupted";
+    job.finishedAt = Math.floor(Date.now() / 1000);
+    job.error = "The local server stopped during this import. Resume to continue from the saved archive.";
+    try { saveImportJob(job); }
+    catch (error) { console.warn("[Import] Could not save interrupted job:", error); }
+    job.abort.abort(new Error(job.error));
+  }
+  for (const upload of UPLOAD_ABORTS.values()) upload.abort();
+}
+
+listenForAndroidImportCancellation(cancelJob);
+
+/** Upload/validation errors mapped by the HTTP route to specific 4xx responses. */
 export class ArchiveValidationError extends Error {
   constructor(public code: "not_zip" | "size" | "no_manifest" | "bad_manifest", message: string) {
     super(message);
@@ -247,11 +325,13 @@ export async function persistUploadedArchive(
   body: ReadableStream<Uint8Array>,
   declaredSize: number | null,
   jobId: string = crypto.randomUUID(),
+  signal?: AbortSignal,
 ): Promise<{ path: string; jobId: string }> {
-  if (declaredSize !== null && declaredSize > MAX_COMPRESSED_BYTES) {
+  signal?.throwIfAborted();
+  if (declaredSize !== null && (!Number.isSafeInteger(declaredSize) || declaredSize < 0)) {
     throw new ArchiveValidationError(
       "size",
-      `archive exceeds ${MAX_COMPRESSED_BYTES / (1024 * 1024 * 1024)} GB cap`,
+      "archive size exceeds the supported integer range",
     );
   }
   const dir = join(env.dataDir, "imports", userId, jobId);
@@ -263,11 +343,14 @@ export async function persistUploadedArchive(
   // intermediate runtime-owned queue to grow under slow Android storage.
   const fd = openSync(path, "w");
   const reader = body.getReader();
+  const abortUpload = () => { void reader.cancel(signal?.reason).catch(() => {}); };
+  signal?.addEventListener("abort", abortUpload, { once: true });
   const header = new Uint8Array(4);
   let headerBytes = 0;
   let magicChecked = false;
   let total = 0;
   let fdClosed = false;
+  let lastUploadProgress = 0;
 
   const closeFd = (ignoreError = false) => {
     if (fdClosed) return;
@@ -292,19 +375,24 @@ export async function persistUploadedArchive(
 
   const writeChunk = (chunk: Uint8Array) => {
     if (chunk.byteLength === 0) return;
-    if (total + chunk.byteLength > MAX_COMPRESSED_BYTES) {
+    if (chunk.byteLength > MAX_ACCOUNT_ARCHIVE_BYTES - total) {
       throw new ArchiveValidationError(
         "size",
-        `archive exceeds compressed size cap (${total + chunk.byteLength} bytes)`,
+        "archive size exceeds the supported integer range",
       );
     }
     writeAllSync(fd, chunk);
     total += chunk.byteLength;
+    if (signal && Date.now() - lastUploadProgress >= 500) {
+      lastUploadProgress = Date.now();
+      notifyAndroidImport({ jobId, status: "uploading", phase: "uploading", bytesProcessed: total, bytesTotal: declaredSize ?? undefined });
+    }
   };
 
   try {
     while (true) {
       const { value, done } = await reader.read();
+      signal?.throwIfAborted();
       if (done) break;
       if (!value || value.byteLength === 0) continue;
 
@@ -344,7 +432,9 @@ export async function persistUploadedArchive(
     // Stop accepting network data immediately on validation/write failure,
     // then remove the partial archive after its fd has actually closed.
     try {
-      await reader.cancel(err);
+      // Cancellation closes reads immediately; a stalled source's cleanup
+      // promise must not prevent releasing the fd or deleting partial data.
+      void reader.cancel(err).catch(() => {});
     } catch {
       /* ignore */
     }
@@ -352,24 +442,13 @@ export async function persistUploadedArchive(
     throw err;
   } finally {
     try {
+      signal?.removeEventListener("abort", abortUpload);
       reader.releaseLock();
     } catch {
       /* ignore */
     }
   }
 
-  const stat = statSync(path);
-  if (stat.size > MAX_COMPRESSED_BYTES) {
-    try {
-      unlinkSync(path);
-    } catch {
-      /* ignore */
-    }
-    throw new ArchiveValidationError(
-      "size",
-      `archive exceeds compressed size cap (${stat.size} bytes)`,
-    );
-  }
   return { path, jobId };
 }
 
@@ -821,6 +900,7 @@ export function startImport(opts: {
   userId: string;
   archivePath: string;
   jobId: string;
+  resuming?: boolean;
 }): ImportJob {
   const existingJobId = USER_RUNNING.get(opts.userId);
   const reservation = USER_UPLOAD_RESERVATIONS.get(opts.userId);
@@ -850,12 +930,15 @@ export function startImport(opts: {
     summary: {},
     fileSummary: {},
     error: null,
+    progress: null,
+    resuming: opts.resuming ?? false,
     abort: new AbortController(),
     ticketGate,
     ticketResolver,
     ticketReused: false,
     secretsRestored: 0,
   };
+  saveImportJob(job);
   JOBS.set(job.jobId, job);
   USER_RUNNING.set(job.userId, job.jobId);
   globalImportSlot = job.jobId;
@@ -866,11 +949,29 @@ export function startImport(opts: {
   return job;
 }
 
+export function resumeImport(userId: string, jobId: string): ImportJob {
+  const job = getJob(jobId, userId);
+  if (!job || job.status !== "interrupted") throw new Error("this import cannot be resumed");
+  if (!existsSync(job.archivePath)) throw new Error("saved archive is unavailable; select the backup again");
+  return startImport({ userId, jobId, archivePath: job.archivePath, resuming: true });
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 function emit(job: ImportJob, type: EventType, payload: Record<string, any>): void {
+  if (type === EventType.USER_IMPORT_PROGRESS && typeof payload.phase === "string") {
+    job.progress = { ...payload, phase: payload.phase };
+  }
+  const previous = LAST_SAVED.get(job);
+  if (!previous || Date.now() - previous.at >= 1000 || previous.status !== job.status || previous.phase !== job.progress?.phase || previous.table !== job.progress?.table) {
+    try {
+      saveImportJob(job);
+      LAST_SAVED.set(job, { at: Date.now(), status: job.status, phase: job.progress?.phase, table: job.progress?.table });
+    } catch (error) { console.warn("[user-data import] could not save recovery state:", error); }
+  }
+  notifyAndroidImport({ jobId: job.jobId, status: job.status, ...job.progress });
   try {
     eventBus.emit(type, { jobId: job.jobId, ...payload }, job.userId);
   } catch {
@@ -960,26 +1061,10 @@ function writeAllSync(fd: number, chunk: Uint8Array): void {
   }
 }
 
-// ZIP uses the IEEE CRC-32 polynomial. Keep the running state inverted so
-// chunks can be fed to it without allocating one concatenated entry buffer.
-const CRC32_TABLE = (() => {
-  const table = new Uint32Array(256);
-  for (let n = 0; n < table.length; n++) {
-    let value = n;
-    for (let bit = 0; bit < 8; bit++) {
-      value = (value & 1) === 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
-    }
-    table[n] = value >>> 0;
-  }
-  return table;
-})();
-
+// Keep the historical inverted running state, but checksum each fixed-size
+// chunk natively. A JavaScript byte loop is costly for multi-GB phone restores.
 function updateCrc32(state: number, bytes: Uint8Array): number {
-  let next = state;
-  for (const byte of bytes) {
-    next = (CRC32_TABLE[(next ^ byte) & 0xff] ^ (next >>> 8)) >>> 0;
-  }
-  return next;
+  return (crc32(bytes, (state ^ 0xffffffff) >>> 0) ^ 0xffffffff) >>> 0;
 }
 
 function finishCrc32(state: number): number {
@@ -1244,6 +1329,7 @@ async function inflateEntry(
   onChunk: (chunk: Uint8Array) => void,
   signal: AbortSignal,
 ): Promise<void> {
+  signal.throwIfAborted();
   if (compressedSize === 0) {
     // Empty entries are valid when their central-directory output size is
     // also zero; the caller validates that exact size after this returns.
@@ -1255,13 +1341,22 @@ async function inflateEntry(
     highWaterMark: ARCHIVE_READ_BYTES,
   });
   const inflater = createInflateRaw({ chunkSize: INFLATE_OUTPUT_BYTES });
-  source.pipe(inflater);
+  // pipe() does not forward source errors. Without this, a read failure can
+  // leave the iterator waiting forever. Cancellation must also wake a read.
+  source.on("error", (error) => inflater.destroy(error));
+  const abort = () => {
+    source.destroy();
+    inflater.destroy(signal.reason instanceof Error ? signal.reason : new Error("import cancelled"));
+  };
+  signal.addEventListener("abort", abort, { once: true });
   try {
+    source.pipe(inflater);
     for await (const chunk of inflater) {
       if (signal.aborted) throw signal.reason ?? new Error("import cancelled");
       onChunk(chunk as Uint8Array);
     }
   } finally {
+    signal.removeEventListener("abort", abort);
     source.destroy();
     inflater.destroy();
   }
@@ -1276,7 +1371,7 @@ export interface SelectedZipExtractionOptions {
   archivePath: string;
   destinationDir: string;
   /** Return a relative output path for entries to extract, or null to skip. */
-  selectEntry(name: string): string | null;
+  selectEntry(name: string, uncompressedSize: number): string | null;
   /** Validate state accumulated by selectEntry before extraction starts. */
   validateSelection?(): void;
   /** Legacy CL bundles can repeat a shared gallery path. Every copy must be byte-identical. */
@@ -1342,7 +1437,7 @@ export async function extractSelectedZipEntries(
   let declaredBytes = 0;
 
   for await (const entry of scanCentralDirectory(archive, cdOffset, cdSize, totalEntries)) {
-    const relativePath = options.selectEntry(entry.name);
+    const relativePath = options.selectEntry(entry.name, entry.uncompressedSize);
     if (relativePath === null) continue;
     const previous = selectedByName.get(entry.name);
     if (previous && !options.allowIdenticalDuplicate?.(entry.name)) {
@@ -1419,6 +1514,12 @@ export async function extractSelectedZipEntries(
             throw new ArchiveValidationError(
               "size",
               `selected ZIP data exceeds decompressed size cap (${maxDecompressedBytes} bytes)`,
+            );
+          }
+          if (chunk.byteLength > centralEntry.uncompressedSize - entryBytes) {
+            throw new ArchiveValidationError(
+              "not_zip",
+              `entry size disagrees with central directory (${centralEntry.name})`,
             );
           }
           if (outputFd !== null) writeAllSync(outputFd, chunk);
@@ -1510,16 +1611,34 @@ async function extractArchive(job: ImportJob): Promise<ImportBuffer> {
   let declaredDecompressedBytes = 0;
   let declaredBinaryBytes = 0;
   for await (const entry of scanCentralDirectory(archive, cdOffset, cdSize, totalEntries)) {
-    // Validate every name before allocating any staging files, and reject a
-    // declared expansion beyond the global cap before decompression begins.
+    job.abort.signal.throwIfAborted();
+    // Validate every name before allocating any staging files, and reject
+    // unsafe aggregate sizes before decompression begins. Account archives
+    // use available disk space rather than a fixed total-byte quota.
     const descriptor = sanitizeEntry(entry.name);
-    if (entry.uncompressedSize > MAX_DECOMPRESSED_BYTES - declaredDecompressedBytes) {
-      throw new Error(`archive exceeds decompressed size cap (${MAX_DECOMPRESSED_BYTES} bytes)`);
+    if (entry.uncompressedSize > MAX_ACCOUNT_ARCHIVE_BYTES - declaredDecompressedBytes) {
+      throw new Error("archive expansion exceeds the supported integer range");
     }
     declaredDecompressedBytes += entry.uncompressedSize;
     if (descriptor.kind === "files") declaredBinaryBytes += entry.uncompressedSize;
   }
   assertExtractionDiskCapacity(stagingDir, declaredDecompressedBytes, declaredBinaryBytes);
+
+  let entriesExtracted = 0;
+  let lastProgressAt = 0;
+  const reportExtraction = (force = false) => {
+    const now = Date.now();
+    if (!force && now - lastProgressAt < 250) return;
+    lastProgressAt = now;
+    emit(job, EventType.USER_IMPORT_PROGRESS, {
+      phase: "extracting",
+      processed: entriesExtracted,
+      total: totalEntries,
+      bytesProcessed: buf.totalDecompressed,
+      bytesTotal: declaredDecompressedBytes,
+    });
+  };
+  reportExtraction(true);
 
   const archiveFd = openSync(job.archivePath, "r");
   const journalFd = openSync(binaryJournalPath, "w");
@@ -1588,8 +1707,8 @@ async function extractArchive(job: ImportJob): Promise<ImportBuffer> {
       let crcState = 0xffffffff;
       try {
         const onChunk = (chunk: Uint8Array) => {
-          if (buf.totalDecompressed + chunk.byteLength > MAX_DECOMPRESSED_BYTES) {
-            throw new Error(`archive exceeds decompressed size cap (${MAX_DECOMPRESSED_BYTES} bytes)`);
+          if (chunk.byteLength > MAX_ACCOUNT_ARCHIVE_BYTES - buf.totalDecompressed) {
+            throw new Error("archive expansion exceeds the supported integer range");
           }
           if (textLimit !== null && entry.byteSize + chunk.byteLength > textLimit) {
             throw new Error(`${centralEntry.name} exceeds ${textLimit} bytes`);
@@ -1598,6 +1717,7 @@ async function extractArchive(job: ImportJob): Promise<ImportBuffer> {
           crcState = updateCrc32(crcState, chunk);
           entry.byteSize += chunk.byteLength;
           buf.totalDecompressed += chunk.byteLength;
+          reportExtraction();
         };
         if (centralEntry.compression === 0) {
           await copyStoredEntry(
@@ -1665,6 +1785,8 @@ async function extractArchive(job: ImportJob): Promise<ImportBuffer> {
       } else {
         buf.entries.push(entry);
       }
+      entriesExtracted++;
+      reportExtraction();
 
       if ((buf.entryCount & 15) === 0) await yieldAndCheck(job.abort.signal);
     }
@@ -1672,6 +1794,7 @@ async function extractArchive(job: ImportJob): Promise<ImportBuffer> {
     closeSync(journalFd);
     closeSync(archiveFd);
   }
+  reportExtraction(true);
 
   // Find and parse the manifest. If absent the archive is invalid.
   const manifestEntry = buf.entries.find((e) => e.table === "__manifest__");
@@ -1740,13 +1863,13 @@ function ndjsonLineLimitForManifest(manifest: ArchiveManifest | null): number {
 }
 
 /**
- * Read an NDJSON file line-by-line, yielding parsed objects. Enforces the
- * per-line size cap.
+ * Read an NDJSON file line-by-line, yielding parsed objects with their source
+ * byte counts so consumers can bound batches without serializing them again.
  */
 async function* readNdjson(
   path: string,
   maxLineBytes: number = NDJSON_MAX_RECORD_BYTES,
-): AsyncGenerator<Record<string, any>> {
+): AsyncGenerator<{ value: Record<string, any>; byteLength: number }> {
   const decoder = new TextDecoder();
   const buffer = new Uint8Array(ARCHIVE_READ_BYTES);
   const fragments: Uint8Array[] = [];
@@ -1763,7 +1886,7 @@ async function* readNdjson(
     fragments.push(chunk.slice());
     lineBytes += chunk.byteLength;
   };
-  const consumeLine = (): Record<string, any> | null => {
+  const consumeLine = (): { value: Record<string, any>; byteLength: number } | null => {
     if (lineBytes === 0) return null;
     const bytes = new Uint8Array(lineBytes);
     let offset = 0;
@@ -1774,7 +1897,7 @@ async function* readNdjson(
     fragments.length = 0;
     lineBytes = 0;
     const line = decoder.decode(bytes);
-    return line.trim().length > 0 ? JSON.parse(line) : null;
+    return line.trim().length > 0 ? { value: JSON.parse(line), byteLength: bytes.byteLength } : null;
   };
 
   try {
@@ -1821,6 +1944,8 @@ async function* readNdjson(
  * reference those preset IDs resolve cleanly instead of 404'ing.
  */
 function mergeSettingValue(existingValue: unknown, importedValue: unknown): unknown {
+  // Fresh clients persist null selections before the restore begins.
+  if (existingValue === null || existingValue === undefined) return importedValue;
   const isPlainObject = (v: unknown): v is Record<string, unknown> =>
     !!v && typeof v === "object" && !Array.isArray(v);
   // An id-shaped array: every element is an object carrying an `id` string.
@@ -1904,7 +2029,7 @@ async function applySettingsTable(
   let skipped = 0;
   let lineCount = 0;
 
-  for await (const raw of readNdjson(stagingPath, ctx.ndjsonLineBytes)) {
+  for await (const { value: raw } of readNdjson(stagingPath, ctx.ndjsonLineBytes)) {
     if (ctx.signal.aborted) throw ctx.signal.reason ?? new Error("import cancelled");
     const key = typeof raw.key === "string" ? raw.key : null;
     if (!key) continue;
@@ -1916,34 +2041,40 @@ async function applySettingsTable(
     const importedValueText = typeof raw.value === "string" ? raw.value : JSON.stringify(raw.value);
     const updatedAt = Math.floor(Date.now() / 1000);
 
-    const existing = selectStmt.get(key, ctx.userId) as { value: string } | null;
-    if (!existing) {
-      insertStmt.run(key, importedValueText, ctx.userId, updatedAt);
-      imported++;
-    } else {
-      // Both rows present — attempt a deep merge.
-      let importedValue: unknown;
-      let existingValue: unknown;
-      try {
-        importedValue = JSON.parse(importedValueText);
-      } catch {
-        importedValue = importedValueText;
-      }
-      try {
-        existingValue = JSON.parse(existing.value);
-      } catch {
-        existingValue = existing.value;
-      }
-      const mergedValue = mergeSettingValue(existingValue, importedValue);
-      // If merge produced no change, count as skipped; otherwise UPDATE.
-      const mergedText = JSON.stringify(mergedValue);
-      if (mergedText === existing.value) {
-        skipped++;
+    const outcome = await retryImportWrite(() => db.transaction(() => {
+      const existing = selectStmt.get(key, ctx.userId) as { value: string } | null;
+      if (!existing) {
+        insertStmt.run(key, importedValueText, ctx.userId, updatedAt);
+        return "imported";
       } else {
-        updateStmt.run(mergedText, updatedAt, key, ctx.userId);
-        merged++;
+        // Both rows present — attempt a deep merge.
+        let importedValue: unknown;
+        let existingValue: unknown;
+        try {
+          importedValue = JSON.parse(importedValueText);
+        } catch {
+          importedValue = importedValueText;
+        }
+        try {
+          existingValue = JSON.parse(existing.value);
+        } catch {
+          existingValue = existing.value;
+        }
+        const mergedValue = mergeSettingValue(existingValue, importedValue);
+        // If merge produced no change, count as skipped; otherwise UPDATE.
+        const mergedText = JSON.stringify(mergedValue);
+        if (mergedText === existing.value) {
+          return "skipped";
+        } else {
+          updateStmt.run(mergedText, updatedAt, key, ctx.userId);
+          return "merged";
+        }
       }
-    }
+
+    }).immediate(), ctx.signal);
+    if (outcome === "imported") imported++;
+    else if (outcome === "merged") merged++;
+    else skipped++;
 
     lineCount++;
     if (lineCount % ROW_BATCH === 0) {
@@ -2005,6 +2136,7 @@ async function applyTable(
 
   const db = getDb();
   let batch: Record<string, any>[] = [];
+  let batchBytes = 0;
   const inserts = new Map<string, { columns: string[]; statement: ReturnType<typeof db.prepare> }>();
 
   const getInsert = (row: Record<string, any>) => {
@@ -2029,9 +2161,11 @@ async function applyTable(
     return prepared;
   };
 
-  const commitBatch = () => {
+  const commitBatch = async () => {
     if (batch.length === 0) return;
     const txn = db.transaction((rows: Record<string, any>[]) => {
+      let imported = 0;
+      let skipped = 0;
       for (const row of rows) {
         const insert = getInsert(row);
         if (!insert) {
@@ -2047,14 +2181,24 @@ async function applyTable(
         if (res.changes > 0) imported++;
         else skipped++;
       }
+      return { imported, skipped };
     });
-    txn(batch);
+    const committed = await retryImportWrite(() => txn.immediate(batch), ctx.signal);
+    imported += committed.imported;
+    skipped += committed.skipped;
     batch = [];
+    batchBytes = 0;
   };
 
   let lineCount = 0;
-  for await (const raw of readNdjson(stagingPath, ctx.ndjsonLineBytes)) {
+  const flushBatch = async () => {
+    await commitBatch();
+    emit(ctx.job, EventType.USER_IMPORT_PROGRESS, { phase: "table", table, processed: lineCount });
+    await yieldAndCheck(ctx.signal);
+  };
+  for await (const { value: raw, byteLength } of readNdjson(stagingPath, ctx.ndjsonLineBytes)) {
     if (ctx.signal.aborted) throw ctx.signal.reason ?? new Error("import cancelled");
+    if (batch.length > 0 && batchBytes + byteLength > ROW_BATCH_BYTES) await flushBatch();
 
     // Defensive filter for the settings table.
     if (table === "settings" && typeof raw.key === "string" && isSecretSettingKey(raw.key)) {
@@ -2075,19 +2219,12 @@ async function applyTable(
     if (columnSet.has("has_api_key")) filtered.has_api_key = 0;
 
     batch.push(filtered);
+    batchBytes += byteLength;
     lineCount++;
 
-    if (batch.length >= ROW_BATCH) {
-      commitBatch();
-      emit(ctx.job, EventType.USER_IMPORT_PROGRESS, {
-        phase: "table",
-        table,
-        processed: lineCount,
-      });
-      await yieldAndCheck(ctx.signal);
-    }
+    if (batch.length >= ROW_BATCH || batchBytes >= ROW_BATCH_BYTES) await flushBatch();
   }
-  commitBatch();
+  await commitBatch();
 
   ctx.job.summary[table] = { imported, skipped };
   emit(ctx.job, EventType.USER_IMPORT_PROGRESS, {
@@ -2158,6 +2295,7 @@ async function applyBinary(
     }
   })();
   if (!dest) return false;
+  if (existsSync(dest)) return false;
   ensureDir(dirname(dest));
 
   if (entry.bucket === "notification-sounds") {
@@ -2182,9 +2320,19 @@ async function applyBinary(
 
   try {
     // Keep this a filesystem copy instead of Bun.write(Bun.file(...)) so a
-    // large staged binary never re-enters Bun's Blob pipeline. EXCL makes the
-    // non-destructive merge atomic if another request creates the file first.
-    copyFileSync(entry.stagingPath, dest, fsConstants.COPYFILE_EXCL);
+    // large staged binary never re-enters Bun's Blob pipeline. Publish only
+    // a complete copy; a killed process can leave a private temporary file,
+    // which resume overwrites. Android forbids hard links in app storage.
+    const temporary = join(dirname(dest), `.lv-restore-${ctx.job.jobId}.tmp`);
+    try {
+      copyFileSync(entry.stagingPath, temporary);
+      // Imports hold the single writer slot. Keep the existence check and
+      // rename synchronous so another application request cannot interleave.
+      if (existsSync(dest)) return false;
+      renameSync(temporary, dest);
+    } finally {
+      try { unlinkSync(temporary); } catch { /* a crash may leave it for recovery */ }
+    }
   } catch (err: any) {
     if (err?.code === "EEXIST") return false;
     throw err;
@@ -2216,10 +2364,11 @@ async function applyLancedbVectors(
     /* ignore */
   }
 
-  if (!embeddingConfigsMatch(archiveCfg, currentCfg)) {
+  const vectorStoreProvider = getResolvedVectorStoreConfig().provider;
+  if (vectorStoreProvider !== "lancedb" || !embeddingConfigsMatch(archiveCfg, currentCfg)) {
     emit(ctx.job, EventType.USER_IMPORT_PROGRESS, {
       phase: "lancedb_skipped",
-      reason: "embedding config mismatch",
+      reason: vectorStoreProvider !== "lancedb" ? "external vector store configured" : "embedding config mismatch",
       archive: archiveCfg,
       current: currentCfg,
     });
@@ -2256,7 +2405,7 @@ async function applyLancedbVectors(
   // Lazy import LanceDB only when we actually have vectors to restore.
   let lance: any;
   try {
-    lance = await import("@lancedb/lancedb");
+    lance = await loadLanceDb();
   } catch {
     return;
   }
@@ -2282,8 +2431,32 @@ async function applyLancedbVectors(
     }
 
     const batch: any[] = [];
+    let batchBytes = 0;
     let restored = 0;
-    for await (const row of readNdjson(entry.stagingPath, ctx.ndjsonLineBytes)) {
+    const commitBatch = async () => {
+      if (ctx.job.resuming) {
+        // Replay must preserve existing vectors, including batches committed
+        // just before a process stopped. Match the account as well as the ID.
+        await table.mergeInsert(["id", "user_id"]).whenNotMatchedInsertAll().execute(batch);
+      } else {
+        await table.add(batch);
+      }
+      restored += batch.length;
+      batch.length = 0;
+      batchBytes = 0;
+      await yieldAndCheck(ctx.signal);
+    };
+    for await (const { value: row, byteLength } of readNdjson(entry.stagingPath, ctx.ndjsonLineBytes)) {
+      ctx.signal.throwIfAborted();
+      if (batch.length > 0 && batchBytes + byteLength > ROW_BATCH_BYTES) {
+        try {
+          await commitBatch();
+        } catch (err) {
+          if (ctx.signal.aborted) throw err;
+          console.warn(`[user-data import] LanceDB add failed for ${tableName}:`, err);
+          break;
+        }
+      }
       let vector: Float32Array | null = null;
       if (typeof row.vector_b64 === "string" && row.vector_b64.length > 0) {
         const bytes = Buffer.from(row.vector_b64, "base64");
@@ -2297,22 +2470,20 @@ async function applyLancedbVectors(
       }
       const { vector_b64: _drop, ...rest } = row;
       batch.push({ ...rest, user_id: ctx.userId, vector });
-      if (batch.length >= 256) {
+      batchBytes += byteLength;
+      if (batch.length >= 256 || batchBytes >= ROW_BATCH_BYTES) {
         try {
-          await table.add(batch);
+          await commitBatch();
         } catch (err) {
+          if (ctx.signal.aborted) throw err;
           console.warn(`[user-data import] LanceDB add failed for ${tableName}:`, err);
           break;
         }
-        restored += batch.length;
-        batch.length = 0;
-        await yieldAndCheck(ctx.signal);
       }
     }
     if (batch.length > 0) {
       try {
-        await table.add(batch);
-        restored += batch.length;
+        await commitBatch();
       } catch (err) {
         console.warn(`[user-data import] LanceDB final add failed for ${tableName}:`, err);
       }
@@ -2394,6 +2565,7 @@ function scrubOrphanForeignKeys(userId: string): void {
       }
     } catch (err) {
       // A schema mismatch (column removed in a future migration) — log and continue.
+      if (isImportLockError(err)) throw err;
       console.warn(`[user-data import] orphan FK scrub on ${child}.${col} failed:`, err);
     }
   }
@@ -2411,6 +2583,7 @@ function scrubMemoryCortexOrphans(userId: string): void {
       [userId],
     );
   } catch (err) {
+    if (isImportLockError(err)) throw err;
     console.warn(`[user-data import] memory cortex orphan scrub failed:`, err);
   }
 }
@@ -2428,7 +2601,7 @@ async function applySecrets(
 ): Promise<{ restored: number; skipped: number }> {
   let restored = 0;
   let skipped = 0;
-  for await (const raw of readNdjson(stagingPath, ctx.ndjsonLineBytes)) {
+  for await (const { value: raw } of readNdjson(stagingPath, ctx.ndjsonLineBytes)) {
     if (ctx.signal.aborted) throw ctx.signal.reason ?? new Error("import cancelled");
     const entry = raw as Partial<EncryptedSecretEntry>;
     if (
@@ -2449,10 +2622,13 @@ async function applySecrets(
       continue;
     }
     try {
-      await putSecret(ctx.userId, entry.key, plaintext);
-      if (plaintext.length > 0) markConnectionSecretRestored(ctx.userId, entry.key);
+      await retryImportWrite(async () => {
+        await putSecret(ctx.userId, entry.key!, plaintext);
+        if (plaintext.length > 0) markConnectionSecretRestored(ctx.userId, entry.key!);
+      }, ctx.signal);
       restored++;
     } catch (err) {
+      if (isImportLockError(err) || ctx.signal.aborted) throw err;
       console.warn(`[user-data import] secret re-encrypt failed for ${entry.key}:`, err);
       skipped++;
     }
@@ -2501,7 +2677,9 @@ export async function submitTicket(
   const wasReused = !!prior;
   const previouslyConsumedAt = prior?.consumedAt ?? null;
 
-  const recorded = recordConsumedTicket(verified.ticket.archiveId, job.userId);
+  const recorded = await retryImportWrite(() => getDb().transaction(() =>
+    recordConsumedTicket(verified.ticket.archiveId, job.userId)
+  ).immediate(), job.abort.signal);
   job.ticketReused = wasReused;
   job.ticketResolver?.(verified);
   return { wasReused, previouslyConsumedAt, uses: recorded.uses };
@@ -2595,18 +2773,43 @@ async function runImportJob(job: ImportJob): Promise<void> {
       }
     }
 
+    // Restore assets before publishing rows that reference them. Concurrent
+    // library/avatar requests must never see a restored row with a missing file.
+    emit(job, EventType.USER_IMPORT_PROGRESS, { phase: "files", total: buf.binaryEntryCount });
+    let filesDone = 0;
+    for await (const { value: raw } of readNdjson(buf.binaryJournalPath)) {
+      if (job.abort.signal.aborted) throw job.abort.signal.reason ?? new Error("cancelled");
+      const entry = raw as Partial<BufferedBinaryEntry>;
+      if (
+        entry.kind !== "binary" ||
+        typeof entry.bucket !== "string" ||
+        typeof entry.inner !== "string" ||
+        typeof entry.stagingPath !== "string" ||
+        typeof entry.byteSize !== "number"
+      ) {
+        throw new Error("binary entry journal is malformed");
+      }
+      try {
+        await applyBinary(ctx, entry as BufferedBinaryEntry);
+      } catch (err) {
+        throw new Error(`Could not restore ${entry.bucket}/${entry.inner}`, { cause: err });
+      }
+      filesDone++;
+      if ((filesDone & 31) === 0) {
+        emit(job, EventType.USER_IMPORT_PROGRESS, {
+          phase: "files",
+          processed: filesDone,
+          total: buf.binaryEntryCount,
+        });
+        await yieldAndCheck(job.abort.signal);
+      }
+    }
+    emit(job, EventType.USER_IMPORT_PROGRESS, { phase: "files_done", processed: filesDone });
+
     // Bulk-load pattern: temporarily disable FK enforcement so tables can be
     // applied in topological order even when they contain dependency cycles.
     db.run("PRAGMA foreign_keys = OFF");
     fkDisabled = true;
-
-    // Phase 2a: apply images first (binary), then images table rows.
-    // Image FILES go before image ROWS so the row's referenced filename is on
-    // disk when the row inserts. Actually, the FK from characters/personas is
-    // on the row ID — the file's presence isn't enforced by SQLite. So we
-    // can apply all DB rows first and then write files, OR interleave. To
-    // keep the merge non-destructive, apply DB rows in topological order
-    // (Phase 2b), then write binary files (Phase 2c).
 
     // Phase 2b: apply DB rows in topological order.
     for (const table of IMPORT_ORDER) {
@@ -2626,41 +2829,15 @@ async function runImportJob(job: ImportJob): Promise<void> {
     // run by import time, so repair restored rows explicitly before any vector
     // or Cortex consumers can observe them.
     if (tableEntries.has("chat_chunks")) {
-      backfillImportedChatChunkMessageRanges(ctx.userId);
+      await retryImportWrite(() => backfillImportedChatChunkMessageRanges(ctx.userId), ctx.signal);
     }
 
-    // Phase 2c: binary files.
-    emit(job, EventType.USER_IMPORT_PROGRESS, { phase: "files", total: buf.binaryEntryCount });
-    let filesDone = 0;
-    for await (const raw of readNdjson(buf.binaryJournalPath)) {
-      if (job.abort.signal.aborted) throw job.abort.signal.reason ?? new Error("cancelled");
-      const entry = raw as Partial<BufferedBinaryEntry>;
-      if (
-        entry.kind !== "binary" ||
-        typeof entry.bucket !== "string" ||
-        typeof entry.inner !== "string" ||
-        typeof entry.stagingPath !== "string" ||
-        typeof entry.byteSize !== "number"
-      ) {
-        throw new Error("binary entry journal is malformed");
-      }
-      try {
-        await applyBinary(ctx, entry as BufferedBinaryEntry);
-      } catch (err) {
-        // Per-file failure is logged but doesn't kill the job.
-        console.warn(`[user-data import] binary failed (${entry.bucket}/${entry.inner}):`, err);
-      }
-      filesDone++;
-      if ((filesDone & 31) === 0) {
-        emit(job, EventType.USER_IMPORT_PROGRESS, {
-          phase: "files",
-          processed: filesDone,
-          total: buf.binaryEntryCount,
-        });
-        await yieldAndCheck(job.abort.signal);
-      }
-    }
-    emit(job, EventType.USER_IMPORT_PROGRESS, { phase: "files_done", processed: filesDone });
+    await retryImportWrite(() => db.transaction(() => {
+      scrubOrphanForeignKeys(job.userId);
+      scrubMemoryCortexOrphans(job.userId);
+    }).immediate(), ctx.signal);
+    db.run("PRAGMA foreign_keys = ON");
+    fkRestored = true;
 
     // Phase 2d: LanceDB vectors if present and compatible.
     await applyLancedbVectors(ctx, buf, buf.manifest?.embeddingConfig ?? null);
@@ -2695,7 +2872,7 @@ async function runImportJob(job: ImportJob): Promise<void> {
     });
   } catch (err: any) {
     if (job.abort.signal.aborted) {
-      job.status = "cancelled";
+      job.status = job.interrupted ? "interrupted" : "cancelled";
     } else {
       job.status = "failed";
       job.error = String(err?.message || err);
@@ -2703,13 +2880,15 @@ async function runImportJob(job: ImportJob): Promise<void> {
     job.finishedAt = Math.floor(Date.now() / 1000);
     emit(job, EventType.USER_IMPORT_FAILED, { error: job.error, cancelled: job.status === "cancelled" });
   } finally {
-    if (fkDisabled) {
+    if (fkDisabled && !fkRestored) {
       // Scrub orphan FK references introduced by the bulk load before
       // re-arming enforcement. A scrub failure must not strand the server
       // with FKs disabled.
       try {
-        scrubOrphanForeignKeys(job.userId);
-        scrubMemoryCortexOrphans(job.userId);
+        await retryImportWrite(() => db.transaction(() => {
+          scrubOrphanForeignKeys(job.userId);
+          scrubMemoryCortexOrphans(job.userId);
+        }).immediate());
       } catch (err) {
         console.warn("[user-data import] orphan scrub raised:", err);
       }

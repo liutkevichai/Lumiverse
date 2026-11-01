@@ -1,6 +1,11 @@
+import type { RecentConnections } from '@/lib/connectionRecents'
+import type { CharacterIndexItem } from './api'
+import type { ConnectionLibraries } from '@/lib/connectionLibrary'
 import type { Message, Character, Persona, Preset, ConnectionProfile, ProviderInfo, RecentChat, GroupedRecentChat, PaginatedResult, Pack, PackWithItems, LumiaItem, LoomItem, ImageGenConnectionProfile, ImageGenProviderInfo } from './api'
 import type { WeaverSession, WeaverStage, WeaverExtraction, WeaverSpineSlot, WeaverSynthesisGroup, WeaverBookRole, WeaverBuildType, WeaverNarrationMode, WeaverPersonaRegister, WeaverPersonaPlan, PersonaDraft, CreateWeaverSessionInput, WeaverCommittedFact, WeaverGap, WeaverInterviewQuestion, WeaverInterviewState, WeaverResponseKind, WeaverCandidate, WeaverBible, UpdateWeaverBibleInput, WeaverFieldDef, WeaverField, WeaverFinalizeResult, WeaverFinalizeInput, WeaverStartChatResult } from '@/api/weaver'
+import type { ChatImageSize, ChatImageAlignment, ChatImageTargets } from '@/lib/chatImagePresentation'
 import type { ImpersonationPreference } from '@/lib/impersonationPreset'
+import type { UiLanguage } from '@/i18n/languages'
 
 // ---- Chat Slice ----
 export interface ChatSlice {
@@ -16,6 +21,8 @@ export interface ChatSlice {
    * write).
    */
   activeChatMetadata: Record<string, any> | null
+  /** null while opening; IDs whose character data was refreshed for this chat. */
+  activeChatLoadedCharacterIds: string[] | null
   activeChatDisplayOwner: string | null
   /** The chat row's `name` for the currently-open chat (group chats display it as the group name) */
   activeChatName: string | null
@@ -34,7 +41,9 @@ export interface ChatSlice {
   /** Index of the swipe the active generation streams into. Lets the UI gate the
    *  streaming buffer to that swipe so the user can navigate to other swipes
    *  mid-generation. null when unknown (pre-GENERATION_STARTED) or idle. */
+  streamingRenderMode: "persisted-message" | null
   streamingSwipeId: number | null
+  streamingPreserveSwipe: boolean
   streamingGenerationType: string | null
   /** The generation type of the last completed generation — survives endStreaming() */
   lastCompletedGenerationType: string | null
@@ -51,6 +60,7 @@ export interface ChatSlice {
    * it when applied, so later mounts and WS-driven refreshes always refetch.
    */
   landingRecentChats: PaginatedResult<GroupedRecentChat> | null
+  landingRecentChatsScope: number | null
   setLandingRecentChats: (result: PaginatedResult<GroupedRecentChat> | null) => void
   setActiveChat: (
     chatId: string | null,
@@ -67,6 +77,7 @@ export interface ChatSlice {
   setActiveChatWallpaper: (wallpaper: WallpaperRef | null) => void
   setActiveChatAvatarId: (imageId: string | null) => void
   setActiveChatMetadata: (metadata: Record<string, any> | null) => void
+  setActiveChatLoadedCharacterIds: (ids: string[]) => void
   setActiveChatDisplayOwner: (owner: string | null) => void
   setActiveChatName: (name: string | null) => void
   setMessages: (messages: Message[], total?: number) => void
@@ -75,8 +86,8 @@ export interface ChatSlice {
   addMessage: (message: Message) => void
   updateMessage: (id: string, updates: Partial<Message>) => void
   removeMessage: (id: string) => void
-  beginStreaming: (regeneratingMessageId?: string, generationType?: string) => void
-  startStreaming: (generationId: string, regeneratingMessageId?: string, generationType?: string) => void
+  beginStreaming: (regeneratingMessageId?: string, generationType?: string, backgroundSwipeId?: number) => void
+  startStreaming: (generationId: string, regeneratingMessageId?: string, generationType?: string, renderMode?: "persisted-message") => void
   pauseStreamingForNavigation: () => void
   /** Append a live stream segment. When `offset` (char position of the segment
    *  start in the server's cumulative buffer) is provided, overlap with already-
@@ -93,7 +104,7 @@ export interface ChatSlice {
   getStreamBuffers: () => { content: string; reasoning: string }
   setStreamingReasoningStartedAt: (ts: number | null) => void
   /** Set the confirmed streaming swipe index and recover its slot if a staging event was missed. */
-  setStreamingSwipeId: (swipeId: number | null) => void
+  setStreamingSwipeId: (swipeId: number | null, preserveSelection?: boolean) => void
   /** Flag a freshly-generated swipe as unseen (drives the "new swipe ready" badge). */
   setUnseenSwipe: (messageId: string, swipeId: number) => void
   /** Clear the unseen-swipe flag for a message (e.g. once the user views it). */
@@ -143,13 +154,22 @@ export interface StartupSettings {
   wallpaper?: WallpaperSettings
   drawerSettings?: DrawerSettings
   spindleSettings?: Partial<SpindleSettings>
-  connectionsOrder?: Partial<Record<'llm' | 'imageGen' | 'stt' | 'tts', string[]>>
+  connectionsOrder?: Partial<Record<'llm' | 'imageGen' | 'stt' | 'tts' | 'decision', string[]>>
   activeProfileId?: string | null
   toastPosition?: ToastPosition
   defaultImpersonationMode?: ImpersonationPreference
+  showGreetingImage?: boolean
+  greetingImagePosition?: 'top' | 'bottom'
 }
 
 export interface CharactersSlice {
+  characterIndex: CharacterIndexItem[]
+  characterIndexLoaded: boolean
+  characterIndexRevision: number
+  characterIndexGeneration: number
+  invalidateCharacterIndex: () => void
+  characterIndexChanges: Record<string, number>
+  setCharacterIndex: (items: CharacterIndexItem[], startedAtRevision: number) => void
   characters: Character[]
   charactersLoaded: boolean
   favorites: string[]
@@ -490,6 +510,7 @@ export interface WallpaperRef {
 
 export interface WallpaperSettings {
   global: WallpaperRef | null
+  mobile?: WallpaperRef | null
   opacity: number
   fit: 'cover' | 'contain' | 'fill'
   blur: number
@@ -514,6 +535,7 @@ export interface SavedThemeConfigEntry {
 }
 /** A user-saved theme made from a .lumitheme bundle import — preserves CSS, components, and assets. */
 export interface SavedThemePackEntry {
+  authoringSnapshot?: { version: 1; globalEnabled: boolean; themeWasNull: boolean }
   kind: 'pack'
   id: string
   name: string
@@ -747,6 +769,8 @@ export interface EnterToSendSettings {
 }
 
 export interface SettingsSlice {
+  /** Saved account preference; null until account settings are hydrated. */
+  uiLanguage: UiLanguage | null
   settingsLoaded: boolean
   /** Full persisted settings loaded; startup settings intentionally set only `settingsLoaded`. */
   fullSettingsLoaded: boolean
@@ -759,6 +783,12 @@ export interface SettingsSlice {
   personasPerPage: number
   messagesPerPage: number
   chatDisplayMode: 'minimal' | 'immersive' | 'bubble'
+  /** Show the selected greeting's artwork with the starting message. Opt-in. */
+  showGreetingImage: boolean
+  greetingImagePosition: 'top' | 'bottom'
+  chatImageSize: ChatImageSize
+  chatImageAlignment: ChatImageAlignment
+  chatImageTargets: ChatImageTargets
   longMessageCollapseEnabled: boolean
   longMessageCollapsePreset: LongMessageCollapsePreset
   longMessageCollapseCustomHeight: number
@@ -772,6 +802,8 @@ export interface SettingsSlice {
   bubbleOpacity: number
   inputBarEnterToSend: EnterToSendSettings
   saveDraftInput: boolean
+  /** Account-synced composer action bar layout; null until first saved. */
+  composerActionBar: { order: string[]; hidden: string[] } | null
   defaultImpersonationMode: ImpersonationPreference
   chatWidthMode: 'full' | 'comfortable' | 'compact' | 'custom'
   centerChatWithSidebar: boolean
@@ -795,6 +827,8 @@ export interface SettingsSlice {
   sovereignHand: SovereignHandSettings
   contextFilters: ContextFilters
   reasoningSettings: ReasoningSettings
+  /** Preferred settings for connections without a reasoning binding, before provider normalization. */
+  unboundReasoningSettings: ReasoningSettings | null
   promptBias: string
   globalWorldBooks: string[]
   worldInfoSettings: import('./api').WorldInfoSettings
@@ -831,7 +865,9 @@ export interface SettingsSlice {
   savedThemes: SavedTheme[]
   spindleSettings: SpindleSettings
   voiceSettings: VoiceSettings
-  connectionsOrder: Record<'llm' | 'imageGen' | 'stt' | 'tts', string[]>
+  recentConnections: RecentConnections
+  connectionLibraries: ConnectionLibraries
+  connectionsOrder: Record<'llm' | 'imageGen' | 'stt' | 'tts' | 'decision', string[]>
   quickToolbarSettings: QuickToolbarSettings
   connectionsPickerSettings: ConnectionsPickerSettings
   loreIndicatorSettings: LoreIndicatorSettings
@@ -848,7 +884,8 @@ export interface SettingsSlice {
   setVoiceSettings: (partial: Partial<VoiceSettings>) => void
   setWallpaper: (settings: Partial<WallpaperSettings>) => void
   setInputBarEnterToSend: (settings: EnterToSendSettings) => void
-  setSetting: <K extends keyof SettingsSlice>(key: K, value: SettingsSlice[K], source?: SettingsWriteSource) => void
+  // Character filters also use coordinated persistence to survive startup hydration.
+  setSetting: <K extends keyof (SettingsSlice & Pick<CharactersSlice, 'filterTab'>)>(key: K, value: (SettingsSlice & Pick<CharactersSlice, 'filterTab'>)[K], source?: SettingsWriteSource) => void
   setTheme: (theme: ThemeConfig | null) => void
   setCharacterThemeOverlay: (overlay: CharacterThemeOverlay | null) => void
   setCustomCSS: (css: string) => void
@@ -862,7 +899,7 @@ export interface SettingsSlice {
   addSavedTheme: (input: SavedThemeInput) => SavedTheme
   renameSavedTheme: (id: string, name: string) => void
   deleteSavedTheme: (id: string) => Promise<void>
-  applySavedTheme: (id: string) => void
+  applySavedTheme: (id: string) => void | Promise<void>
   /** Replace a saved theme with the complete current theme snapshot and persist it. */
   updateSavedTheme: (id: string) => Promise<void>
   loadSettings: () => Promise<void>
@@ -928,6 +965,8 @@ export interface DrawerSettings {
   /** Drag-resized width in layout pixels. Legacy vw widths are used until the first resize. */
   panelWidthPx?: number
   showTabLabels: boolean
+  /** Keep the drawer in a separate pane while iPhone Duo is unfolded. Defaults to true. */
+  duoAlwaysOpen?: boolean
   hiddenTabIds: string[]
   /** Legacy flat tab order retained for downgrade compatibility and migration. */
   tabOrder: string[]
@@ -946,6 +985,7 @@ export interface SpindleSettings {
 
 // ---- Loom Registry Entry ----
 export interface LoomRegistryEntry {
+  cacheRevision?: number
   name: string
   blockCount: number
   coverUrl: string | null
@@ -959,6 +999,7 @@ export interface PresetsSlice {
   activePresetId: string | null
   activeLoomPresetId: string | null
   loomRegistry: Record<string, LoomRegistryEntry>
+  loomRegistryLoaded: boolean
   setActiveLoomPreset: (id: string | null) => void
   setPresets: (presets: Record<string, Preset>) => void
   setActivePreset: (id: string | null) => void
@@ -1112,6 +1153,9 @@ export interface ImageGenSettings {
   activeImageGenConnectionId?: string | null
   includeCharacters: boolean
   includePersona: boolean
+  describeCharacterAvatar?: boolean
+  describePersonaAvatar?: boolean
+  activeCaptioningPresetId?: string | null
   promptMode?: 'scene' | 'custom' | 'parsed_custom'
   customPrompt?: string
   customNegativePrompt?: string
@@ -1240,6 +1284,16 @@ export interface PendingConfirmRequest {
   variant: 'info' | 'warning' | 'danger' | 'success'
   confirmLabel: string
   cancelLabel: string
+  /** Optional host-provided checkbox; extension confirmation protocol remains unchanged. */
+  checkboxLabel?: string
+}
+
+/** An extension analysing the device's audio right now. The host shows an indicator for each, with a Stop button. */
+export interface SystemAudioSessionInfo {
+  id: string
+  extensionId: string
+  extensionName: string
+  stop: () => void
 }
 
 export interface PendingContextMenuRequest {
@@ -1317,6 +1371,9 @@ export interface SpindleSlice {
   pendingConfirm: PendingConfirmRequest | null
   pendingInputPrompt: PendingInputPromptRequest | null
   pendingContextMenu: PendingContextMenuRequest | null
+  systemAudioSessions: SystemAudioSessionInfo[]
+  addSystemAudioSession: (session: SystemAudioSessionInfo) => void
+  removeSystemAudioSession: (id: string) => void
   setExtensionUpdates: (updates: import('./spindle-updates').ExtensionUpdateInfo[]) => void
   loadExtensions: () => Promise<void>
   installExtension: (githubUrl: string, branch?: string | null) => Promise<void>
@@ -1338,7 +1395,7 @@ export interface SpindleSlice {
   closeSpindleModal: (requestId: string, dismissedBy: 'user' | 'extension' | 'cleanup') => void
   dismissSpindleModal: (requestId: string) => void
   openSpindleConfirm: (request: PendingConfirmRequest) => void
-  closeSpindleConfirm: (requestId: string, confirmed: boolean) => void
+  closeSpindleConfirm: (requestId: string, confirmed: boolean, checkboxChecked?: boolean) => void
   openInputPrompt: (request: PendingInputPromptRequest) => void
   closeInputPrompt: (requestId: string, value: string | null) => void
   openContextMenu: (request: PendingContextMenuRequest) => void
@@ -1771,6 +1828,18 @@ export interface McpServersSlice {
 }
 
 // ---- TTS Connections Slice ----
+export interface DecisionConnectionsSlice {
+  decisionProfiles: import('@/types/api').DecisionConnectionProfile[]
+  decisionProviders: import('@/types/api').DecisionProviderInfo[]
+
+  setDecisionProfiles: (profiles: import('@/types/api').DecisionConnectionProfile[]) => void
+  addDecisionProfile: (profile: import('@/types/api').DecisionConnectionProfile) => void
+  updateDecisionProfile: (id: string, updates: Partial<import('@/types/api').DecisionConnectionProfile>) => void
+  removeDecisionProfile: (id: string) => void
+  applyDecisionProfileOrder: (orderedIds: string[]) => void
+  setDecisionProviders: (providers: import('@/types/api').DecisionProviderInfo[]) => void
+}
+
 export interface SttConnectionsSlice {
   sttProfiles: import('@/types/api').SttConnectionProfile[]
   sttProviders: import('@/types/api').SttProviderInfo[]
@@ -2104,6 +2173,7 @@ export type AppStore = ChatSlice &
   ExpressionSlice &
   ImageGenConnectionsSlice &
   SttConnectionsSlice &
+  DecisionConnectionsSlice &
   TtsConnectionsSlice &
   McpServersSlice &
   LoadoutsSlice &
